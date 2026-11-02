@@ -1,11 +1,14 @@
-"""GitHub REST API: releases of a repository and download of their assets (private repositories need a token)."""
+"""GitHub REST API: releases of a repository and download of their assets or source code archives (private
+repositories need a token)."""
 import fnmatch
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import __version__
+from .sites import SOURCE_ARCHIVE
 from .util import version_of
 
 
@@ -54,11 +57,16 @@ class GitHub(object):
         except (urllib.error.URLError, OSError) as e:
             raise GitHubError("cannot reach GitHub: %s" % getattr(e, "reason", e))
 
-    @staticmethod
-    def _release(raw, pattern):
+    def _release(self, raw, pattern, repo):
+        """``pattern``: file name pattern of the asset to install, or SOURCE_ARCHIVE for the source code of the tag."""
         assets = [{"id": a["id"], "name": a["name"], "size": a.get("size", 0), "url": a["url"],
                    "digest": a.get("digest") or "", "download_count": a.get("download_count", 0)} for a in raw.get("assets", [])]
-        match = [a for a in assets if fnmatch.fnmatch(a["name"], pattern)]
+        if pattern == SOURCE_ARCHIVE:
+            url = raw.get("zipball_url") or "%s/repos/%s/zipball/%s" % (self.api, repo, urllib.parse.quote(raw["tag_name"]))
+            match = [{"id": 0, "name": "%s-%s.zip" % (repo.split("/")[-1], raw["tag_name"]), "size": 0, "url": url, "digest": "",
+                      "download_count": 0, "source": True}]
+        else:
+            match = [a for a in assets if fnmatch.fnmatch(a["name"], pattern)]
         return {
             "tag": raw["tag_name"], "version": version_of(raw["tag_name"]), "name": raw.get("name") or raw["tag_name"],
             "published_at": raw.get("published_at"), "prerelease": bool(raw.get("prerelease")), "draft": bool(raw.get("draft")),
@@ -73,24 +81,25 @@ class GitHub(object):
         if cached and not refresh and time.time() - cached[0] < self.CACHE_SECONDS:
             return cached[1]
         raw = self._get_json("/repos/%s/releases?per_page=30" % repo)
-        releases = [self._release(r, pattern) for r in raw if not r.get("draft")]
+        releases = [self._release(r, pattern, repo) for r in raw if not r.get("draft")]
         self.cache[key] = (time.time(), releases)
         return releases
 
     def release(self, repo, version, pattern="*.zip"):
         for tag in ("v" + version, version):
             try:
-                return self._release(self._get_json("/repos/%s/releases/tags/%s" % (repo, tag)), pattern)
+                return self._release(self._get_json("/repos/%s/releases/tags/%s" % (repo, tag)), pattern, repo)
             except GitHubError as e:
                 if e.status != 404:
                     raise
         raise GitHubError("release %s not found in %s" % (version, repo), 404)
 
     def download(self, asset, target, progress=None):
-        """Download an asset to ``target``. The API answers with a redirect to a signed storage URL, which must be
-        requested WITHOUT the GitHub token."""
+        """Download an asset or a source code archive to ``target``. The API answers with a redirect to a signed
+        storage URL, which must be requested WITHOUT the GitHub token."""
         opener = urllib.request.build_opener(_NoRedirect)
-        request = urllib.request.Request(asset["url"], headers=self._headers("application/octet-stream"))
+        accept = "application/vnd.github+json" if asset.get("source") else "application/octet-stream"
+        request = urllib.request.Request(asset["url"], headers=self._headers(accept))
         url = asset["url"]
         try:
             response = opener.open(request, timeout=60)

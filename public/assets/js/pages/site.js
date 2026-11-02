@@ -4,6 +4,7 @@ import { t } from '../core/i18n.js';
 import { attachPasswordToggles, clearErrors, duration, esc, formatBytes, formatDate, formatDateTime, icon, showErrors, toast } from '../core/ui.js';
 import { actionDialog, checkbox, healthBadge, jobStatusBadge, jobType, localizeFields, passwordField, startJob, stateBadge, versionPill } from './shared/bits.js';
 import { attachSiteForm, readSiteForm, siteFormHtml } from './shared/site-form.js';
+import { serverBadge } from './overview.js';
 
 const TABS = [['versions', 'git-branch'], ['history', 'clock'], ['backups', 'archive'], ['settings', 'settings']];
 
@@ -18,7 +19,8 @@ function header(site) {
         ${site.domain ? `<a href="https://${esc(site.domain)}" target="_blank" rel="noopener">${icon('globe')}${esc(site.domain)}</a>` : ''}
         <a href="https://github.com/${esc(site.repo)}" target="_blank" rel="noopener">${icon('github')}${esc(site.repo)}</a>
         <span class="mono small">${icon('folder')}${esc(site.path)}</span></p>
-      <div class="badge-row">${stateBadge(site.state)} ${healthBadge(site.health)} ${versionPill(site.current_version, 'current')}
+      <div class="badge-row">${site.server && !site.server.local ? serverBadge(site.server) : ''} ${stateBadge(site.state)} ${healthBadge(site.health)} ${versionPill(site.current_version, 'current')}
+        ${site.deploy_mode === 'compose' ? `<span class="badge badge--failed">${icon('layers')}Docker Compose</span>` : ''}
         ${site.disk ? `<span class="small muted">${icon('hard-drive')}${d('disk', { free: formatBytes(site.disk.free), total: formatBytes(site.disk.total) })}</span>` : ''}</div>
     </div>
     <div class="site-header__actions">
@@ -29,7 +31,7 @@ function header(site) {
   </header>
   ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' ? 'red' : 'yellow'}">${icon('info')}<div>${t('sites.state.' + site.state + '_hint')}</div></div>` : ''}
   ${busy ? `<div class="box box--blue">${icon('activity')}<div>${t('jobs.in_progress')} ${jobStatusBadge(site.active_job.status)}
-    <a href="#/jobs/${site.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}`;
+    <a href="#/sites/${esc(site.id)}/jobs/${site.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}`;
 }
 
 // ---------- Versions ----------
@@ -55,7 +57,7 @@ function releaseItem(site, release) {
   return `<li class="release${release.current ? ' release--current' : ''}">
     <div class="release__main">
       <div class="release__title">${versionPill(release.version, release.current ? 'current' : '')}<b>${esc(release.name && release.name !== release.tag ? release.name : '')}</b>${flags}</div>
-      <small class="muted">${release.local_only ? v('local_only') : v('published', { date: formatDate(release.published_at) })}${release.asset ? ' · ' + esc(release.asset.name) + ' · ' + formatBytes(release.asset.size) : ''}</small>
+      <small class="muted">${release.local_only ? v('local_only') : v('published', { date: formatDate(release.published_at) })}${release.asset ? ' · ' + (release.asset.source ? v('source_code') : esc(release.asset.name) + ' · ' + formatBytes(release.asset.size)) : ''}</small>
       ${release.notes ? `<details class="release__notes"><summary>${v('notes')}</summary><pre>${esc(release.notes)}</pre></details>` : ''}
     </div>
     <div class="release__actions">${actions}</div></li>`;
@@ -95,7 +97,7 @@ async function historyTab(container, site, isCurrent) {
   container.innerHTML = `<section class="card card--table">${jobs.length ? `<div class="table-scroll"><table class="table">
     <thead><tr><th>${h('job')}</th><th>${h('type')}</th><th>${h('version')}</th><th>${h('status')}</th><th>${h('actor')}</th><th>${h('started')}</th><th class="right">${h('duration')}</th><th>${h('result')}</th></tr></thead>
     <tbody>${jobs.map((j) => `<tr>
-      <td data-label="${h('job')}"><a href="#/jobs/${j.id}" class="mono">#${j.id}</a></td>
+      <td data-label="${h('job')}"><a href="#/sites/${esc(site.id)}/jobs/${j.id}" class="mono">#${j.id}</a></td>
       <td data-label="${h('type')}">${jobType(j.type)}</td>
       <td data-label="${h('version')}" class="mono">${j.from_version && j.to_version && j.from_version !== j.to_version ? `${esc(j.from_version)} → ${esc(j.to_version)}` : esc(j.to_version || j.version || '–')}</td>
       <td data-label="${h('status')}">${jobStatusBadge(j.status)}</td>
@@ -113,7 +115,9 @@ async function backupsTab(container, site, isCurrent) {
   container.innerHTML = '<div class="skeleton skeleton--table"></div>';
   const { data: backups } = await get(`sites/${site.id}/backups`);
   if (!isCurrent()) return;
-  const configured = site.settings.backup_env_file || (site.settings.backup_paths || []).length;
+  const st = site.settings;
+  const configured = st.backup_env_file || st.backup_db_service || ['mysql', 'postgres'].includes(st.backup_db) || (st.backup_paths || []).length
+    || (st.backup_volumes || []).length;
   container.innerHTML = `<section class="card card--table">
     <div class="card__header card__header--padded"><div><h2 class="card__title">${icon('archive')}${b('title')}</h2>
       <p class="small muted">${b('lead', { keep: site.settings.backup_keep })}</p></div>
@@ -125,7 +129,8 @@ async function backupsTab(container, site, isCurrent) {
         <td data-label="${c('time')}"><b>${formatDateTime(x.created_at, true)}</b><small class="block muted mono">${esc(x.id)}</small></td>
         <td data-label="${c('version')}">${versionPill(x.version)}</td>
         <td data-label="${c('contents')}">${x.has_database ? `<span class="badge badge--admin">${icon('database')}${b('database')}</span>` : ''}
-          ${x.has_files ? `<span class="badge badge--failed">${icon('folder')}${b('files')}</span>` : ''}</td>
+          ${x.has_files ? `<span class="badge badge--failed">${icon('folder')}${b('files')}</span>` : ''}
+          ${x.volumes ? `<span class="badge badge--failed">${icon('hard-drive')}${b('volumes', { n: x.volumes })}</span>` : ''}</td>
         <td data-label="${c('size')}" class="right">${formatBytes(x.size_bytes)}</td>
         <td data-label="${c('reason')}" class="small muted">${esc(x.reason || '')}</td>
         <td class="right cell-actions">${site.state === 'ready' ? `<button type="button" class="btn btn--outline btn--small" data-restore="${esc(x.id)}" ${site.active_job ? 'disabled' : ''}>${icon('rollback')}${b('restore')}</button>` : ''}

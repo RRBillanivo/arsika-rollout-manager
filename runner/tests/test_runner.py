@@ -1,16 +1,26 @@
-"""Integration test of the runner with a fake GitHub API and a fake web site (no root, no systemd, no MySQL needed).
+"""Integration test of the runner with a fake GitHub API, a fake web site and a fake docker command (no root, no
+systemd, no MySQL, no Docker needed).
 
-    python runner/tests/test_runner.py            (Linux, or Windows with symlink rights; bash in PATH or ROLLOUT_TEST_SHELL)
+    python runner/tests/test_runner.py            (Linux, or Windows with symlink rights; bash in PATH or ROLLOUT_TEST_SHELL;
+                                                   openssl in PATH or ROLLOUT_TEST_OPENSSL for the HTTPS tests)
 
 Covers: signed API, site validation, one read-only GitHub token per site (write-only, used for checks and downloads,
 replaced, removed, deleted with the site, moved over from the single token of 1.0.0), backup before an adoption, adoption
 of an existing installation (with aaPanel's .user.ini in the document root), deployment, automatic rollback after a failed
-health check, manual rollback, backups and restore of shared files, release pruning, unsafe archives."""
+health check, manual rollback, backups and restore of shared files, release pruning, unsafe archives, the health check of
+a site that is not adopted yet, database settings from environment files, the init options, the address allowlist.
+Docker Compose sites (fake docker), installed from release source code archives: adoption of a compose installation
+made by hand (its project name is kept), version-tagged images, rollback without a rebuild, a bind mount outside the
+release, automatic rollback, database dumps inside the container (no password on the command line), volume backups and
+restore. HTTPS runner: public key pin (same as openssl computes it), wrong pin, plain HTTP refused."""
+import base64
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,16 +32,32 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHan
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from arsika_rollout_manager.backup import Backups  # noqa: E402
-from arsika_rollout_manager.client import Client  # noqa: E402
+from arsika_rollout_manager import __main__ as cli  # noqa: E402
+from arsika_rollout_manager.backup import Backups, settings_from_env  # noqa: E402
+from arsika_rollout_manager.client import Client, PinError  # noqa: E402
+from arsika_rollout_manager.compose import ComposeError  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
-from arsika_rollout_manager.server import Api, serve  # noqa: E402
+from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
+from arsika_rollout_manager.util import certificate_pin  # noqa: E402
 from arsika_rollout_manager.worker import Worker  # noqa: E402
 
 SHELL = os.environ.get("ROLLOUT_TEST_SHELL") or shutil.which("bash") or "/bin/bash"
+OPENSSL = os.environ.get("ROLLOUT_TEST_OPENSSL") or shutil.which("openssl")
+FAKE_DOCKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_docker.py")
 SITE_TOKEN = "github_pat_" + "s" * 40                    # the demo site's own (fake) read-only token
+
+
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+def stop(*servers):
+    for server in servers:
+        server.shutdown()
+        server.server_close()
 
 
 def make_zip(files):
@@ -49,12 +75,25 @@ def release_files(version, page=None):
             "app/main.php": "<?php // " + version, "data/.gitignore": "*\n", "deploy/run.sh": "#!/bin/sh\necho hi\n"}
 
 
+def shop_files(version, page=None, extra_mount=None):
+    """Source code of a Docker Compose application (compose file in JSON, which is also YAML)."""
+    web = {"build": {"context": "."}, "volumes": ["./data:/app/data", "uploads:/app/uploads"]}
+    if extra_mount:
+        web["volumes"].append(extra_mount)
+    compose = {"services": {"web": web, "db": {"image": "mariadb:11", "volumes": ["dbdata:/var/lib/mysql"]}},
+               "volumes": {"uploads": {}, "dbdata": {}}}
+    return {"compose.yaml": json.dumps(compose, indent=2), "Dockerfile": "FROM busybox\n",
+            "public/version.txt": page or ("version " + version), "data/.keep": ""}
+
+
 class FakeGitHub(object):
-    """/repos/o/demo/releases, /releases/tags/<tag>, /assets/<id> (redirect to /storage/<id>, which must come without token)."""
+    """/repos/<owner>/<name>/releases, /releases/tags/<tag>, /zipball/<tag> (redirect to /codeload/...), /assets/<id>
+    (redirect to /storage/<id>). Storage and codeload must be requested without the token."""
 
     def __init__(self):
         self.assets = {}
-        self.releases = []
+        self.archives = {}
+        self.repos = {}
         self.token_seen_by_storage = False
         self.auth_seen = []                                # Authorization headers of the API requests
         github = self
@@ -76,12 +115,21 @@ class FakeGitHub(object):
                 path = self.path.split("?")[0]
                 if path.startswith(("/repos/", "/assets/")):
                     github.auth_seen.append(self.headers.get("Authorization") or "")
-                if path == "/repos/o/demo/releases":
-                    return self.send(200, json.dumps(github.releases).encode())
-                if path.startswith("/repos/o/demo/releases/tags/"):
-                    tag = path.rsplit("/", 1)[1]
-                    found = [r for r in github.releases if r["tag_name"] == tag]
+                match = re.match(r"^/repos/([^/]+/[^/]+)/(releases$|releases/tags/(.+)|zipball/(.+))", path)
+                releases = github.repos.get(match.group(1)) if match else None
+                if releases is not None and match.group(2) == "releases":
+                    return self.send(200, json.dumps(releases).encode())
+                if releases is not None and match.group(3):
+                    found = [r for r in releases if r["tag_name"] == match.group(3)]
                     return self.send(200, json.dumps(found[0]).encode()) if found else self.send(404, b'{"message":"Not Found"}')
+                if releases is not None and match.group(4):
+                    return self.send(302, b"", headers={"Location": "http://127.0.0.1:%d/codeload/%s/%s" % (
+                        github.port, match.group(1), match.group(4))})
+                if path.startswith("/codeload/"):
+                    if self.headers.get("Authorization"):
+                        github.token_seen_by_storage = True
+                    data = github.archives.get(path[len("/codeload/"):])
+                    return self.send(200, data, "application/zip") if data else self.send(404, b"not found")
                 if path.startswith("/assets/"):
                     return self.send(302, b"", headers={"Location": "http://127.0.0.1:%d/storage/%s" % (github.port, path.rsplit("/", 1)[1])})
                 if path.startswith("/storage/"):
@@ -94,16 +142,26 @@ class FakeGitHub(object):
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def publish(self, version, files, digest=True):
+    def publish(self, version, files, digest=True, repo="o/demo"):
         data = make_zip(files)
         asset_id = len(self.assets) + 1
         self.assets[asset_id] = data
-        self.releases.insert(0, {
+        self.repos.setdefault(repo, []).insert(0, {
             "tag_name": "v" + version, "name": "v" + version, "draft": False, "prerelease": False, "body": "notes " + version,
             "published_at": "2026-10-31T00:00:00Z", "html_url": "",
+            "zipball_url": "http://127.0.0.1:%d/repos/%s/zipball/v%s" % (self.port, repo, version),
             "assets": [{"id": asset_id, "name": "demo_v%s.zip" % version, "size": len(data),
                         "url": "http://127.0.0.1:%d/assets/%d" % (self.port, asset_id),
                         "digest": ("sha256:" + hashlib.sha256(data).hexdigest()) if digest else None}]})
+
+    def publish_source(self, repo, version, files):
+        """A release without assets: only GitHub's source code archive (one top folder owner-name-<commit>/)."""
+        top = "%s-%s/" % (repo.replace("/", "-"), hashlib.sha1(version.encode()).hexdigest()[:7])
+        self.archives["%s/v%s" % (repo, version)] = make_zip({top + name: content for name, content in files.items()})
+        self.repos.setdefault(repo, []).insert(0, {
+            "tag_name": "v" + version, "name": "v" + version, "draft": False, "prerelease": False, "body": "notes " + version,
+            "published_at": "2026-10-31T00:00:00Z", "html_url": "", "assets": [],
+            "zipball_url": "http://127.0.0.1:%d/repos/%s/zipball/v%s" % (self.port, repo, version)})
 
 
 class RunnerTest(unittest.TestCase):
@@ -119,9 +177,7 @@ class RunnerTest(unittest.TestCase):
         cls.github.publish("1.2.0", release_files("1.2.0", page="broken build"))          # fails its health check
 
         # fake web server whose document root is the site's "public" link (follows current/ on every request)
-        handler = partial(SimpleHTTPRequestHandler, directory=os.path.join(cls.site_dir, "public"))
-        handler.log_message = lambda *a: None
-        SimpleHTTPRequestHandler.log_message = lambda *a: None
+        handler = partial(QuietHandler, directory=os.path.join(cls.site_dir, "public"))
         cls.web = HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=cls.web.serve_forever, daemon=True).start()
 
@@ -143,11 +199,9 @@ class RunnerTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.shutdown()
+        stop(cls.server, cls.web, cls.github.server)
         cls.worker.stopping = True
         cls.worker.wake.set()
-        cls.web.shutdown()
-        cls.github.server.shutdown()
         time.sleep(0.3)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
@@ -225,6 +279,8 @@ class RunnerTest(unittest.TestCase):
         with open(os.path.join(self.site_dir, "public", ".user.ini"), "w") as f:          # aaPanel: Running directory /public
             f.write("open_basedir=/www/wwwroot/demo.example.com/:/tmp/\n")
         self.assertEqual(self.call("GET", "/v1/sites/demo")["state"], "classic")
+        health = self.call("GET", "/v1/sites/demo/health")          # health_contains has {version}, unknown before adoption
+        self.assertTrue(health["ok"], health)
         status, doc = self.client.post("/v1/sites/demo/jobs", {"type": "deploy", "version": "1.1.0"})
         self.assertEqual((status, doc["error"]["code"]), (409, "needs_adopt"))
         backup_id = self.job("backup", params={"reason": "before adoption"})["message"].split()[-1]   # data still in the site folder
@@ -361,6 +417,320 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(self.config.site_token("second"))
         self.call("DELETE", "/v1/sites/second")
         self.assertEqual(self.config.site_token("second"), "")
+
+    def test_15_allow_from(self):
+        server = ThreadingServer.__new__(ThreadingServer)            # verify_request only, no socket
+        server.allowed = tuple(Config.networks("10.0.0.0/8, fd00::/8"))
+        self.assertTrue(server.verify_request(None, ("10.1.2.3", 5000)))
+        self.assertTrue(server.verify_request(None, ("::ffff:10.1.2.3", 5000, 0, 0)))      # IPv4 client of a dual-stack socket
+        self.assertTrue(server.verify_request(None, ("127.0.0.1", 5000)))                  # the local command line
+        self.assertTrue(server.verify_request(None, ("fd12::5", 5000, 0, 0)))
+        self.assertFalse(server.verify_request(None, ("192.168.1.5", 5000)))
+        self.assertFalse(server.verify_request(None, ("fe80::1%eth0", 5000, 0, 2)))
+        with self.assertRaises(ValueError):
+            Config.networks(["300.1.1.1"])
+
+    def test_16_database_settings(self):
+        laravel = settings_from_env({"DB_CONNECTION": "mysql", "DB_HOST": "127.0.0.1", "DB_DATABASE": "app", "DB_USERNAME": "u",
+                                     "DB_PASSWORD": "p"})
+        self.assertEqual((laravel["engine"], laravel["port"], laravel["name"]), ("mysql", "3306", "app"))
+        self.assertEqual(settings_from_env({"DB_DATABASE": "app"})["host"], "localhost")          # 1.x default: MySQL socket
+        pg = settings_from_env({"DB_CONNECTION": "pgsql", "DB_DATABASE": "app", "DB_USERNAME": "u"})
+        self.assertEqual((pg["engine"], pg["host"], pg["port"]), ("postgres", "127.0.0.1", "5432"))
+        url = settings_from_env({"DATABASE_URL": "postgresql://shop:p%40ss@db.internal:5433/shop?sslmode=disable"})
+        self.assertEqual((url["engine"], url["host"], url["port"], url["name"], url["user"], url["password"]),
+                         ("postgres", "db.internal", "5433", "shop", "shop", "p@ss"))
+        compose_env = settings_from_env({"POSTGRES_DB": "shop", "POSTGRES_USER": "shop", "POSTGRES_PASSWORD": "x"})
+        self.assertEqual((compose_env["engine"], compose_env["user"]), ("postgres", "shop"))
+        self.assertEqual(settings_from_env({"MYSQL_DATABASE": "shop", "MYSQL_USER": "shop"})["engine"], "mysql")
+        self.assertIsNone(settings_from_env({"DB_CONNECTION": "sqlite", "DB_DATABASE": "/data/app.sqlite"})["engine"])
+        self.assertIsNone(settings_from_env({"APP_KEY": "x"}))
+
+    def test_17_init_options(self):
+        folder = os.path.join(self.tmp, "init")
+        path = os.path.join(folder, "runner.json")
+        common = ["init", "--config=" + path, "--state-dir=" + os.path.join(folder, "state"), "--backup-dir=" + os.path.join(folder, "backup")]
+        self.assertEqual(cli.main(common + ["--listen=0.0.0.0"]), 2)                    # network address without TLS
+        self.assertEqual(cli.main(common + ["--web-user=www-data", "--platform=linux", "--site-root=/var/www,/srv",
+                                            "--allow-from=10.0.0.0/8,192.168.1.10"]), 0)
+        first = Config(path)
+        self.assertEqual((first["web_user"], first["platform"], first["site_roots"], first["allow_from"]),
+                         ("www-data", "linux", ["/var/www", "/srv"], ["10.0.0.0/8", "192.168.1.10/32"]))
+        self.assertEqual(cli.main(common + ["--port=9000"]), 0)                         # an existing file: only the option changes
+        second = Config(path)
+        self.assertEqual((second["port"], second["secret"], second["web_user"]), (9000, first["secret"], "www-data"))
+
+    def test_18_presets_use_the_server_web_user(self):
+        presets = {p["id"]: p["settings"] for p in self.call("GET", "/v1/presets")}
+        self.assertEqual(presets["php-app"]["web_user"], self.config["web_user"])
+        self.assertEqual((presets["compose-build"]["web_user"], presets["compose-build"]["deploy_mode"]), ("", "compose"))
+        self.assertFalse(presets["compose-images"]["compose_build"])
+        status, doc = self.client.post("/v1/sites", {"id": "bad", "path": os.path.join(self.www, "bad"), "repo": "o/demo",
+                                                     "deploy_mode": "kubernetes", "backup_db": "oracle", "compose_project": "Bad Name"})
+        self.assertEqual(status, 422)
+        self.assertTrue({"deploy_mode", "backup_db", "compose_project"} <= set(doc["error"]["fields"]))
+
+
+class ComposeTest(unittest.TestCase):
+    """A Docker Compose site run by the fake docker command, installed from release source code archives."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-compose-")
+        cls.www = os.path.join(cls.tmp, "srv")
+        cls.site_dir = os.path.join(cls.www, "shop.example.com")
+        os.makedirs(cls.site_dir)
+        cls.webroot = os.path.join(cls.tmp, "container-web")       # what the fake "web" container serves
+        os.makedirs(cls.webroot)
+        cls.state = os.path.join(cls.tmp, "docker", "state.json")
+        os.makedirs(os.path.join(cls.tmp, "docker", "volumes"))
+        os.environ["FAKE_DOCKER_STATE"], os.environ["FAKE_DOCKER_WEBROOT"] = cls.state, cls.webroot
+        cls.github = FakeGitHub()
+        for version in ("1.0.0", "1.1.0"):
+            cls.github.publish_source("o/shop", version, shop_files(version))
+        cls.github.publish_source("o/shop", "1.2.0", shop_files("1.2.0", extra_mount="./cache:/cache"))   # not in the release
+        cls.github.publish_source("o/shop", "1.3.0", shop_files("1.3.0", page="broken build"))          # fails its health check
+
+        handler = partial(QuietHandler, directory=cls.webroot)
+        cls.web = HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=cls.web.serve_forever, daemon=True).start()
+
+        config_path = os.path.join(cls.tmp, "etc", "runner.json")
+        os.makedirs(os.path.dirname(config_path))
+        cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
+                                   github_api="http://127.0.0.1:%d" % cls.github.port, site_roots=[cls.www], shell=SHELL, port=0,
+                                   health_attempts=3, health_delay=0.3, docker_command=[sys.executable, FAKE_DOCKER])
+        cls.config.prepare_dirs()
+        store = Store(cls.config.state_path("runner.db"))
+        cls.deployer = Deployer(cls.config, store, Backups(cls.config, store))
+        cls.worker = Worker(cls.config, store, cls.deployer)
+        cls.worker.start()
+        cls.server = serve(Api(cls.config, store, cls.deployer, cls.worker))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.client = Client("http://127.0.0.1:%d" % cls.server.server_address[1], cls.config["secret"])
+
+    @classmethod
+    def tearDownClass(cls):
+        stop(cls.server, cls.web, cls.github.server)
+        cls.worker.stopping = True
+        cls.worker.wake.set()
+        time.sleep(0.3)
+        for key in ("FAKE_DOCKER_STATE", "FAKE_DOCKER_WEBROOT"):
+            os.environ.pop(key, None)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    call = RunnerTest.call
+
+    def job(self, job_type, version=None, params=None, expect="succeeded"):
+        job = self.call("POST", "/v1/sites/shop/jobs", {"type": job_type, "version": version, "params": params or {}, "actor": "test"})
+        for _ in range(300):
+            current = self.call("GET", "/v1/jobs/%d" % job["id"])
+            if current["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(current["status"], expect, current["message"] + "\n" + current["log"]["text"][-3000:])
+        return current
+
+    def docker(self):
+        with open(self.state, encoding="utf-8") as f:
+            return json.load(f)
+
+    def set_docker(self, **values):
+        state = self.docker() if os.path.exists(self.state) else {}
+        state.update(values)
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+    def last_up(self):
+        return [c for c in self.docker()["compose"] if c["command"] == "up"][-1]
+
+    def page(self):
+        with open(os.path.join(self.webroot, "version.txt"), encoding="utf-8") as f:
+            return f.read()
+
+    def volume_file(self, *parts):
+        return os.path.join(self.tmp, "docker", "volumes", *parts)
+
+    # ---------- tests (run in order) ----------
+    def test_00_register(self):
+        self.assertEqual(self.call("GET", "/v1/status")["docker_compose"], "2.29.1")
+        check = self.call("POST", "/v1/github/check", {"repo": "o/shop", "source": "source"})
+        self.assertEqual((check["ok"], check["with_asset"], check["latest"]), (True, 4, "1.3.0"))   # every release has source code
+        created = self.call("POST", "/v1/sites", {
+            "preset": "compose-build", "id": "shop", "domain": "shop.example.com", "path": self.site_dir, "repo": "o/shop",
+            "shared": [".env", "data/"], "backup_env_file": ".env", "backup_db_service": "db", "backup_volumes": ["uploads"],
+            "health_url": "http://127.0.0.1:%d/version.txt" % self.web.server_address[1], "health_contains": "version {version}",
+            "build": 'echo "$COMPOSE_PROJECT_NAME|$COMPOSE_FILE" > hook.txt', "keep_releases": 2})
+        settings = created["settings"]
+        self.assertEqual((settings["deploy_mode"], settings["source"], settings["web_user"], settings["docroot_link"]),
+                         ("compose", "source", "", ""))
+        self.assertEqual((created["deploy_mode"], created["latest_version"]), ("compose", "1.3.0"))
+
+    def test_01_adopt_compose_installation(self):
+        # a compose installation made by hand, running as project "shop" (not the folder name "shopexamplecom")
+        files = shop_files("1.0.0")
+        for name in ("compose.yaml", "public/version.txt", "data/.keep"):
+            os.makedirs(os.path.dirname(os.path.join(self.site_dir, name)), exist_ok=True)
+            with open(os.path.join(self.site_dir, name), "w", encoding="utf-8") as f:
+                f.write(files[name])
+        with open(os.path.join(self.site_dir, ".env"), "w", encoding="utf-8") as f:
+            f.write("COMPOSE_PROJECT_NAME=shop\nDB_DATABASE=shopdb\nMYSQL_PASSWORD=supersecret\n")
+        with open(os.path.join(self.site_dir, "data", "user.txt"), "w", encoding="utf-8") as f:
+            f.write("user data")
+        for volume in ("shop_uploads", "shop_dbdata"):
+            os.makedirs(self.volume_file(volume))
+        with open(self.volume_file("shop_uploads", "photo.jpg"), "w", encoding="utf-8") as f:
+            f.write("photo")
+        self.set_docker(db="INSERT INTO t VALUES (1);\n", volume_users={"shop_uploads": ["shop-web"], "shop_dbdata": ["shop-db"]})
+        with open(os.path.join(self.webroot, "version.txt"), "w", encoding="utf-8") as f:
+            f.write("version 1.0.0")
+
+        job = self.job("adopt", "1.0.0")
+        details = self.call("GET", "/v1/sites/shop")
+        self.assertEqual((details["state"], details["current_version"], details["settings"]["compose_project"]), ("ready", "1.0.0", "shop"))
+        up = self.last_up()
+        self.assertEqual((up["project"], os.path.normcase(up["directory"])),
+                         ("shop", os.path.normcase(os.path.join(self.site_dir, "releases", "1.0.0"))))
+        self.assertIn(".rollout-compose.yml", up["files"])
+        docker = self.docker()
+        self.assertEqual(docker["built"][-1]["images"], {"web": "shop-web:1.0.0"})          # tagged with the version
+        self.assertEqual(docker["pulled"][-1]["services"], ["db"])
+        self.assertEqual(docker["containers"]["shop"]["web"], "shop-web:1.0.0")
+        dump = [e for e in docker["exec"] if '"$D"' in e["argv"][-1]][-1]                   # the dump itself
+        self.assertEqual((dump["service"], dump["env"]), ("db", {"ROLLOUT_DB": "shopdb"}))
+        self.assertFalse(any("supersecret" in " ".join(e["argv"]) for e in docker["exec"]))  # credentials stay in the container
+        backup = self.call("GET", "/v1/sites/shop/backups")[0]
+        self.assertEqual((backup["has_database"], backup["volumes"]), (1, 1))
+        manifest_path = os.path.join(self.config["backup_dir"], "shop", backup["id"], "manifest.json")
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual((manifest["database"]["engine"], manifest["database"]["where"]), ("mysql", "container"))
+        self.assertEqual(manifest["volumes"][0]["volume"], "shop_uploads")
+        with open(os.path.join(self.site_dir, "current", "data", "user.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "user data")                                          # bind mount data moved to shared/
+        with open(os.path.join(self.site_dir, "current", "hook.txt"), encoding="utf-8") as f:
+            hook = f.read()
+        self.assertTrue(hook.startswith("shop|") and ".rollout-compose.yml" in hook, hook)   # hooks can run docker compose
+        self.assertFalse(self.github.token_seen_by_storage)
+        self.assertIn("Download the source code of v1.0.0", job["log"]["text"])
+        self.assertTrue(details["health"]["ok"])
+
+    def test_02_deploy_and_rollback_without_rebuild(self):
+        self.job("deploy", "1.1.0")
+        self.assertEqual(self.page(), "version 1.1.0")
+        self.assertEqual(self.docker()["containers"]["shop"]["web"], "shop-web:1.1.0")
+        builds = len(self.docker()["built"])
+        job = self.job("rollback")
+        self.assertEqual((job["from_version"], job["to_version"]), ("1.1.0", "1.0.0"))
+        self.assertEqual(self.docker()["containers"]["shop"]["web"], "shop-web:1.0.0")       # the image of 1.0.0 again
+        self.assertEqual(len(self.docker()["built"]), builds)                                # no rebuild
+        self.assertEqual(self.page(), "version 1.0.0")
+        self.job("rollback")
+        self.assertEqual(self.page(), "version 1.1.0")
+
+    def test_03_mount_outside_the_release_stops_before_the_switch(self):
+        ups = len([c for c in self.docker()["compose"] if c["command"] == "up"])
+        job = self.job("deploy", "1.2.0", expect="failed")
+        self.assertIn("add cache/ to Shared files", job["message"])
+        self.assertEqual(len([c for c in self.docker()["compose"] if c["command"] == "up"]), ups)
+        self.assertEqual(self.call("GET", "/v1/sites/shop")["current_version"], "1.1.0")
+
+    def test_04_failed_health_check_starts_the_previous_containers(self):
+        job = self.job("deploy", "1.3.0", expect="failed")
+        self.assertIn("rolled back to 1.1.0", job["message"])
+        self.assertEqual(self.docker()["containers"]["shop"]["web"], "shop-web:1.1.0")
+        self.assertEqual(self.page(), "version 1.1.0")
+        self.assertIn("shop-web:1.3.0", self.docker().get("removed", []))                 # pruned with its release
+
+    def test_05_backup_and_restore_volume_and_database(self):
+        backup_id = self.job("backup")["message"].split()[-1]
+        with open(self.volume_file("shop_uploads", "photo.jpg"), "w", encoding="utf-8") as f:
+            f.write("changed")
+        with open(self.volume_file("shop_uploads", "new.jpg"), "w", encoding="utf-8") as f:
+            f.write("added after the backup")
+        self.job("restore", params={"backup_id": backup_id})
+        with open(self.volume_file("shop_uploads", "photo.jpg"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "photo")
+        self.assertFalse(os.path.exists(self.volume_file("shop_uploads", "new.jpg")))
+        docker = self.docker()
+        self.assertEqual((docker["stopped"][-1], docker["started"][-1]), (["shop-web"], ["shop-web"]))
+        self.assertIn("-- fake mysql dump of shopdb", docker["db_restored"])
+        self.assertIn("INSERT INTO t VALUES (1);", docker["db_restored"])
+
+    def test_06_delete_release_removes_its_image(self):
+        self.job("delete-release", "1.0.0")
+        self.assertIn("shop-web:1.0.0", self.docker()["removed"])
+
+    def test_07_project_name_is_fixed_once_installed(self):
+        status, doc = self.client.put("/v1/sites/shop", {"compose_project": "other"})
+        self.assertEqual((status, list(doc["error"]["fields"])), (422, ["compose_project"]))
+
+    def test_08_missing_docker_compose(self):
+        self.set_docker(no_compose=True)
+        self.deployer.compose._version = (0.0, None)
+        try:
+            with self.assertRaises(ComposeError):
+                self.deployer.compose.require()
+        finally:
+            self.set_docker(no_compose=False)
+            self.deployer.compose._version = (0.0, None)
+
+
+@unittest.skipUnless(OPENSSL, "openssl is needed to create the test certificate")
+class TlsTest(unittest.TestCase):
+    """The runner on HTTPS with a self-signed certificate, as install.sh --agent sets it up."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-tls-")
+        cls.cert, key = os.path.join(cls.tmp, "cert.pem"), os.path.join(cls.tmp, "key.pem")
+        subprocess.run([OPENSSL, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "2",
+                        "-subj", "/CN=rollout-test", "-keyout", key, "-out", cls.cert], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        config = Config.create(os.path.join(cls.tmp, "runner.json"), state_dir=os.path.join(cls.tmp, "state"),
+                               backup_dir=os.path.join(cls.tmp, "backup"), port=0, tls_cert=cls.cert, tls_key=key,
+                               allow_from=["10.9.0.0/16"])
+        config = Config(config.path)
+        config.prepare_dirs()
+        store = Store(config.state_path("runner.db"))
+        deployer = Deployer(config, store, Backups(config, store))
+        cls.server = serve(Api(config, store, deployer, Worker(config, store, deployer)))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.url = "https://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.secret = config["secret"]
+        cls.pin = certificate_pin(cls.cert)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop(cls.server)
+        time.sleep(0.2)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_pin_is_the_one_openssl_computes(self):
+        pubkey = subprocess.run([OPENSSL, "x509", "-in", self.cert, "-pubkey", "-noout"], stdout=subprocess.PIPE, check=True).stdout
+        der = subprocess.run([OPENSSL, "pkey", "-pubin", "-outform", "der"], input=pubkey, stdout=subprocess.PIPE, check=True).stdout
+        self.assertEqual(self.pin, "sha256//" + base64.b64encode(hashlib.sha256(der).digest()).decode())
+
+    def test_signed_request_over_https(self):
+        status, doc = Client(self.url, self.secret, pin=self.pin).get("/v1/status")
+        self.assertEqual(status, 200)
+        self.assertEqual((doc["data"]["tls"], doc["data"]["allow_from"]), (True, ["10.9.0.0/16"]))   # loopback is always allowed
+
+    def test_wrong_pin_is_refused(self):
+        with self.assertRaises(PinError):
+            Client(self.url, self.secret, pin="sha256//" + "A" * 43 + "=").get("/v1/status")
+
+    def test_plain_http_gets_no_answer(self):
+        with self.assertRaises(Exception):
+            Client(self.url.replace("https:", "http:"), self.secret, timeout=10).get("/v1/status")
+        self.assertEqual(Client(self.url, self.secret, pin=self.pin).get("/v1/status")[0], 200)     # the server still serves
+
+    def test_network_address_needs_tls(self):
+        path = os.path.join(self.tmp, "plain.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"listen": "0.0.0.0", "secret": "x"}, f)
+        with self.assertRaises(ValueError):
+            Config(path)
 
 
 if __name__ == "__main__":

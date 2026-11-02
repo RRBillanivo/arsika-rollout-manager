@@ -1,4 +1,5 @@
-// Overview: every registered site with its health, current and latest version, and one-click update (refreshes every 30 s).
+// Overview: every registered site of every server with its health, current and latest version, and one-click update
+// (refreshes every 30 s). A server that does not answer is named above the sites; the others are still shown.
 import { get } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { esc, icon, timeAgo } from '../core/ui.js';
@@ -18,14 +19,18 @@ function summary(sites) {
     <div class="stat stat--problem"><span>${icon('alert')}${s('problems')}</span><b>${problems}</b></div></section>`;
 }
 
-function card(site) {
+export function serverBadge(server) {
+  return `<span class="badge badge--server" title="${esc(t('sites.card.server'))}">${icon('server')}${esc(server.local ? t('sites.card.server_local') : server.name)}</span>`;
+}
+
+function card(site, showServer) {
   const c = (key, params) => t('sites.card.' + key, params);
   const job = site.last_job;
   const services = Object.entries(site.services || {});
   const busy = !!site.active_job;
   let action = '';
   if (busy) {
-    action = `<a class="btn btn--outline btn--small" href="#/jobs/${site.active_job.id}">${jobStatusBadge(site.active_job.status)} ${t('sites.overview.view_log')}</a>`;
+    action = `<a class="btn btn--outline btn--small" href="#/sites/${esc(site.id)}/jobs/${site.active_job.id}">${jobStatusBadge(site.active_job.status)} ${t('sites.overview.view_log')}</a>`;
   } else if (site.state === 'classic') {
     action = `<a class="btn btn--primary btn--small" href="#/sites/${site.id}/versions">${icon('package')}${t('sites.adopt.submit')}</a>`;
   } else if (site.update_available || (site.state === 'empty' && site.latest_version)) {
@@ -44,6 +49,8 @@ function card(site) {
       <div><dt>${c('latest')}</dt><dd>${site.latest_error ? `<span class="muted" title="${esc(site.latest_error)}">${icon('alert')} GitHub</span>` : versionPill(site.latest_version, site.update_available ? 'new' : '')}</dd></div>
     </dl>
     <div class="site-card__meta">
+      ${showServer && site.server ? serverBadge(site.server) : ''}
+      ${site.deploy_mode === 'compose' ? `<span class="badge badge--failed">${icon('layers')}Compose</span>` : ''}
       ${site.state !== 'ready' ? stateBadge(site.state) : ''}
       ${services.map(([name, state]) => `<span class="badge ${state === 'active' ? 'badge--normal' : state === 'unknown' ? 'badge--failed' : 'badge--danger'}">${esc(name)}: ${esc(state)}</span>`).join('')}
     </div>
@@ -55,18 +62,22 @@ function card(site) {
 export async function render(main, _params, app, isCurrent) {
   main.innerHTML = '<div aria-busy="true"><div class="skeleton skeleton--title"></div><div class="stat-grid">' + '<div class="skeleton skeleton--stat"></div>'.repeat(4) + '</div><div class="skeleton skeleton--table"></div></div>';
   let sites = [];
+  let servers = [];
 
   const draw = () => {
     const active = sites.find((s) => s.active_job);
+    const down = servers.filter((x) => !x.ok);
     main.innerHTML = `
 <header class="page-title">
   <div><h1>${t('sites.overview.title')}</h1><p class="muted">${t('sites.overview.lead', { n: sites.length })}
     <span class="live-note">${icon('refresh')}${t('sites.overview.auto_refresh')}</span></p></div>
   <div class="action-row"><a class="btn btn--primary" href="#/sites/new">${icon('plus')}${t('sites.overview.add')}</a></div>
 </header>
+${down.map((x) => `<div class="box box--red">${icon('alert')}<div><b>${esc(x.local ? t('sites.overview.server_down_local') : t('sites.overview.server_down', { name: x.name }))}</b>
+  ${esc(x.error)} <a href="#/servers">${t('sites.overview.servers_link')}</a></div></div>`).join('')}
 ${active ? `<div class="box box--blue">${icon('activity')}<div>${t('sites.overview.active_job', { id: active.active_job.id, type: jobType(active.active_job.type), site: active.name })}
-  <a href="#/jobs/${active.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}
-${sites.length ? summary(sites) + `<section class="site-grid">${sites.map(card).join('')}</section>`
+  <a href="#/sites/${esc(active.id)}/jobs/${active.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}
+${sites.length ? summary(sites) + `<section class="site-grid">${sites.map((x) => card(x, servers.length > 1)).join('')}</section>`
     : `<section class="empty-large">${icon('server', 'icon--large')}<h2>${t('sites.overview.empty_title')}</h2><p>${t('sites.overview.empty_text')}</p>
       <a class="btn btn--primary" href="#/sites/new">${icon('plus')}${t('sites.overview.add')}</a></section>`}`;
   };
@@ -74,7 +85,8 @@ ${sites.length ? summary(sites) + `<section class="site-grid">${sites.map(card).
   const load = async () => {
     const { data } = await get('sites');
     if (!isCurrent()) return;
-    sites = data;
+    sites = data.sites;
+    servers = data.servers;
     draw();
   };
   await load();

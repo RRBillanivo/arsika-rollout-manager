@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 
+from .sites import DEFAULTS
 from .util import now
 
 SCHEMA = """
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS backups (
     size_bytes INTEGER NOT NULL DEFAULT 0,
     has_database INTEGER NOT NULL DEFAULT 0,
     has_files INTEGER NOT NULL DEFAULT 0,
+    volumes INTEGER NOT NULL DEFAULT 0,
     reason TEXT,
     job_id INTEGER,
     PRIMARY KEY (site_id, id)
@@ -65,6 +67,9 @@ class Store(object):
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA busy_timeout = 5000")
         self.db.executescript(SCHEMA)
+        columns = [r["name"] for r in self.db.execute("PRAGMA table_info(backups)").fetchall()]
+        if "volumes" not in columns:                                 # runner 1.1.0 and older
+            self.db.execute("ALTER TABLE backups ADD COLUMN volumes INTEGER NOT NULL DEFAULT 0")
 
     def query(self, sql, params=()):
         with self.lock:
@@ -101,7 +106,8 @@ class Store(object):
 
     @staticmethod
     def _site(row):
-        site = json.loads(row["config"])
+        site = dict(DEFAULTS)                                        # settings added by later versions get their default
+        site.update(json.loads(row["config"]))
         site.update(id=row["id"], created_at=row["created_at"], updated_at=row["updated_at"])
         return site
 
@@ -172,10 +178,11 @@ class Store(object):
         return self.one("SELECT * FROM backups WHERE site_id = ? AND id = ?", (site_id, backup_id))
 
     def save_backup(self, site_id, backup_id, **fields):
-        self.execute("INSERT INTO backups (id, site_id, version, created_at, size_bytes, has_database, has_files, reason, job_id) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        self.execute("INSERT INTO backups (id, site_id, version, created_at, size_bytes, has_database, has_files, volumes, reason, "
+                     "job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      (backup_id, site_id, fields.get("version"), fields.get("created_at") or now(), fields.get("size_bytes", 0),
-                      int(bool(fields.get("has_database"))), int(bool(fields.get("has_files"))), fields.get("reason"), fields.get("job_id")))
+                      int(bool(fields.get("has_database"))), int(bool(fields.get("has_files"))), int(fields.get("volumes") or 0),
+                      fields.get("reason"), fields.get("job_id")))
 
     def delete_backup(self, site_id, backup_id):
         self.execute("DELETE FROM backups WHERE site_id = ? AND id = ?", (site_id, backup_id))

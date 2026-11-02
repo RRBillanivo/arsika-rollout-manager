@@ -1,83 +1,96 @@
 # Arsika Rollout Manager
 
-A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux server**,
-straight from the zip assets of their **GitHub Releases**.
+A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux servers**,
+straight from their **GitHub Releases**: a zip attached to the release, or the release's source code.
 
-![version](https://img.shields.io/badge/version-1.1.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
-![php](https://img.shields.io/badge/PHP-7.4%2B-777bb4) ![python](https://img.shields.io/badge/Python-3.6%2B-3776ab)
+![version](https://img.shields.io/badge/version-1.2.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
+![php](https://img.shields.io/badge/PHP-7.4%E2%80%938.4-777bb4) ![python](https://img.shields.io/badge/Python-3.6%E2%80%933.13-3776ab)
 
-> **Status: early release.** Version 1.1.0 passes its automated tests (a runner integration test and an end-to-end
-> smoke test on PHP 7.4 and 8.3), but it has not been proven on production servers yet. Try it on a test server first
-> and keep your own backups.
+> **Status: early release.** Version 1.1 runs in production on an aaPanel server (adoption of an existing site,
+> deployments, backups). The features of 1.2 (other servers, servers without a panel, Docker Compose, PostgreSQL and
+> container backups) pass the automated tests but are new: try them with a test application first and keep your own
+> backups.
 
 ## What it is for
 
-Updating a web application by hand usually means: back up the data, upload a zip, unpack it over the running site and
-hope nothing breaks. Arsika Rollout Manager does this for you:
+Updating a web application by hand usually means: back up the data, upload a zip or pull the code, rebuild, restart
+and hope nothing breaks. Arsika Rollout Manager does this for you:
 
-1. You publish a release of your application on GitHub, with the application as a zip asset.
-2. The dashboard on your server shows that a new version is available.
-3. One click backs up the database and the data files, installs the new version next to the running one, runs the
-   application's build steps, switches over and checks that the site answers.
+1. You publish a release of your application on GitHub.
+2. The dashboard shows that a new version is available.
+3. One click backs up the database and the data, installs the new version next to the running one (and builds its
+   Docker images, when it runs with Docker Compose), switches over and checks that the site answers.
 4. If the check fails, the previous version is switched back automatically. Earlier versions stay on the server, so a
-   manual rollback takes seconds.
+   manual rollback takes seconds, also for Docker Compose applications (their images are tagged with the version).
 
-One installation manages several sites on the same server.
+One dashboard manages many sites on **this server and on other servers** (in the local network, over a VPN or over the
+internet): each other server runs only the small runner service.
 
 ## Features
 
-- **Overview** of every registered site: health (HTTP check), current version, latest GitHub release, services, last job.
+- **Overview** of every site of every server: health (HTTP check), current version, latest GitHub release, last job.
 - **Deploy** any release in one click; the new version is prepared next to the running one, activated, then checked.
   When the health check fails, the previous version is switched back automatically.
+- **Two ways to run a site**
+  - *Files* served by the web server: PHP applications, static sites, applications run by a systemd service.
+  - *Docker Compose*: the compose files of the release are run with `docker compose up -d`; images are built from the
+    release (tagged with its version) or pulled; named volumes and the project name stay the same across versions.
+- **Two release sources:** a zip asset attached to the release, or GitHub's source code archive of the release tag.
 - **Rollback** to any version still on the server within seconds.
-- **Backups** of the database (mysqldump) and the shared files (.env, storage) before every update, on demand, and
-  **restore** with a safety backup first.
-- **Adoption** of an installation made by hand (files directly in the site folder) without downtime.
-- **One GitHub token per site:** each site has its own read-only token (or none for a public repository), so a leaked
-  token exposes one repository only. Tokens are kept by the runner and never shown again.
+- **Backups** before every update, on demand, and **restore** with a safety backup first:
+  - databases: MySQL/MariaDB or PostgreSQL, on the server or inside a container (the dump runs in the container with
+    the container's own credentials);
+  - shared files (.env, storage/) and Docker volumes.
+- **Adoption** of an installation made by hand (files in the site folder, or a running `docker compose` project)
+  without downtime.
+- **Several servers:** a server is added with its address, secret and certificate key pin; the dashboard talks to it
+  over HTTPS and signs every request. A server that is down does not hide the others.
+- **aaPanel and plain servers:** paths, web server user and nginx examples for both.
+- **One GitHub token per site:** each site has its own read-only token (or none for a public repository). Tokens are
+  kept by the runner of the site's server and never shown again.
 - **Live job logs**, job history, activity log (sign-ins and every administrator action).
-- Presets for PHP applications and static sites, plus Anemia Web 3.x as a complete example with a Python service; any
-  site can define its own build and activation commands.
 - Interface in Indonesian and English, light and dark theme, works on phones.
 
 ## Requirements
 
-- A Linux server with root access and systemd (VPS, virtual machine or dedicated server).
-- For the dashboard: PHP 7.4 to 8.3 with `curl`, `pdo_mysql`, `openssl`, `mbstring`, and MySQL 5.7+ / MariaDB 10.3+.
-- For the runner: Python 3.6 or newer (standard library only).
-- A domain or sub-domain for the dashboard, served over HTTPS.
+- Linux servers with root access and systemd (VPS, virtual machines, dedicated servers), with or without aaPanel.
+- Runner (every server): Python 3.6 or newer (standard library only); Docker with Compose v2 for Docker Compose sites.
+- Dashboard (one server): PHP 7.4 to 8.4 with `curl`, `pdo_mysql`, `openssl`, `mbstring`; MySQL 5.7+ / MariaDB 10.3+;
+  a domain or sub-domain served over HTTPS.
 
-The installer and the installation guide currently target servers managed with **aaPanel**. On other Linux servers
-(nginx or Apache without a panel) the paths have to be adjusted by hand for now; built-in support is planned.
+## Installation
 
-## Installation (aaPanel)
-
-Create a site and a MySQL database, upload the release archive `arsika-rollout-manager-vX.Y.Z.zip` into the site
-folder and unzip it, then run as root:
+On the server that hosts the dashboard (aaPanel site or nginx + PHP-FPM), unzip the release archive
+`arsika-rollout-manager-vX.Y.Z.zip` into the dashboard's folder and run as root:
 
 ```sh
-cd /www/wwwroot/rollout.example.com
-bash deploy/install.sh
+bash deploy/install.sh              # dashboard + runner of this server
 ```
 
-Set the site's running directory to `/public`, paste [deploy/nginx/aapanel.conf](deploy/nginx/aapanel.conf) as URL
-rewrite rules, and open the one-time administrator setup link printed by the script. Full guide:
-[docs/INSTALL.md](docs/INSTALL.md). Registering sites and adopting an existing installation: [docs/SITES.md](docs/SITES.md).
+On every other server (runner only, no PHP needed):
+
+```sh
+bash deploy/install.sh --agent      # HTTPS runner; prints the address, secret and key pin for the dashboard
+```
+
+Then add the server in the dashboard under **Servers**. Guides: [docs/INSTALL.md](docs/INSTALL.md) (aaPanel and plain
+servers), [docs/SERVERS.md](docs/SERVERS.md) (other servers), [docs/SITES.md](docs/SITES.md) (registering, adopting,
+Docker Compose, backups).
 
 ## How it works
 
 ```
-Browser ──HTTPS──> Dashboard (PHP site, public/)                     MySQL: administrators, audit log
-                        │  signed requests (HMAC-SHA256) to 127.0.0.1:8790
-                        ▼
-                   Runner (Python, systemd service, root)            SQLite: sites, releases, jobs, backups
-                        │  GitHub API, unzip, symlinks, systemctl, mysqldump
-                        ▼
-/www/wwwroot/<site>/  releases/<version>/  shared/  current -> releases/<version>   public -> current/public
+Browser ──HTTPS──> Dashboard (PHP)                                    MySQL: administrators, servers, audit log
+                     │ signed requests (HMAC-SHA256)
+                     ├──> 127.0.0.1:8790   runner of this server       (plain HTTP on loopback)
+                     └──> https://vm2:8790 runner of another server    (HTTPS, pinned certificate, allowlist)
+                              │ GitHub API, unzip, symlinks, docker compose, systemctl, dumps
+                              ▼
+<site>/  releases/<version>/  shared/  current -> releases/<version>  [public -> current/public]
 ```
 
-The dashboard never runs as root: it authenticates the administrator and forwards signed requests to the runner, which
-does the work. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md),
+The dashboard never runs as root: it authenticates the administrator and forwards signed requests to the runners, which
+do the work. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md),
 [docs/API.md](docs/API.md).
 
 ## Project layout
@@ -86,22 +99,22 @@ does the work. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECU
 app/                            dashboard (PHP): Core, Http, Models, Services, Install, Console
 config/ routes/ lang/ database/schema/ bootstrap/ bin/console
 public/                         web root: index.html (single-page app), index.php (API), assets/
-runner/arsika_rollout_manager/  runner (Python, standard library only): API, job queue, deployments, backups
+runner/arsika_rollout_manager/  runner (Python, standard library only): API, job queue, deployments, compose, backups
 runner/presets/                 build/activation hooks for known applications
-runner/tests/                   runner integration test (fake GitHub, fake web site)
-deploy/                         install.sh, nginx rules
-docs/                           architecture, installation, sites, API, security
-tests/smoke_test.py             end-to-end test: dashboard + runner + fake GitHub
+runner/tests/                   runner integration test (fake GitHub, fake web site, fake docker)
+deploy/                         install.sh, nginx examples (aaPanel and plain servers)
+docs/                           architecture, installation, servers, sites, API, security
+tests/smoke_test.py             end-to-end test: dashboard + two runners + fake GitHub
 ```
 
 ## Development and tests
 
 ```sh
-python runner/tests/test_runner.py                              # runner (needs bash and symlink support)
-python tests/smoke_test.py --php php [--php-ini php.ini]        # dashboard + runner end to end
+python runner/tests/test_runner.py                              # runner (needs bash and symlink support; openssl for HTTPS)
+python tests/smoke_test.py --php php [--php-ini php.ini]        # dashboard + runners end to end
 ```
 
-Both tests run entirely on 127.0.0.1 with temporary folders and a fake GitHub API.
+Both tests run entirely on 127.0.0.1 with temporary folders, a fake GitHub API and a fake docker command.
 
 ## Versioning
 

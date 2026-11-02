@@ -8,6 +8,7 @@ use App\Core\Request;
 use App\Core\Response;
 use App\Models\User;
 use App\Services\RunnerClient;
+use App\Services\Servers;
 use App\Services\SessionManager;
 
 /** Bootstrap data for the single-page app. */
@@ -21,21 +22,29 @@ final class AppController extends Controller
     private $users;
     /** @var RunnerClient */
     private $runner;
+    /** @var Servers */
+    private $servers;
 
-    public function __construct(Application $app, SessionManager $session, User $users, RunnerClient $runner)
+    public function __construct(Application $app, SessionManager $session, User $users, RunnerClient $runner, Servers $servers)
     {
         $this->app = $app;
         $this->session = $session;
         $this->users = $users;
         $this->runner = $runner;
+        $this->servers = $servers;
     }
 
-    /** GET /api/v1/app — version, CSRF token, signed-in account and (for administrators) the runner state. */
+    /**
+     * GET /api/v1/app — version, CSRF token, signed-in account and (for administrators) the state of this server's
+     * runner. A dashboard that only controls other servers may have no runner of its own.
+     */
     public function show(Request $request): Response
     {
         $user = $this->session->user();
         $runner = null;
-        if ($user !== null) {
+        if ($user !== null && !$this->runner->configured() && $this->servers->remote()) {
+            $runner = ['ok' => true, 'configured' => false];
+        } elseif ($user !== null) {
             try {
                 $status = $this->runner->get('/v1/status');
                 $runner = ['ok' => true, 'version' => $status['version'] ?? '', 'active_job' => $status['active_job'] ?? null];

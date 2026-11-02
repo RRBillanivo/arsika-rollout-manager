@@ -6,6 +6,7 @@ export default {
       title: 'Runner', version: 'Versi', python: 'Python', uptime: 'Hidup', disk: 'Disk backup', roots: 'Folder situs yang diizinkan',
       ok: 'Runner berjalan di server.', down: 'Runner tidak menjawab.',
       tokens: 'Token GitHub: {n} dari {sites} situs punya token sendiri (diatur di pengaturan tiap situs).',
+      servers: 'Server lain yang dikelola dasbor ini',
     },
     uptime: { days: '{d} hari {h} jam', hours: '{h} jam {m} menit', minutes: '{m} menit' },
     account: {
@@ -20,6 +21,7 @@ export default {
       title: 'Runner', version: 'Version', python: 'Python', uptime: 'Uptime', disk: 'Backup disk', roots: 'Allowed site folders',
       ok: 'The runner is running on the server.', down: 'The runner does not answer.',
       tokens: 'GitHub tokens: {n} of {sites} sites have their own token (set in the settings of each site).',
+      servers: 'Other servers this dashboard controls',
     },
     uptime: { days: '{d} days {h} h', hours: '{h} h {m} min', minutes: '{m} min' },
     account: {

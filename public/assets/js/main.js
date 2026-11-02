@@ -12,6 +12,7 @@ import * as sitePage from './pages/site.js';
 import * as jobPage from './pages/job.js';
 import * as settingsPage from './pages/settings.js';
 import * as activityPage from './pages/activity.js';
+import * as serversPage from './pages/servers.js';
 
 // access: guest (signed out only) or auth; title = key in common.titles; menu = key in common.menu
 const router = new Router([
@@ -19,12 +20,14 @@ const router = new Router([
   { pattern: /^\/$/, page: overviewPage, access: 'auth', menu: 'overview', title: 'overview' },
   { pattern: /^\/sites\/new$/, page: siteNewPage, access: 'auth', menu: 'overview', title: 'site_new' },
   { pattern: /^\/sites\/([a-z0-9][a-z0-9-]{0,39})(?:\/(versions|history|backups|settings))?$/, page: sitePage, access: 'auth', menu: 'overview', title: 'site' },
+  { pattern: /^\/sites\/([a-z0-9][a-z0-9-]{0,39})\/jobs\/(\d+)$/, page: jobPage, access: 'auth', menu: 'overview', title: 'job' },
   { pattern: /^\/jobs\/(\d+)$/, page: jobPage, access: 'auth', menu: 'overview', title: 'job' },
+  { pattern: /^\/servers$/, page: serversPage, access: 'auth', menu: 'servers', title: 'servers' },
   { pattern: /^\/settings$/, page: settingsPage, access: 'auth', menu: 'settings', title: 'settings' },
   { pattern: /^\/activity$/, page: activityPage, access: 'auth', menu: 'activity', title: 'activity' },
 ]);
 
-const MENU = [['/', 'overview', 'grid'], ['/activity', 'activity', 'file'], ['/settings', 'settings', 'settings']];
+const MENU = [['/', 'overview', 'grid'], ['/servers', 'servers', 'server'], ['/activity', 'activity', 'file'], ['/settings', 'settings', 'settings']];
 
 /** Shared state and navigation helpers handed to every page. */
 const app = {
@@ -151,7 +154,7 @@ function renderHeader() {
 
 function renderRunnerBanner() {
   const banner = document.getElementById('banner');
-  const runner = app.info && app.info.runner;
+  const runner = app.info && app.info.runner;          // the runner of this server (a dashboard may only control others)
   if (!app.user || !runner || runner.ok) { if (banner.dataset.kind === 'runner') banner.hidden = true; return; }
   banner.dataset.kind = 'runner';
   banner.hidden = false;

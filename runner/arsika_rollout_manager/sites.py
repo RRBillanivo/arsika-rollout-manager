@@ -1,11 +1,15 @@
 """Site settings: validation, defaults and presets.
 
-A site is a web application on this server that is installed from the zip asset of a GitHub release:
+A site is a web application on this server that is installed from a GitHub release: a zip asset of the release
+(source "asset") or the release's source code archive (source "source"):
 
     <path>/releases/<version>/    one folder per installed release
     <path>/shared/                files kept between releases (.env, storage/ ...), linked into every release
     <path>/current -> releases/<version>
     <path>/<docroot_link> -> current/<docroot_target>   the web server's document root (aaPanel: Running directory)
+
+Deploy mode "files" serves the release folder through the web server (PHP, static files, an app run by a systemd
+unit); deploy mode "compose" runs the release's Docker Compose files (see compose.py).
 
 Hooks ("build" before the switch, "activate" after it) are shell commands run as root, or "preset:<name>" for the
 scripts in runner/presets/.
@@ -14,6 +18,8 @@ import os
 import re
 
 from .util import REPO, SERVICE, SITE_ID, USER
+
+SOURCE_ARCHIVE = ":source"                 # release pattern meaning: the release's source code archive (zipball)
 
 DEFAULTS = {
     "name": "",
@@ -38,6 +44,27 @@ DEFAULTS = {
     "backup_exclude": [],
     "backup_keep": 5,
     "adopt_keep": [".user.ini", ".well-known", ".htaccess"],
+    "deploy_mode": "files",
+    "source": "asset",
+    "compose_files": [],
+    "compose_project": "",
+    "compose_build": True,
+    "backup_db": "auto",
+    "backup_db_service": "",
+    "backup_volumes": [],
+}
+
+COMPOSE = {
+    "deploy_mode": "compose",
+    "source": "source",
+    "web_user": "",
+    "shared": [".env"],
+    "docroot_link": "",
+    "docroot_target": ".",
+    "reload_php_fpm": False,
+    "health_url": "https://{domain}/",
+    "backup_env_file": "",
+    "backup_paths": [".env"],
 }
 
 PRESETS = {
@@ -78,24 +105,37 @@ PRESETS = {
         "health_url": "https://{domain}/",
         "backup_paths": [],
     },
+    "compose-build": dict(COMPOSE, label="Docker Compose: build the images from the release", compose_build=True),
+    "compose-images": dict(COMPOSE, label="Docker Compose: pull ready-made images", compose_build=False),
 }
 
 RELATIVE = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9_.@+-][A-Za-z0-9_./@+-]{0,199}$")
 DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
-LIST_FIELDS = ("shared", "services", "backup_paths", "backup_exclude", "adopt_keep")
-BOOL_FIELDS = ("reload_php_fpm", "backup_before_deploy")
+LIST_FIELDS = ("shared", "services", "backup_paths", "backup_exclude", "adopt_keep", "compose_files", "backup_volumes")
+BOOL_FIELDS = ("reload_php_fpm", "backup_before_deploy", "compose_build")
 HOOK_FIELDS = ("build", "activate")
+CHOICES = {"deploy_mode": ("files", "compose"), "source": ("asset", "source"), "backup_db": ("auto", "mysql", "postgres", "none")}
+PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+CONTAINER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
-def preset(name):
-    """Default settings of a preset (without its label)."""
+def preset(name, web_user=None):
+    """Default settings of a preset (without its label). ``web_user`` = this server's web server user, used by the
+    presets that serve files (Docker Compose sites have none)."""
     values = dict(DEFAULTS)
     values.update({k: v for k, v in PRESETS.get(name, {}).items() if k != "label"})
+    if web_user is not None and values["deploy_mode"] == "files":
+        values["web_user"] = web_user
     return values
 
 
-def presets_info():
-    return [{"id": key, "label": value["label"], "settings": preset(key)} for key, value in PRESETS.items()]
+def presets_info(web_user=None):
+    return [{"id": key, "label": value["label"], "settings": preset(key, web_user)} for key, value in PRESETS.items()]
+
+
+def release_pattern(site):
+    """What to take from a release: the asset pattern, or SOURCE_ARCHIVE for the source code archive."""
+    return SOURCE_ARCHIVE if site.get("source") == "source" else site.get("asset_pattern") or "*.zip"
 
 
 def _as_list(value):
@@ -106,7 +146,8 @@ def _as_list(value):
 
 def validate(data, site_roots, existing=None):
     """Check settings sent by the dashboard. -> (site dict, errors dict field -> message)."""
-    site = dict(existing or DEFAULTS)
+    site = dict(DEFAULTS)
+    site.update(existing or {})
     errors = {}
     for key in DEFAULTS:
         if key in data:
@@ -183,6 +224,25 @@ def validate(data, site_roots, existing=None):
     site["backup_env_file"] = str(site["backup_env_file"]).strip()
     if site["backup_env_file"] and not RELATIVE.match(site["backup_env_file"]):
         errors["backup_env_file"] = "Path inside shared/, e.g. .env."
+
+    for key, allowed in CHOICES.items():
+        site[key] = str(site[key] or DEFAULTS[key]).strip().lower()
+        if site[key] not in allowed:
+            errors[key] = "One of: " + ", ".join(allowed) + "."
+    bad = [p for p in site["compose_files"] if not RELATIVE.match(p)]
+    if bad:
+        errors["compose_files"] = "Relative paths only (no leading / and no ..): " + ", ".join(bad[:3])
+    site["compose_project"] = str(site["compose_project"] or "").strip()
+    if site["compose_project"] and not PROJECT.match(site["compose_project"]):
+        errors["compose_project"] = "Lowercase letters, digits, - and _ (empty: the name of the site folder)."
+    site["backup_db_service"] = str(site["backup_db_service"] or "").strip()
+    if site["backup_db_service"] and not CONTAINER.match(site["backup_db_service"]):
+        errors["backup_db_service"] = "Name of a compose service or container, e.g. db."
+    bad = [v for v in site["backup_volumes"] if not CONTAINER.match(v)]
+    if bad:
+        errors["backup_volumes"] = "Volume names only: " + ", ".join(bad[:3])
+    if site["deploy_mode"] == "compose" and site["reload_php_fpm"]:
+        site["reload_php_fpm"] = False                               # the containers serve the site
     return site, errors
 
 

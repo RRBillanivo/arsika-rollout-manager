@@ -46,11 +46,11 @@ export function actionDialog({ title, message = '', extra = '', password = false
   });
 }
 
-/** Queue a job on the runner and open its live log. */
+/** Queue a job on the runner of the site's server and open its live log. */
 export async function startJob(app, siteId, payload) {
   const { data } = await post(`sites/${siteId}/jobs`, payload);
   toast(t('sites.versions.job_started', { id: data.id }), 'success');
-  app.go(`/jobs/${data.id}`);
+  app.go(`/sites/${siteId}/jobs/${data.id}`);
   return data;
 }
 

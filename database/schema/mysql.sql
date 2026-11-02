@@ -1,5 +1,6 @@
 -- Schema for MySQL 5.7+ / MariaDB 10.3+ (created automatically, see App\Core\Database).
--- The dashboard stores only its administrators and audit data; sites, releases, jobs and backups live in the runner.
+-- The dashboard stores its administrators, audit data and the other servers it controls; sites, releases, jobs and
+-- backups live in the runner of each server.
 
 CREATE TABLE IF NOT EXISTS app_meta (
     meta_key VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -50,4 +51,25 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     details VARCHAR(255) NULL,
     ip VARCHAR(45) NULL,
     KEY audit_logs_time_index (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Runners on other servers (schema version 2). The secret is encrypted with APP_KEY; tls_pin is the public key pin of
+-- the runner's certificate (empty: the certificate is checked against the system's certificate authorities).
+CREATE TABLE IF NOT EXISTS servers (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(80) NOT NULL,
+    url VARCHAR(255) NOT NULL,
+    secret TEXT NOT NULL,
+    tls_pin VARCHAR(255) NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY servers_url_unique (url)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- The server of each site that is not on this server (a site without a row belongs to the runner of this server).
+CREATE TABLE IF NOT EXISTS site_servers (
+    site_id VARCHAR(40) NOT NULL PRIMARY KEY,
+    server_id INT UNSIGNED NOT NULL,
+    created_at DATETIME NOT NULL,
+    KEY site_servers_server_index (server_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -1,4 +1,5 @@
 // Live job log: the runner's log is read in pieces (from the last byte offset) every second until the job ends.
+// Job numbers count per server: #/sites/<site>/jobs/<n> (#/jobs/<n> = a job of this server, links of version 1.1).
 import { get } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { duration, esc, formatDateTime, icon, toast } from '../core/ui.js';
@@ -15,13 +16,15 @@ function formatLog(text) {
   }).join('');
 }
 
-export async function render(main, [jobId], app, isCurrent) {
+export async function render(main, params, app, isCurrent) {
   const p = (key, params) => t('jobs.page.' + key, params);
+  const [siteId, jobId] = params.length > 1 ? params : ['', params[0]];
+  const path = siteId ? `sites/${siteId}/jobs/${jobId}` : `jobs/${jobId}`;
   let offset = 0;
   let text = '';
   let follow = true;
   let timer = null;
-  let job = (await get(`jobs/${jobId}?offset=0`)).data;
+  let job = (await get(`${path}?offset=0`)).data;
   if (!isCurrent()) return null;
 
   main.innerHTML = `
@@ -66,7 +69,7 @@ export async function render(main, [jobId], app, isCurrent) {
   const poll = async () => {
     if (!isCurrent()) return;
     try {
-      const { data } = await get(`jobs/${jobId}?offset=${offset}`);
+      const { data } = await get(`${path}?offset=${offset}`);
       if (!isCurrent()) return;
       const wasRunning = job.status === 'queued' || job.status === 'running';
       apply(data);

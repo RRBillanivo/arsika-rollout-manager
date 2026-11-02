@@ -155,6 +155,13 @@ def quick_health(url, contains, timeout=8):
         return {"ok": False, "status": 0, "ms": int((time.time() - t0) * 1000), "error": "%s: %s" % (type(e).__name__, str(e)[:150])}
 
 
+def platform_name():
+    """aapanel when aaPanel is installed on this server, else linux."""
+    if os.path.isdir("/www/server/panel"):
+        return "aapanel"
+    return "linux" if POSIX else os.name
+
+
 def disk_free(path):
     try:
         usage = shutil.disk_usage(path)

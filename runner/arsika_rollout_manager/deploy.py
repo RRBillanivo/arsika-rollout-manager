@@ -1,12 +1,13 @@
 """Deployment operations: install a release, switch "current", roll back, adopt an existing installation, and clean up.
 
 Order of a deployment (any failure before step 6 leaves the site untouched):
-  1. backup of the database and shared files (if enabled)
-  2. download the release asset from GitHub and verify its size / SHA-256
-  3. extract into releases/<version>/ and link the shared files
+  1. backup of the database, shared files and volumes (if enabled)
+  2. download the release asset (or the release's source code) from GitHub and verify its size / SHA-256
+  3. extract into releases/<version>/ and link the shared files; Docker Compose sites: build or pull the images
   4. build hook (e.g. Python environment, database migrations, self-test)
   5. mark the release complete (.rollout-release.json)
-  6. switch current -> releases/<version>, activate hook, restart services, reload PHP-FPM
+  6. switch current -> releases/<version>; Docker Compose sites: docker compose up -d; activate hook, restart
+     services, reload PHP-FPM
   7. health check; on failure the previous release is switched back automatically
 """
 import json
@@ -16,8 +17,9 @@ import stat
 import zipfile
 
 from . import system
+from .compose import DEFAULT_FILES, OVERRIDE, Compose, ComposeError
 from .github import GitHub
-from .sites import expand, layout
+from .sites import expand, layout, release_pattern
 from .util import (POSIX, chown_tree, ensure_dir, exists, human_size, link_target, lock_file, make_link, remove,
                    sha256_file, switch_link, version_key, VERSION)
 
@@ -51,6 +53,7 @@ class Deployer(object):
         self.config = config
         self.store = store
         self.backups = backups
+        self.compose = getattr(backups, "compose", None) or Compose(config)
 
     def github(self, site):
         """GitHub client with the site's own read-only token (none for a public repository)."""
@@ -93,12 +96,35 @@ class Deployer(object):
 
     def variables(self, site, version):
         lay = layout(site)
-        return {
+        release_dir = os.path.join(lay["releases"], version)
+        values = {
             "ROLLOUT_SITE": site["id"], "ROLLOUT_VERSION": version, "ROLLOUT_SITE_DIR": site["path"],
-            "ROLLOUT_RELEASE_DIR": os.path.join(lay["releases"], version), "ROLLOUT_SHARED_DIR": lay["shared"],
+            "ROLLOUT_RELEASE_DIR": release_dir, "ROLLOUT_SHARED_DIR": lay["shared"],
             "ROLLOUT_CURRENT_DIR": lay["current"], "ROLLOUT_WEB_USER": site.get("web_user", ""), "ROLLOUT_DOMAIN": site.get("domain", ""),
-            "ROLLOUT_CACHE_DIR": os.path.join(lay["shared"], ".rollout-cache"),
+            "ROLLOUT_CACHE_DIR": os.path.join(lay["shared"], ".rollout-cache"), "ROLLOUT_DEPLOY_MODE": site.get("deploy_mode", "files"),
         }
+        if self.is_compose(site):
+            # a plain "docker compose run/exec ..." in a hook uses the project and the files (with the images) of this release
+            values["COMPOSE_PROJECT_NAME"] = values["ROLLOUT_COMPOSE_PROJECT"] = self.compose.project(site)
+            try:
+                files = self.compose.files(site, release_dir)
+                if os.path.isfile(os.path.join(release_dir, OVERRIDE)):
+                    files.append(OVERRIDE)
+                values["COMPOSE_FILE"] = ":".join(os.path.join(release_dir, name) for name in files)
+            except ComposeError:
+                pass
+        return values
+
+    @staticmethod
+    def is_compose(site):
+        return site.get("deploy_mode") == "compose"
+
+    def keep_project(self, site, name, log):
+        """Save the compose project of the site: its containers and volumes belong to that name from now on."""
+        if site.get("compose_project") != name:
+            site["compose_project"] = name
+            self.store.save_site({k: v for k, v in site.items() if k not in ("created_at", "updated_at")})
+            log.line("compose project of the site: " + name)
 
     # ------------------------------------------------------------------ release preparation
     def prepare_release(self, site, version, log, job_id):
@@ -114,17 +140,22 @@ class Deployer(object):
             remove(target)
 
         log.step("Find release %s in %s" % (version, site["repo"]))
+        if self.is_compose(site):
+            self.compose.require()                                   # before anything is downloaded
         github = self.github(site)
-        release = github.release(site["repo"], version, site["asset_pattern"])
+        release = github.release(site["repo"], version, release_pattern(site))
         asset = release["asset"]
         if not asset:
             raise DeployError("release %s has no asset matching %s (assets: %s)" % (
                 version, site["asset_pattern"], ", ".join(release["assets"]) or "none"))
         archive = self.config.state_path("downloads", "%s-%s-%d.zip" % (site["id"], version, job_id))
-        log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
+        if asset.get("source"):
+            log.step("Download the source code of %s (%s)" % (release["tag"], asset["name"]))
+        else:
+            log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
         try:
             size = github.download(asset, archive, lambda done, total: log.line(
-                "downloaded %s of %s" % (human_size(done), human_size(total))))
+                "downloaded %s" % human_size(done) + (" of %s" % human_size(total) if total else "")))
             if asset["size"] and size != asset["size"]:
                 raise DeployError("download incomplete: %d of %d bytes" % (size, asset["size"]))
             digest = sha256_file(archive)
@@ -147,13 +178,16 @@ class Deployer(object):
         self.link_shared(site, target, log)
         if site.get("web_user") and chown_tree(target, site["web_user"]):
             log.line("release files given to " + site["web_user"])
+        if self.is_compose(site):
+            self.keep_project(site, self.compose.project(site), log)
+            self.compose.prepare(site, version, target, log, system.run, self.config["hook_timeout_seconds"])
         system.run_hook(site, "build", site.get("build", ""), target, self.variables(site, version), log,
                         self.config["shell"], self.config["hook_timeout_seconds"])
-        info = {"version": version, "installed_at": system_now(), "asset": asset["name"], "size_bytes": asset["size"], "sha256": digest,
+        info = {"version": version, "installed_at": system_now(), "asset": asset["name"], "size_bytes": size, "sha256": digest,
                 "job_id": job_id}
         with open(os.path.join(target, MARKER), "w", encoding="utf-8") as f:
             json.dump(info, f, indent=2)
-        self.store.save_release(site["id"], version, asset["name"], asset["size"], digest)
+        self.store.save_release(site["id"], version, asset["name"], size, digest)
         log.line("release %s is ready" % version)
         return target
 
@@ -288,7 +322,12 @@ class Deployer(object):
         self.ensure_docroot(site, log)
 
     def activate(self, site, version, log):
-        system.run_hook(site, "activate", site.get("activate", ""), os.path.join(layout(site)["releases"], version),
+        release_dir = os.path.join(layout(site)["releases"], version)
+        if self.is_compose(site):
+            # the release folder itself (not current/) is the project directory: its bind mounts and images differ
+            # from the previous release, so compose recreates exactly the containers that changed
+            self.compose.up(site, version, release_dir, log, system.run, self.config["hook_timeout_seconds"])
+        system.run_hook(site, "activate", site.get("activate", ""), release_dir,
                         self.variables(site, version), log, self.config["shell"], self.config["hook_timeout_seconds"])
         system.restart_services(site.get("services", []), log)
         if site.get("reload_php_fpm"):
@@ -365,6 +404,17 @@ class Deployer(object):
             raise DeployError("nothing to adopt: the site folder is %s" % self.state(site))
         lay = layout(site)
         root = site["path"]
+        old_compose = False
+        if self.is_compose(site):
+            self.compose.require()
+            names = site.get("compose_files") or DEFAULT_FILES
+            old_compose = any(os.path.isfile(os.path.join(root, name)) for name in names)
+            if old_compose:
+                # the new release takes over the containers and volumes of the running installation: same project
+                log.step("Find the compose project of the running installation")
+                self.keep_project(site, self.compose.detect_project(site, root), log)
+            else:
+                log.line("the old installation has no compose file; the containers of release %s replace it" % version)
         if job["params"].get("backup", True):
             # shared/ does not exist yet: the data is still in the site folder itself
             self.backups.create(site, version, "before adopting " + version, log, job["id"], base=root)
@@ -403,6 +453,8 @@ class Deployer(object):
                 if not exists(os.path.join(root, name)):
                     os.rename(os.path.join(lay["pre_rollout"], name), os.path.join(root, name))
             try:
+                if old_compose:                                      # the old containers, from the old compose files
+                    self.compose.up(site, "", root, log, system.run, self.config["hook_timeout_seconds"])
                 # presets put back what their activate step changed (e.g. the old systemd unit); custom hooks are not re-run
                 if site.get("activate", "").startswith("preset:"):
                     system.run_hook(site, "adopt-revert", site["activate"], root, self.variables(site, version), log,
@@ -424,9 +476,19 @@ class Deployer(object):
         removable = [r for r in releases if r["version"] not in protected]
         excess = len(releases) - keep
         for release in sorted(removable, key=lambda r: r["installed_at"])[:max(0, excess)]:
-            remove(os.path.join(layout(site)["releases"], release["version"]))
+            path = os.path.join(layout(site)["releases"], release["version"])
+            self.remove_images(path, log)
+            remove(path)
             self.store.forget_release(site["id"], release["version"])
             log.line("old release removed: " + release["version"])
+
+    def remove_images(self, release_dir, log):
+        """Docker Compose sites: the images built for a release are removed with it (an image still in use stays)."""
+        if self.compose.images(release_dir):
+            try:
+                self.compose.remove_images(release_dir, log, system.run)
+            except system.CommandError as error:
+                log.line("images of %s not removed: %s" % (os.path.basename(release_dir), error))
 
     def delete_release(self, site, version, log):
         if version == self.current_version(site):
@@ -434,6 +496,7 @@ class Deployer(object):
         path = os.path.join(layout(site)["releases"], version)
         if not VERSION.match(version) or not exists(path):
             raise DeployError("release %s is not installed" % version)
+        self.remove_images(path, log)
         remove(path)
         self.store.forget_release(site["id"], version)
         log.line("release removed: " + version)

@@ -48,3 +48,20 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     ip TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_logs_time_index ON audit_logs (created_at);
+
+CREATE TABLE IF NOT EXISTS servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    secret TEXT NOT NULL,
+    tls_pin TEXT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_servers (
+    site_id TEXT NOT NULL PRIMARY KEY,
+    server_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS site_servers_server_index ON site_servers (server_id);

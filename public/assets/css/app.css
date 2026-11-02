@@ -279,6 +279,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--bg-2); padd
 .badge--failed { background: var(--bg-2); color: var(--muted); }
 .badge--yellow { background: var(--yellow-soft); color: var(--yellow); }
 .badge--admin { background: color-mix(in srgb, var(--purple) 15%, transparent); color: var(--purple); }
+.badge--server { background: color-mix(in srgb, var(--blue) 13%, transparent); color: var(--blue); }
 .badge--large { font-size: 1rem; padding: 8px 16px; }
 .chip-group { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { border: 1px solid var(--border-2); background: var(--surface); color: var(--text-2); padding: 6px 13px; border-radius: 999px; font: 600 .84rem var(--font); cursor: pointer; }

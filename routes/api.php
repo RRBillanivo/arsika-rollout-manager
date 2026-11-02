@@ -11,6 +11,7 @@ use App\Http\Controllers\ActivityController;
 use App\Http\Controllers\AppController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\JobController;
+use App\Http\Controllers\ServerController;
 use App\Http\Controllers\SettingsController;
 use App\Http\Controllers\SiteController;
 
@@ -18,6 +19,7 @@ return static function (Router $router): void {
     $router->pattern('site', '[a-z0-9][a-z0-9-]{0,39}');
     $router->pattern('backup', '[0-9A-Za-z][0-9A-Za-z._+-]{0,100}');
     $router->pattern('job', '\d{1,10}');
+    $router->pattern('server', '(?:local|\d{1,10})');
 
     $router->group(['prefix' => '/api/v1', 'middleware' => ['csrf']], static function (Router $router): void {
         $router->get('/app', [AppController::class, 'show']);
@@ -40,9 +42,16 @@ return static function (Router $router): void {
             $router->post('/sites/{site}/jobs', [SiteController::class, 'job']);
             $router->get('/sites/{site}/backups', [SiteController::class, 'backups']);
             $router->delete('/sites/{site}/backups/{backup}', [SiteController::class, 'destroyBackup']);
+            $router->get('/sites/{site}/jobs/{job}', [JobController::class, 'forSite']);
 
             $router->get('/jobs', [JobController::class, 'index']);
             $router->get('/jobs/{job}', [JobController::class, 'show']);
+
+            $router->get('/servers', [ServerController::class, 'index']);
+            $router->post('/servers', [ServerController::class, 'store']);
+            $router->post('/servers/test', [ServerController::class, 'test']);
+            $router->put('/servers/{server}', [ServerController::class, 'update']);
+            $router->delete('/servers/{server}', [ServerController::class, 'destroy']);
 
             $router->get('/settings', [SettingsController::class, 'show']);
 

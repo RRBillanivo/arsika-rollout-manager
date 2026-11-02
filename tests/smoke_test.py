@@ -6,7 +6,9 @@ public/install/, which deletes itself).
 
 Covers: setup page, sign-in and lockout messages, CSRF, password confirmation, site registration and validation,
 the site's own GitHub token (write-only, access check, removal), deploy, rollback, backups, settings, activity log,
-sign-out."""
+sign-out. With openssl (PATH or ROLLOUT_TEST_OPENSSL): a second runner on HTTPS as "another server" - connection test
+with a wrong key pin, without a pin and with a wrong secret, a site on that server (presets, access check, deploy, job
+log, history), site ids unique across servers, a server that is down, removing the server."""
 import argparse
 import base64
 import http.cookiejar
@@ -29,7 +31,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runner"))
 sys.path.insert(0, str(ROOT / "runner" / "tests"))
+from arsika_rollout_manager.util import certificate_pin  # noqa: E402
 from test_runner import FakeGitHub, release_files  # noqa: E402
+
+OPENSSL = os.environ.get("ROLLOUT_TEST_OPENSSL") or shutil.which("openssl")
 
 passed = failed = 0
 
@@ -110,6 +115,92 @@ def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def remote_tests(admin, password, tmp, github, args, logs, run_job):
+    """A second runner on HTTPS (as install.sh --agent sets it up) plays the other server."""
+    cert, key = tmp / "agent-cert.pem", tmp / "agent-key.pem"
+    subprocess.run([OPENSSL, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "2",
+                    "-subj", "/CN=smoke-agent", "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
+    pin = certificate_pin(str(cert))
+    port, secret = free_port(), secrets.token_hex(32)
+    www = tmp / "agent-www"
+    (www / "remote.test" / "shared").mkdir(parents=True)
+    (www / "remote.test" / "shared" / ".env").write_text("APP_KEY=remote\n")
+    config = tmp / "agent.json"
+    config.write_text(json.dumps({
+        "listen": "127.0.0.1", "port": port, "secret": secret, "state_dir": str(tmp / "agent-state"), "backup_dir": str(tmp / "agent-backup"),
+        "github_api": "http://127.0.0.1:%d" % github.port, "shell": args.shell, "site_roots": [str(www)], "tls_cert": str(cert),
+        "tls_key": str(key), "web_user": "www-data", "platform": "linux"}), encoding="utf-8")
+    agent = subprocess.Popen([sys.executable, "-m", "arsika_rollout_manager", "serve", "--config=" + str(config)], cwd=ROOT / "runner",
+                             stdout=logs, stderr=logs)
+    url = "https://127.0.0.1:%d" % port
+    try:
+        for _ in range(60):
+            status, doc = admin.post("servers/test", {"url": url, "secret": secret, "tls_pin": pin})
+            if status == 200:
+                break
+            time.sleep(0.25)
+        check("connection test with the key pin", status == 200 and doc["data"]["status"]["tls"], json.dumps(doc)[:300])
+        wrong_pin = "sha256//" + "A" * 43 + "="
+        status, doc = admin.post("servers/test", {"url": url, "secret": secret, "tls_pin": wrong_pin})
+        check("a wrong key pin is refused", status == 422 and "tls_pin" in doc["error"]["fields"], json.dumps(doc)[:300])
+        status, doc = admin.post("servers/test", {"url": url, "secret": secret, "tls_pin": ""})
+        check("a self-signed certificate without a pin is refused", status == 422 and "tls_pin" in doc["error"]["fields"], json.dumps(doc)[:300])
+        status, doc = admin.post("servers/test", {"url": url, "secret": "f" * 64, "tls_pin": pin})
+        check("a wrong secret is refused", status == 422 and "secret" in doc["error"]["fields"], json.dumps(doc)[:300])
+        status, doc = admin.post("servers/test", {"url": "http://192.168.1.20:8790", "secret": secret})
+        check("plain http to another machine is refused", status == 422 and "url" in doc["error"]["fields"])
+        status, doc = admin.post("servers", {"name": "VM2", "url": url, "secret": secret, "tls_pin": pin})
+        check("adding a server needs the password", status == 422 and "password" in doc["error"]["fields"])
+        status, doc = admin.post("servers", {"name": "VM2", "url": url + "/", "secret": secret, "tls_pin": pin, "password": password})
+        server_id = str(doc.get("data", {}).get("id", ""))
+        check("server added", status == 201 and server_id.isdigit() and doc["data"]["status"]["platform"] == "linux", json.dumps(doc)[:300])
+        status, doc = admin.get("servers")
+        names = [(s["id"], s["local"], bool(s["status"])) for s in doc["data"]]
+        check("servers list: this server and VM2, both answer", names == [("local", True, True), (server_id, False, True)], str(names))
+        check("the secret is never sent back", secret not in json.dumps(doc))
+        status, doc = admin.get("presets?server=" + server_id)
+        presets = {p["id"]: p["settings"] for p in doc.get("data", [])}
+        check("presets of VM2 use its web server user", presets.get("php-app", {}).get("web_user") == "www-data", json.dumps(doc)[:200])
+        status, doc = admin.post("github/check", {"repo": "o/demo", "asset_pattern": "demo_v*.zip", "server": server_id})
+        check("access check through VM2", status == 200 and doc["data"]["ok"])
+        site = {"server": server_id, "id": "demo", "domain": "remote.test", "path": str(www / "remote.test"), "repo": "o/demo",
+                "asset_pattern": "demo_v*.zip", "web_user": "", "shared": [".env"], "reload_php_fpm": False, "password": password}
+        status, doc = admin.post("sites", site)
+        check("site ids are unique across servers", status == 422 and "id" in doc["error"]["fields"], json.dumps(doc)[:300])
+        status, doc = admin.post("sites", dict(site, id="remote"))
+        check("site created on VM2", status == 201 and doc["data"]["server"]["id"] == server_id, json.dumps(doc)[:300])
+        status, doc = run_job({"type": "deploy", "version": "1.1.0"}, site_id="remote")
+        check("deploy on VM2", doc["data"]["status"] == "succeeded" and (www / "remote.test" / "current").exists(),
+              doc["data"].get("message", "") + doc["data"]["log"]["text"][-500:])
+        status, doc = admin.get("jobs?site=remote")
+        check("job history of the VM2 site", status == 200 and len(doc["data"]) == 1 and doc["data"][0]["site_id"] == "remote")
+        status, doc = admin.get("sites/remote")
+        check("site page names its server", status == 200 and doc["data"]["server"]["name"] == "VM2" and doc["data"]["current_version"] == "1.1.0")
+        status, doc = admin.get("sites")
+        ids = {s["id"]: s["server"]["id"] for s in doc["data"]["sites"]}
+        check("overview lists the sites of both servers", ids == {"demo": "local", "remote": server_id}, str(ids))
+
+        agent.terminate()
+        agent.wait(10)
+        status, doc = admin.get("sites")
+        down = [s for s in doc["data"]["servers"] if not s["ok"]]
+        check("a server that is down: the other sites are still listed", status == 200 and [s["id"] for s in doc["data"]["sites"]] == ["demo"]
+              and len(down) == 1 and down[0]["name"] == "VM2" and "VM2" in down[0]["error"], json.dumps(doc["data"]["servers"]))
+        status, doc = admin.get("sites/remote")
+        check("its site answers with the reason", status == 503 and "VM2" in doc["error"]["message"], json.dumps(doc)[:200])
+        status, doc = admin.delete("servers/" + server_id, {"password": password})
+        check("server removed (its sites stay on it)", status == 200 and doc["data"]["sites"] == 1)
+        status, doc = admin.get("servers")
+        check("only this server is left", [s["id"] for s in doc["data"]] == ["local"])
+        status, doc = admin.get("activity")
+        actions = {a["action"] for a in doc["data"]["actions"]}
+        check("server changes in the activity log", {"server_added", "server_removed"} <= actions, str(actions))
+        check("the server secret never appears in the activity log", secret not in json.dumps(doc["data"]))
+    finally:
+        if agent.poll() is None:
+            agent.terminate()
 
 
 def main():
@@ -208,13 +299,13 @@ def main():
         status, doc = admin.post("github/check", {"repo": "o/demo", "github_token": "not a token"})
         check("access check refuses a malformed token", status == 200 and not doc["data"]["ok"])
 
-        def run_job(payload, expect="succeeded"):
-            status, doc = admin.post("sites/demo/jobs", payload)
+        def run_job(payload, expect="succeeded", site_id="demo"):
+            status, doc = admin.post("sites/%s/jobs" % site_id, payload)
             if status != 201:
                 return status, doc
             job_id = doc["data"]["id"]
             for _ in range(240):
-                status, doc = admin.get("jobs/%d" % job_id)
+                status, doc = admin.get("sites/%s/jobs/%d" % (site_id, job_id))
                 if doc["data"]["status"] in ("succeeded", "failed"):
                     break
                 time.sleep(0.25)
@@ -227,9 +318,15 @@ def main():
         status, doc = run_job({"type": "deploy", "version": "1.1.0", "params": {"backup": True}})
         check("deploy 1.1.0 with backup", doc["data"]["status"] == "succeeded" and "Backup" in doc["data"]["log"]["text"], doc["data"].get("message", ""))
         status, doc = admin.get("sites")
-        demo = doc["data"][0]
+        demo = doc["data"]["sites"][0]
         check("overview: current 1.1.0, healthy, rollback to 1.0.0", demo["current_version"] == "1.1.0" and demo["health"]["ok"]
-              and demo["rollback_version"] == "1.0.0", json.dumps(demo)[:300])
+              and demo["rollback_version"] == "1.0.0" and demo["server"]["local"], json.dumps(demo)[:300])
+        check("overview: this server answered", doc["data"]["servers"] == [{"id": "local", "name": "", "local": True, "ok": True, "error": ""}],
+              json.dumps(doc["data"]["servers"]))
+        status, doc = admin.get("jobs/%d" % 1)
+        check("job link of version 1.1 (this server)", status == 200 and doc["data"]["site_id"] == "demo")
+        status, doc = admin.get("sites/demo/jobs/99999")
+        check("unknown job of a site -> 404", status == 404)
         status, doc = admin.get("sites/demo/releases")
         check("releases with installed/current flags", any(r["current"] and r["version"] == "1.1.0" for r in doc["data"]["releases"]))
         status, doc = run_job({"type": "rollback"})
@@ -263,6 +360,12 @@ def main():
         check("activity log", {"admin_created", "site_created", "site_updated", "job_deploy", "job_rollback", "job_restore",
                                "backup_deleted"} <= actions, str(actions))
         check("tokens never appear in the activity log", site_token not in json.dumps(doc["data"]))
+
+        print("== other servers")
+        if not OPENSSL:
+            print("  (skipped: openssl not found)")
+        else:
+            remote_tests(admin, admin_password, tmp, github, args, logs, run_job)
 
         print("== account")
         new_password = admin_password + "Z9"

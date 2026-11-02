@@ -1,4 +1,5 @@
-// Settings: runner state, administrator password, versions. GitHub tokens belong to the sites (site form).
+// Settings: state of this server's runner, administrator password, versions. Other servers: the Servers page.
+// GitHub tokens belong to the sites (site form).
 import { get, put } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { attachPasswordToggles, clearErrors, esc, formatBytes, icon, passwordStrength, showErrors, toast } from '../core/ui.js';
@@ -36,8 +37,9 @@ export async function render(main, _params, app, isCurrent) {
           ${runner.disk ? `<div><dt>${s('runner.disk')}</dt><dd>${formatBytes(runner.disk.free)} / ${formatBytes(runner.disk.total)}</dd></div>` : ''}
         </dl>
         <p class="small muted">${s('runner.roots')}: <span class="mono">${(runner.site_roots || []).map(esc).join(', ')}</span></p>`
-      : `<div class="box box--red">${icon('alert')}<div><b>${s('runner.down')}</b> ${esc(runnerError ? runnerError.message : '')}</div></div>`}
+      : `<div class="box box--red">${icon('alert')}<div><b>${s('runner.down')}</b> ${esc(runnerError ? runnerError.message : (data && data.runner_error) || '')}</div></div>`}
       ${runner ? `<p class="small muted">${s('runner.tokens', { n: runner.github_tokens || 0, sites: runner.sites || 0 })}</p>` : ''}
+      <p class="small"><a href="#/servers">${icon('server')}${s('runner.servers')}</a></p>
     </section>
   </div>
   <div class="stack">

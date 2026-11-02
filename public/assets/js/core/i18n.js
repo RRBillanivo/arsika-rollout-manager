@@ -4,10 +4,11 @@ import activity from '../locales/activity.js';
 import auth from '../locales/auth.js';
 import common from '../locales/common.js';
 import jobs from '../locales/jobs.js';
+import servers from '../locales/servers.js';
 import settings from '../locales/settings.js';
 import sites from '../locales/sites.js';
 
-const AREAS = { activity, auth, common, jobs, settings, sites };
+const AREAS = { activity, auth, common, jobs, servers, settings, sites };
 
 export const LANGUAGES = {
   id: { name: 'Bahasa Indonesia', short: 'ID', locale: 'id-ID' },

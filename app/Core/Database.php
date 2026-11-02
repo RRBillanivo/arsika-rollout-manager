@@ -14,7 +14,7 @@ use PDOStatement;
  */
 final class Database
 {
-    const SCHEMA_VERSION = 1;
+    const SCHEMA_VERSION = 2;                     // 2: servers and site_servers (dashboard 1.2.0)
 
     /** @var array */
     private $config;

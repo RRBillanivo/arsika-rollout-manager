@@ -1,4 +1,5 @@
 """Small helpers shared by the runner modules: time stamps, names, files, links and environment files."""
+import base64
 import hashlib
 import json
 import os
@@ -216,6 +217,40 @@ def chown_tree(path, user):
         for name in dirs + files:
             os.lchown(os.path.join(root, name), uid, gid)
     return True
+
+
+def _der_item(data, offset):
+    """One DER element at ``offset`` -> (tag, start of its content, end of the element)."""
+    tag, length = data[offset], data[offset + 1]
+    offset += 2
+    if length & 0x80:
+        count = length & 0x7F
+        length = int.from_bytes(data[offset:offset + count], "big")
+        offset += count
+    return tag, offset, offset + length
+
+
+def public_key_pin(der):
+    """Pin of a certificate (DER) as curl's CURLOPT_PINNEDPUBLICKEY expects it: "sha256//" + base64 of the SHA-256 of
+    its SubjectPublicKeyInfo. The pin stays the same as long as the key does."""
+    _, start, _ = _der_item(der, 0)                                  # Certificate
+    _, offset, _ = _der_item(der, start)                             # TBSCertificate
+    tag, _, end = _der_item(der, offset)
+    if tag == 0xA0:                                                  # [0] version
+        offset = end
+    for _ in range(5):                                               # serial, signature, issuer, validity, subject
+        offset = _der_item(der, offset)[2]
+    end = _der_item(der, offset)[2]                                  # subjectPublicKeyInfo
+    return "sha256//" + base64.b64encode(hashlib.sha256(bytes(der[offset:end])).digest()).decode("ascii")
+
+
+def certificate_pin(path):
+    """Public key pin of the first certificate in a PEM file."""
+    with open(path, encoding="ascii", errors="replace") as f:
+        match = re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", f.read(), re.S)
+    if not match:
+        raise ValueError("no certificate in " + path)
+    return public_key_pin(base64.b64decode("".join(match.group(1).split())))
 
 
 def user_exists(user):

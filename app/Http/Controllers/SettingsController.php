@@ -2,11 +2,12 @@
 
 namespace App\Http\Controllers;
 
+use App\Core\HttpException;
 use App\Core\Request;
 use App\Core\Response;
 use App\Services\RunnerClient;
 
-/** Runner state and versions. GitHub tokens belong to the sites (see SiteController). */
+/** State of this server's runner and versions (other servers: ServerController). GitHub tokens belong to the sites. */
 final class SettingsController extends Controller
 {
     /** @var RunnerClient */
@@ -20,7 +21,13 @@ final class SettingsController extends Controller
     /** GET /api/v1/settings */
     public function show(Request $request): Response
     {
-        return Response::json(['runner' => $this->runner->get('/v1/status'), 'php' => PHP_VERSION,
-                               'dashboard_version' => app()->version()]);
+        try {
+            $runner = $this->runner->get('/v1/status');
+            $error = '';
+        } catch (HttpException $e) {
+            $runner = null;
+            $error = $e->getMessage();
+        }
+        return Response::json(['runner' => $runner, 'runner_error' => $error, 'php' => PHP_VERSION, 'dashboard_version' => app()->version()]);
     }
 }

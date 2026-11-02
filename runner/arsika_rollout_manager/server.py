@@ -1,4 +1,5 @@
-"""HTTP API for the dashboard on 127.0.0.1 (JSON). Every request is signed:
+"""HTTP API for the dashboard (JSON): plain HTTP on 127.0.0.1 for a dashboard on the same server, HTTPS with a pinned
+certificate (and optionally an address allowlist) for a dashboard on another server. Every request is signed:
 
     X-Rollout-Timestamp: <unix seconds>
     X-Rollout-Nonce: <16-64 random lowercase hex characters, new for every request>
@@ -8,11 +9,15 @@ Requests older than 120 seconds and repeated nonces are refused. Answers: {"data
 """
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import platform
 import re
+import socket
 import socketserver
+import ssl
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +28,7 @@ from . import __version__, system
 from .deploy import DeployError
 from .github import GitHub, GitHubError
 from .joblog import read_log
-from .sites import expand, layout, presets_info, validate
+from .sites import expand, layout, preset, presets_info, release_pattern, validate
 from .util import VERSION, exists, now, version_key
 from .worker import JOB_TYPES
 
@@ -57,6 +62,36 @@ def read_token(data, errors):
 class ThreadingServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    allowed = ()                                                     # allow_from networks; empty: any address
+
+    def verify_request(self, request, client_address):
+        """Connections from addresses outside allow_from are closed before TLS or HTTP (loopback is always allowed)."""
+        if not self.allowed:
+            return True
+        try:
+            ip = ipaddress.ip_address(str(client_address[0]).split("%")[0])
+        except ValueError:
+            return False
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if ip.is_loopback or any(ip in network for network in self.allowed):
+            return True
+        refused = self.__dict__.setdefault("refused", {})
+        if time.time() - refused.get(str(ip), 0) > 3600:                # one line per address and hour in the journal
+            if len(refused) > 1000:
+                refused.clear()
+            refused[str(ip)] = time.time()
+            print("connection from %s refused: not in allow_from" % ip, flush=True)
+        return False
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, OSError)):  # scanners, plain HTTP on the HTTPS port, dropped clients
+            return
+        HTTPServer.handle_error(self, request, client_address)
+
+
+class ThreadingServer6(ThreadingServer):
+    address_family = socket.AF_INET6
 
 
 class Api(object):
@@ -168,7 +203,10 @@ class Api(object):
         cached = self.health_cache.get(site["id"])
         if cached and not refresh and time.time() - cached[0] < 30 and cached[2] == version:
             return cached[1]
-        result = system.quick_health(expand(site, site["health_url"], version), expand(site, site.get("health_contains", ""), version))
+        contains = site.get("health_contains", "")
+        if "{version}" in contains and not version:
+            contains = ""                       # an installation that is not adopted yet: its version is not known
+        result = system.quick_health(expand(site, site["health_url"], version), expand(site, contains, version))
         result["checked_at"] = now()
         self.health_cache[site["id"]] = (time.time(), result, version)
         return result
@@ -180,7 +218,7 @@ class Api(object):
         latest, latest_error = None, ""
         if with_latest and site.get("repo"):
             try:
-                releases = [r for r in self.site_github(site).releases(site["repo"], site["asset_pattern"]) if not r["prerelease"]]
+                releases = [r for r in self.site_github(site).releases(site["repo"], release_pattern(site)) if not r["prerelease"]]
                 latest = releases[0]["version"] if releases else None
             except GitHubError as e:
                 latest_error = str(e)
@@ -188,7 +226,7 @@ class Api(object):
         active = self.store.active_job(site["id"])
         return {
             "id": site["id"], "name": site["name"], "domain": site["domain"], "repo": site["repo"], "path": site["path"],
-            "state": self.deployer.state(site), "current_version": current, "installed": [r["version"] for r in installed],
+            "deploy_mode": site.get("deploy_mode", "files"), "state": self.deployer.state(site), "current_version": current, "installed": [r["version"] for r in installed],
             "latest_version": latest, "latest_error": latest_error,
             "update_available": bool(latest and current and latest != current and version_key(latest) > version_key(current)),
             "rollback_version": self.deployer.rollback_target(site),
@@ -205,10 +243,13 @@ class Api(object):
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.started)) + "+00:00",
                 "sites": len(sites), "github_tokens": sum(1 for s in sites if self.config.site_token(s["id"])), "active_job": active,
                 "disk": system.disk_free(self.config["backup_dir"] if os.path.isdir(self.config["backup_dir"]) else "/"),
-                "site_roots": self.config.get("site_roots", ["/www/wwwroot"])}
+                "site_roots": self.config.get("site_roots", ["/www/wwwroot"]), "hostname": socket.gethostname(),
+                "platform": self.config.get("platform") or system.platform_name(), "web_user": self.config.get("web_user", ""),
+                "tls": self.config.tls_enabled(), "allow_from": [str(n) for n in self.config.allowed],
+                "docker_compose": self.deployer.compose.version() if self.deployer else None}
 
     def presets(self, query, data):
-        return presets_info()
+        return presets_info(self.config.get("web_user", "www"))
 
     def github_check(self, query, data):
         """Can this repository be read? Uses the token typed in the form, else the saved token of the site being edited."""
@@ -219,8 +260,9 @@ class Api(object):
             return {"ok": False, "message": TOKEN_ERROR, "releases": 0}
         if not token and data.get("site"):
             token = self.config.site_token(str(data["site"]))
+        pattern = release_pattern({"source": data.get("source"), "asset_pattern": str(data.get("asset_pattern") or "*.zip")})
         try:
-            releases = self.github(token).releases(repo, str(data.get("asset_pattern") or "*.zip"), refresh=True)
+            releases = self.github(token).releases(repo, pattern, refresh=True)
         except GitHubError as e:
             return {"ok": False, "message": str(e), "releases": 0}
         with_asset = [r for r in releases if r["asset"]]
@@ -246,8 +288,7 @@ class Api(object):
         return details
 
     def create_site(self, query, data):
-        from .sites import preset
-        base = preset(str(data.get("preset", ""))) if data.get("preset") else None
+        base = preset(str(data.get("preset", "")), self.config.get("web_user", "www")) if data.get("preset") else None
         merged = dict(base or {})
         merged.update({k: v for k, v in data.items() if k not in ("preset", "github_token", "remove_github_token")})
         site, errors = validate(merged, self.config.get("site_roots", ["/www/wwwroot"]))
@@ -267,8 +308,12 @@ class Api(object):
         record = self.get_site(site)
         updated, errors = validate(data, self.config.get("site_roots", ["/www/wwwroot"]), existing=record)
         token = read_token(data, errors)
-        if not errors and updated["path"] != record["path"] and self.deployer.state(record) == "ready":
+        installed = self.deployer.state(record) == "ready"
+        if not errors and updated["path"] != record["path"] and installed:
             errors["path"] = "The folder of an installed site cannot be changed."
+        if not errors and installed and record.get("compose_project") and updated["compose_project"] != record["compose_project"] \
+                and record.get("deploy_mode") == "compose":
+            errors["compose_project"] = "The containers and volumes of the installed site belong to this name; it cannot be changed."
         if errors:
             raise ApiError(422, "validation_failed", "check the highlighted fields", errors)
         updated["id"] = record["id"]
@@ -291,7 +336,7 @@ class Api(object):
         installed = {r["version"]: r for r in self.deployer.installed(record)}
         current = self.deployer.current_version(record)
         try:
-            remote = self.site_github(record).releases(record["repo"], record["asset_pattern"], refresh=query.get("refresh") == "1")
+            remote = self.site_github(record).releases(record["repo"], release_pattern(record), refresh=query.get("refresh") == "1")
             error = ""
         except GitHubError as e:
             remote, error = [], str(e)
@@ -360,6 +405,12 @@ def make_handler(api):
     class Handler(BaseHTTPRequestHandler):
         server_version = "arsika-rollout-manager/" + __version__
         protocol_version = "HTTP/1.1"
+        timeout = 60                                                 # idle or slow connections are closed
+
+        def setup(self):
+            BaseHTTPRequestHandler.setup(self)
+            if isinstance(self.connection, ssl.SSLSocket):
+                self.connection.do_handshake()                       # here, in the request thread, not in accept()
 
         def _serve(self, method):
             length = int(self.headers.get("Content-Length") or 0)
@@ -394,6 +445,21 @@ def make_handler(api):
     return Handler
 
 
+def tls_context(config):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if hasattr(ssl, "TLSVersion"):
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    else:                                                            # Python 3.6
+        context.options |= getattr(ssl, "OP_NO_TLSv1", 0) | getattr(ssl, "OP_NO_TLSv1_1", 0)
+    context.load_cert_chain(config["tls_cert"], config["tls_key"])
+    return context
+
+
 def serve(api):
-    server = ThreadingServer((api.config["listen"], int(api.config["port"])), make_handler(api))
+    config = api.config
+    server_class = ThreadingServer6 if ":" in config["listen"] else ThreadingServer
+    server = server_class((config["listen"], int(config["port"])), make_handler(api))
+    server.allowed = tuple(config.allowed)
+    if config.tls_enabled():
+        server.socket = tls_context(config).wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
     return server

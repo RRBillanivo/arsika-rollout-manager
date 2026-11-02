@@ -1,14 +1,23 @@
 """Runner settings: /etc/arsika-rollout-manager/runner.json (root only, 0600). Created by deploy/install.sh.
 
-    listen, port      address of the API (always a loopback address)
-    secret            shared HMAC key; the same value is RUNNER_SECRET in the dashboard's .env
+    listen, port      address of the API: a loopback address, or any address when TLS is set up (a runner that a
+                      dashboard on another server controls)
+    tls_cert, tls_key certificate and private key of the HTTPS API (install.sh --agent creates them); the dashboard
+                      pins the certificate's public key ("connection-info" prints the pin)
+    allow_from        IP addresses or networks allowed to connect (empty: any; loopback always; the signature is always
+                      required)
+    secret            shared HMAC key; the same value is RUNNER_SECRET in the dashboard's .env (or the server's secret)
     state_dir         SQLite database and job logs
     backup_dir        site backups (database dumps and data archives)
     github_api        GitHub REST API base URL (changed only by the tests)
     site_tokens       read-only GitHub token of each site, by site id (set from the dashboard, never shown again)
     shell             bash used for the site hooks
     site_roots        folders that may contain registered sites (a site path must be inside one of them)
+    web_user          default owner of the release files of new sites (aaPanel: www; Debian/Ubuntu: www-data)
+    platform          aapanel or linux (detected by install.sh)
+    docker_command    command that runs Docker (changed only by the tests)
 """
+import ipaddress
 import json
 import os
 import secrets
@@ -17,9 +26,13 @@ import threading
 from .util import POSIX, ensure_dir, write_private
 
 DEFAULT_PATH = "/etc/arsika-rollout-manager/runner.json"
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
 DEFAULTS = {
     "listen": "127.0.0.1",
     "port": 8790,
+    "tls_cert": "",
+    "tls_key": "",
+    "allow_from": [],
     "secret": "",
     "state_dir": "/var/lib/arsika-rollout-manager",
     "backup_dir": "/www/backup/arsika-rollout-manager",
@@ -28,6 +41,9 @@ DEFAULTS = {
     "shell": "/bin/bash",
     "hook_timeout_seconds": 3600,
     "site_roots": ["/www/wwwroot"],
+    "web_user": "www",
+    "platform": "",
+    "docker_command": ["docker"],
     "health_attempts": 10,
     "health_delay": 3,
 }
@@ -41,8 +57,26 @@ class Config(object):
         if os.path.exists(self.path):
             with open(self.path, encoding="utf-8") as f:
                 self.values.update(json.load(f))
-        if self.values["listen"] not in ("127.0.0.1", "::1", "localhost"):
-            raise ValueError("listen must be a loopback address (127.0.0.1)")
+        if self.values["listen"] not in LOOPBACK and not self.tls_enabled():
+            raise ValueError("listen must be a loopback address (127.0.0.1) unless TLS is set up (tls_cert, tls_key): "
+                             "a runner reachable from the network must use HTTPS (install.sh --agent sets it up)")
+        self.allowed = self.networks(self.values.get("allow_from") or [])
+
+    @staticmethod
+    def networks(entries):
+        """allow_from entries ("192.168.1.10", "10.8.0.0/24", "fd00::/8") -> ip_network objects."""
+        if isinstance(entries, str):
+            entries = entries.replace(",", " ").split()
+        found = []
+        for entry in entries:
+            try:
+                found.append(ipaddress.ip_network(str(entry).strip(), strict=False))
+            except ValueError:
+                raise ValueError("allow_from: %s is not an IP address or network" % entry)
+        return found
+
+    def tls_enabled(self):
+        return bool(self.values.get("tls_cert") and self.values.get("tls_key"))
 
     def __getitem__(self, key):
         return self.values[key]

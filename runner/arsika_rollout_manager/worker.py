@@ -52,21 +52,22 @@ class Worker(object):
         log = JobLog(self.log_path(job_id))
         log.line("Arsika Rollout Manager runner %s - job #%d: %s%s on %s, requested by %s" % (
             __version__, job_id, job["type"], " " + job["version"] if job["version"] else "", job["site_id"], job["actor"] or "?"))
+        outcome = {}
         try:
             if site is None:
                 raise DeployError("site %s is not registered" % job["site_id"])
             handler = getattr(self, "job_" + job["type"].replace("-", "_"))
             before, after, message = handler(job, site, log)
             log.step("Finished: " + message)
-            self.store.update_job(job_id, status="succeeded", message=message, from_version=before, to_version=after, finished_at=now())
+            outcome = {"status": "succeeded", "message": message, "from_version": before, "to_version": after}
         except EXPECTED as error:
             log.error(str(error))
-            self.store.update_job(job_id, status="failed", message=str(error)[:500], finished_at=now())
+            outcome = {"status": "failed", "message": str(error)[:500]}
         except Exception as error:                                   # a bug: keep the traceback in the log
             log.error("unexpected error: %s" % error)
             for line in traceback.format_exc().splitlines():
                 log.error(line)
-            self.store.update_job(job_id, status="failed", message=("unexpected error: %s" % error)[:500], finished_at=now())
+            outcome = {"status": "failed", "message": ("unexpected error: %s" % error)[:500]}
         finally:
             if site is not None and job["type"] in ("deploy", "rollback"):
                 try:                                                     # also after a failed deployment (its release stays only if needed)
@@ -74,6 +75,8 @@ class Worker(object):
                 except Exception as error:
                     log.error("cleaning up old releases failed: %s" % error)
             log.close()
+            if outcome:                                                  # the job ends after its clean-up (and its last log line)
+                self.store.update_job(job_id, finished_at=now(), **outcome)
 
     # ---------- job types ----------
     def job_deploy(self, job, site, log):
@@ -94,7 +97,8 @@ class Worker(object):
         base = site["path"] if self.deployer.state(site) == "classic" else None
         backup_id = self.backups.create(site, version, job["params"].get("reason") or "manual backup", log, job["id"], base=base)
         if not backup_id:
-            raise BackupError("nothing to back up: set the backup paths or the database environment file of the site")
+            raise BackupError("nothing to back up: set the database (environment file or database service), the backup paths "
+                              "or the volumes of the site")
         return version, version, "backup " + backup_id
 
     def job_restore(self, job, site, log):
