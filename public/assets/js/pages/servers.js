@@ -20,8 +20,9 @@ function facts(status) {
       ${status.tls ? ' · HTTPS' : ''}${(status.allow_from || []).length ? ` · ${s('facts.allow', { list: status.allow_from.join(', ') })}` : ''}</p>`;
 }
 
-function card(server) {
+function card(server, version) {
   const title = server.local ? s('local') : server.name;
+  const behind = !server.local && server.status && server.status.version !== version;
   return `<article class="card server-card">
     <header class="card__header"><div><h2 class="card__title">${icon('server')}${esc(title)}</h2>
       <p class="small muted"><span class="mono">${esc(server.url)}</span>${server.tls_pin ? ' · ' + s('pinned') : ''}</p></div>
@@ -29,6 +30,8 @@ function card(server) {
         <button type="button" class="btn btn--outline btn--small" data-edit="${esc(server.id)}">${icon('edit')}${s('edit')}</button>
         <button type="button" class="icon-btn icon-btn--danger" data-remove="${esc(server.id)}" title="${s('remove')}" aria-label="${s('remove')}">${icon('trash')}</button></div>`}
     </header>
+    ${behind ? `<div class="box box--yellow">${icon('info')}<div>${s('update_note', { runner: server.status.version, version })}
+      <button type="button" class="btn btn--primary btn--small" data-update="${esc(server.id)}">${icon('upload-cloud')}${s('update', { version })}</button></div></div>` : ''}
     ${server.status ? `<div class="box box--green">${icon('check-circle')}<div>${s('connected')}</div></div>${facts(server.status)}`
     : `<div class="box box--red">${icon('alert')}<div><b>${s('not_connected')}</b> ${esc(server.error || '')}</div></div>`}
   </article>`;
@@ -103,6 +106,7 @@ export async function render(main, _params, app, isCurrent) {
   main.innerHTML = '<div aria-busy="true"><div class="skeleton skeleton--title"></div><div class="skeleton skeleton--table"></div></div>';
   let servers = (await get('servers')).data;
   if (!isCurrent()) return null;
+  const version = (app.info && app.info.app && app.info.app.version) || '';
 
   const draw = () => {
     main.innerHTML = `
@@ -110,7 +114,7 @@ export async function render(main, _params, app, isCurrent) {
   <div><h1>${s('title')}</h1><p class="muted">${s('lead')}</p></div>
   <div class="action-row"><button type="button" class="btn btn--primary" data-add>${icon('plus')}${s('add')}</button></div>
 </header>
-<section class="stack">${servers.map(card).join('')}</section>
+<section class="stack">${servers.map((x) => card(x, version)).join('')}</section>
 <details class="tech-section card">
   <summary>${icon('book')}${s('howto.title')}</summary>
   <ol class="bullet-list">${tList('servers.howto.steps').map((x) => `<li>${x}</li>`).join('')}</ol>
@@ -128,6 +132,19 @@ export async function render(main, _params, app, isCurrent) {
     if (!button) return;
     if ('add' in button.dataset) await openForm(null, reload);
     if (button.dataset.edit) await openForm(servers.find((x) => x.id === button.dataset.edit), reload);
+    if (button.dataset.update) {
+      const server = servers.find((x) => x.id === button.dataset.update);
+      const job = await formDialog({
+        title: s('update_title', { name: server.name, version }),
+        body: `<p>${s('update_text', { version })}</p>${passwordField()}`,
+        submitLabel: s('update', { version }),
+        onSubmit: async (form) => (await post(`servers/${server.id}/update`, { password: form.elements.password.value })).data,
+      });
+      if (job) {
+        toast(t('sites.versions.job_started', { id: job.id }), 'success');
+        app.go(`/servers/${server.id}/jobs/${job.id}`);
+      }
+    }
     if (button.dataset.remove) {
       const server = servers.find((x) => x.id === button.dataset.remove);
       const done = await formDialog({

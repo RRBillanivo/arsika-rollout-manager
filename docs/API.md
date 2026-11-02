@@ -15,6 +15,8 @@ POST/PUT/DELETE (token from `GET /app`); `X-Locale: id|en` for the message langu
 | POST | `/servers/test` | `{url, secret, tls_pin, server?}` → the runner's status, or field errors (`url`, `secret`, `tls_pin`) with the reason; nothing is saved |
 | POST 🔒 | `/servers` | `{name, url, secret, tls_pin}`; the connection is tested first |
 | PUT 🔒 / DELETE 🔒 | `/servers/{server}` | change (empty `secret` keeps it) / forget the server (nothing changes on it) |
+| POST 🔒 | `/servers/{server}/update` | the runner of that server installs the runner of the dashboard's version and restarts (a job of `_runner`) |
+| GET | `/servers/{server}/jobs/{job}?offset=` | a job of that runner itself, with its log |
 | GET | `/presets?server=` | presets of that server's runner (its web server user) |
 | POST | `/github/check` | `{repo, asset_pattern, source, github_token?, site? \| server?}` → can the runner read the releases? Uses the typed token, else the saved token of `site` |
 | GET | `/sites` | `{sites: [… with server], servers: [{id, name, local, ok, error}]}` (all runners asked at once) |
@@ -30,7 +32,7 @@ POST/PUT/DELETE (token from `GET /app`); `X-Locale: id|en` for the message langu
 
 Site settings: `deploy_mode` (`files` \| `compose`), `source` (`asset` \| `source`), `compose_files`,
 `compose_project`, `compose_build`, `backup_db` (`auto` \| `mysql` \| `postgres` \| `none`), `backup_db_service`,
-`backup_volumes`, plus the settings of 1.1 (see [SITES.md](SITES.md)).
+`backup_volumes`, `health_local` (check through this server), plus the settings of 1.1 (see [SITES.md](SITES.md)).
 
 Job types: `deploy` (`version`, `params.backup`), `rollback` (`version` optional: the previous release),
 `adopt` (`version`, `params.backup`), `backup` (`params.reason`), `restore` (`params.backup_id`, `params.safety_backup`),
@@ -57,3 +59,4 @@ X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD "\n" PATH_WITH_QUERY "\n" TI
 | POST | `/v1/sites/{site}/jobs` `{type, version, params, actor}` (409 `busy` while a job of the site is queued or running) |
 | DELETE | `/v1/sites/{site}/backups/{backup}` |
 | GET | `/v1/jobs?site=&limit=`, `/v1/jobs/{id}?offset=` |
+| POST | `/v1/runner/update` `{version, actor}`: install the runner of that release (`update_repo`); restarts when the job has ended (409 `busy` while any job is queued or running) |

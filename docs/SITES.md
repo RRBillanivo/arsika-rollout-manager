@@ -24,6 +24,7 @@
 | Static site | files | asset | – | `public` → `current` | `https://{domain}/` |
 | Docker Compose: build | compose | source code | `.env` | – | images built from the release; `https://{domain}/` |
 | Docker Compose: images | compose | source code | `.env` | – | images pulled from a registry; `https://{domain}/` |
+| Arsika Rollout Manager (this dashboard) | files | asset `arsika-rollout-manager-v*.zip` | `.env`, `storage/` | `public` → `current/public` | `preset:rollout-manager` (see [below](#arsika-rollout-manager-itself)); `http://{domain}/api/v1/app` checked on this server |
 
 Then fill in the domain (a folder in the server's site folder is suggested), the repository (`owner/name`) and, for a
 zip asset, the file name pattern. For a private repository, paste the site's own **GitHub token**: a fine-grained token
@@ -43,7 +44,7 @@ Settings under **Advanced**:
 | systemd services | Restarted after every switch |
 | Reload PHP-FPM | Needed for PHP sites (OPcache) |
 | Docker Compose | Compose files, project name, build or pull (see below) |
-| Health check | Address that must answer 200 (and contain the text); `{domain}` and `{version}` are replaced |
+| Health check | Address that must answer 200 (and contain the text); `{domain}` and `{version}` are replaced. **Check through this server**: the web server of the site's server is asked directly (127.0.0.1 with the address's host name; a redirect to the same host, e.g. to https, is followed there too), for sites behind Cloudflare Access, a CDN or a firewall |
 | Backups | Database, environment file, paths, exclusions, volumes, number kept (see below) |
 
 ## First installation
@@ -108,6 +109,24 @@ Each backup holds what is configured, with SHA-256 checksums in `manifest.json`:
 A restore verifies the checksums, puts the files back (the replaced ones are kept until the site is healthy), stops the
 containers using a restored volume while it is replaced, imports the database, then runs the activation steps and the
 health check. A safety backup of the current state is made first (on by default).
+
+## Arsika Rollout Manager itself
+
+The dashboard can update itself: it becomes a site of the runner on its own server.
+
+1. **Sites → Add site** on **This server**, kind **Arsika Rollout Manager (this dashboard)**: the dashboard's domain and
+   its folder (e.g. `/www/wwwroot/rollout.example.com`); the repository is the official one (a fork: its own). The health
+   check asks `/api/v1/app` on this server, so Cloudflare Access in front of the dashboard does not get in the way.
+2. **Versions → Adopt now** with the installed version (the footer shows it). `.env` and `storage/` move to `shared/`;
+   the web server's document root (`public`) becomes a link into `current/`, as for any adopted PHP site.
+3. A new release then shows **Update to X.Y.Z**. The job backs up the dashboard database and `.env`, runs
+   `deploy/install.sh --self-update=build` of the new release (PHP syntax, database: new tables are added, the new
+   runner code with this server's Python and settings), switches, runs `--self-update=activate` (installs that
+   release's runner code and systemd unit), reloads PHP-FPM and checks the health. The runner restarts with its new
+   code when the job has ended; an automatic rollback puts the previous runner code back the same way.
+
+Every version brings its own update steps (they are part of its `deploy/install.sh`); a release older than 1.3.0 cannot
+be installed this way (the build step stops with a message). Runners of other servers: **Servers → Update runner**.
 
 ### Example: Anemia Web
 

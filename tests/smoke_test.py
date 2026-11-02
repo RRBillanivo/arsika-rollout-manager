@@ -8,7 +8,8 @@ Covers: setup page, sign-in and lockout messages, CSRF, password confirmation, s
 the site's own GitHub token (write-only, access check, removal), deploy, rollback, backups, settings, activity log,
 sign-out. With openssl (PATH or ROLLOUT_TEST_OPENSSL): a second runner on HTTPS as "another server" - connection test
 with a wrong key pin, without a pin and with a wrong secret, a site on that server (presets, access check, deploy, job
-log, history), site ids unique across servers, a server that is down, removing the server."""
+log, history), site ids unique across servers, "Update runner" (the runner installs a release and restarts, as systemd
+would start it again), a server that is down, removing the server. The dashboard writes a linked .env through the link."""
 import argparse
 import base64
 import http.cookiejar
@@ -32,7 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runner"))
 sys.path.insert(0, str(ROOT / "runner" / "tests"))
 from arsika_rollout_manager.util import certificate_pin  # noqa: E402
-from test_runner import FakeGitHub, release_files  # noqa: E402
+from test_runner import AGENT_UPDATE_SCRIPT, FakeGitHub, release_files  # noqa: E402
 
 OPENSSL = os.environ.get("ROLLOUT_TEST_OPENSSL") or shutil.which("openssl")
 
@@ -131,9 +132,12 @@ def remote_tests(admin, password, tmp, github, args, logs, run_job):
     config.write_text(json.dumps({
         "listen": "127.0.0.1", "port": port, "secret": secret, "state_dir": str(tmp / "agent-state"), "backup_dir": str(tmp / "agent-backup"),
         "github_api": "http://127.0.0.1:%d" % github.port, "shell": args.shell, "site_roots": [str(www)], "tls_cert": str(cert),
-        "tls_key": str(key), "web_user": "www-data", "platform": "linux"}), encoding="utf-8")
-    agent = subprocess.Popen([sys.executable, "-m", "arsika_rollout_manager", "serve", "--config=" + str(config)], cwd=ROOT / "runner",
-                             stdout=logs, stderr=logs)
+        "tls_key": str(key), "web_user": "www-data", "platform": "linux", "update_repo": "o/rollout"}), encoding="utf-8")
+
+    def start_agent():
+        return subprocess.Popen([sys.executable, "-m", "arsika_rollout_manager", "serve", "--config=" + str(config)], cwd=ROOT / "runner",
+                                stdout=logs, stderr=logs)
+    agent = start_agent()
     url = "https://127.0.0.1:%d" % port
     try:
         for _ in range(60):
@@ -181,6 +185,33 @@ def remote_tests(admin, password, tmp, github, args, logs, run_job):
         status, doc = admin.get("sites")
         ids = {s["id"]: s["server"]["id"] for s in doc["data"]["sites"]}
         check("overview lists the sites of both servers", ids == {"demo": "local", "remote": server_id}, str(ids))
+
+        version = admin.get("app")[1]["data"]["app"]["version"]
+        github.publish(version, {"deploy/install.sh": AGENT_UPDATE_SCRIPT, "README.md": "release"}, repo="o/rollout",
+                       asset="arsika-rollout-manager-v%s.zip" % version)
+        status, doc = admin.post("servers/%s/update" % server_id, {})
+        check("updating a runner needs the password", status == 422 and "password" in doc["error"]["fields"])
+        status, doc = admin.post("servers/local/update", {"password": password})
+        check("this server's runner is updated with the dashboard, not here", status == 400)
+        status, doc = admin.post("servers/%s/update" % server_id, {"password": password})
+        update_id = doc.get("data", {}).get("id")
+        check("update runner of VM2 started", status == 201 and doc["data"]["site_id"] == "_runner", json.dumps(doc)[:300])
+        try:
+            agent.wait(30)                                         # the runner stops after the job (systemd starts it again)
+            stopped = True
+        except subprocess.TimeoutExpired:
+            stopped = False
+        check("the runner of VM2 stopped by itself after the update", stopped)
+        agent = start_agent()                                      # what systemd does (Restart=always)
+        for _ in range(60):
+            status, doc = admin.get("servers/%s/jobs/%d" % (server_id, update_id))
+            if status == 200:
+                break
+            time.sleep(0.25)
+        check("the update job succeeded and its log is kept", status == 200 and doc["data"]["status"] == "succeeded"
+              and "--agent --self-update" in (www.parent / "update.log").read_text(), json.dumps(doc)[:400])
+        status, doc = admin.get("sites/remote/jobs/%d" % update_id)
+        check("a runner job is not a job of a site", status == 404)
 
         agent.terminate()
         agent.wait(10)
@@ -366,6 +397,21 @@ def main():
             print("  (skipped: openssl not found)")
         else:
             remote_tests(admin, admin_password, tmp, github, args, logs, run_job)
+
+        print("== .env behind a link")
+        envdir = tmp / "envlink"
+        envdir.mkdir()
+        (envdir / "real.env").write_text("APP_KEY=keep\n")
+        try:
+            os.symlink(envdir / "real.env", envdir / ".env")
+        except OSError as e:
+            print("  (skipped: no symlink support: %s)" % e)
+        else:
+            code = "require 'app/Core/Env.php'; App\\Core\\Env::write($argv[1], ['RUNNER_SECRET' => 'x']);"
+            subprocess.run(php + ["-r", code, str(envdir / ".env")], cwd=ROOT, check=True)
+            check("a linked .env is written through the link (shared .env of an installed release)",
+                  os.path.islink(envdir / ".env") and "RUNNER_SECRET=x" in (envdir / "real.env").read_text()
+                  and "APP_KEY=keep" in (envdir / "real.env").read_text())
 
         print("== account")
         new_password = admin_password + "Z9"

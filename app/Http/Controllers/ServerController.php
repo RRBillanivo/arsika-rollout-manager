@@ -92,6 +92,23 @@ final class ServerController extends Controller
         return Response::json($this->servers->get($server) + ['status' => $status, 'error' => '', 'site_count' => (int)($status['sites'] ?? 0)]);
     }
 
+    /**
+     * POST /api/v1/servers/{server}/update {password} — the runner of that server installs the runner of this
+     * dashboard's version from GitHub (deploy/install.sh --agent --self-update) and restarts with it.
+     */
+    public function updateRunner(Request $request, string $server): Response
+    {
+        $user = $this->confirmPassword($request);
+        $current = $this->servers->get($server);
+        if ($current['local']) {
+            throw HttpException::badRequest(trans('servers.update_local'));
+        }
+        $version = app()->version();
+        $job = $this->servers->client($server)->post('/v1/runner/update', ['version' => $version, 'actor' => (string)$user['username']]);
+        $this->audit($request, 'runner_update', 'server:' . $server, $current['name'] . ' · ' . $version . ' · #' . $job['id']);
+        return Response::json($job, 201);
+    }
+
     /** DELETE /api/v1/servers/{server} {password} — the dashboard forgets the server; nothing changes on it. */
     public function destroy(Request $request, string $server): Response
     {

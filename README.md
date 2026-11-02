@@ -3,13 +3,13 @@
 A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux servers**,
 straight from their **GitHub Releases**: a zip attached to the release, or the release's source code.
 
-![version](https://img.shields.io/badge/version-1.2.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
+![version](https://img.shields.io/badge/version-1.3.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![php](https://img.shields.io/badge/PHP-7.4%E2%80%938.4-777bb4) ![python](https://img.shields.io/badge/Python-3.6%E2%80%933.13-3776ab)
 
 > **Status: early release.** Version 1.1 runs in production on an aaPanel server (adoption of an existing site,
-> deployments, backups). The features of 1.2 (other servers, servers without a panel, Docker Compose, PostgreSQL and
-> container backups) pass the automated tests but are new: try them with a test application first and keep your own
-> backups.
+> deployments, backups). The features of 1.2 and 1.3 (other servers, servers without a panel, Docker Compose, PostgreSQL
+> and container backups, self-update) pass the automated tests but are new: try them with a test application first and
+> keep your own backups.
 
 ## What it is for
 
@@ -48,6 +48,11 @@ internet): each other server runs only the small runner service.
 - **aaPanel and plain servers:** paths, web server user and nginx examples for both.
 - **One GitHub token per site:** each site has its own read-only token (or none for a public repository). Tokens are
   kept by the runner of the site's server and never shown again.
+- **Updates itself:** registered as a site of its own (preset "Arsika Rollout Manager"), the dashboard installs a new
+  version of itself and of its runner like any release, with a backup first and an automatic rollback; the runners of
+  other servers are updated with one click (**Update runner**).
+- **Health checks through the server itself** (127.0.0.1 with the site's domain) for sites behind Cloudflare Access, a
+  CDN or a firewall.
 - **Live job logs**, job history, activity log (sign-ins and every administrator action).
 - Interface in Indonesian and English, light and dark theme, works on phones.
 

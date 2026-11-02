@@ -72,6 +72,7 @@ return [
         'secret_invalid' => 'Secret berisi 16-256 karakter tanpa spasi.',
         'pin_invalid' => 'Key pin berbentuk sha256//… (44 karakter setelah //).',
         'site_ids_taken' => 'Situs dengan id ini sudah ada di dashboard: :sites',
+        'update_local' => 'Runner server ini di-update bersama dashboard (situs dengan preset "Arsika Rollout Manager"), atau lewat bash deploy/install.sh.',
     ],
     'jobs' => [
         'not_found' => 'Job tidak ditemukan.',

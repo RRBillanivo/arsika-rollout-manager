@@ -17,6 +17,10 @@
 #                                        enter in that dashboard (Servers > Add server)
 #   bash deploy/install.sh --db          change the dashboard database settings only
 #   bash deploy/install.sh --admin-link  new one-time administrator setup link (e.g. forgotten password)
+#   --self-update[=build|activate]       used by the runner when Arsika Rollout Manager updates itself (preset
+#                                        "rollout-manager" for the dashboard, "Update runner" for a server installed
+#                                        with --agent): build = check this release; activate = install its runner code
+#                                        and unit without a restart (the runner restarts when the job has ended)
 # Options (new installations get defaults that suit the server; an existing runner keeps its settings unless an
 # option is given):
 #   --site-root=/var/www,/srv     folders that may contain sites       (aaPanel: /www/wwwroot; else /var/www,/srv)
@@ -28,22 +32,28 @@
 #                                 a firewall rule that only lets the dashboard in is recommended in any case)
 # Unattended dashboard installation: set APP_URL, DB_DATABASE, DB_USERNAME, DB_PASSWORD, [DB_HOST], [DB_PORT].
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1                  # no __pycache__ in release folders or in /opt
 cd "$(dirname "$0")/.."
 WEB_DIR="$(pwd)"
 
-RUNNER_DIR="/opt/arsika-rollout-manager"
-CONFIG="/etc/arsika-rollout-manager/runner.json"
-TLS_DIR="/etc/arsika-rollout-manager/tls"
+# (the ROLLOUT_INSTALL_* variables are set only by tests that run this script in a sandbox)
+RUNNER_DIR="${ROLLOUT_INSTALL_RUNNER_DIR:-/opt/arsika-rollout-manager}"
+CONFIG="${ROLLOUT_INSTALL_CONFIG:-/etc/arsika-rollout-manager/runner.json}"
+TLS_DIR="$(dirname "$CONFIG")/tls"
+UNIT_FILE="${ROLLOUT_INSTALL_UNIT:-/etc/systemd/system/arsika-rollout-manager-runner.service}"
 SERVICE="arsika-rollout-manager-runner"
 DB_ONLY=0
 ADMIN_LINK_ONLY=0
 AGENT=0
+SELF_UPDATE=""
 OPT_SITE_ROOT="" OPT_BACKUP_DIR="" OPT_WEB_USER="" OPT_PORT="" OPT_LISTEN="" OPT_ALLOW_FROM=""
 for arg in "$@"; do
     case "$arg" in
         --db)            DB_ONLY=1 ;;
         --admin-link)    ADMIN_LINK_ONLY=1 ;;
         --agent)         AGENT=1 ;;
+        --self-update)   SELF_UPDATE="activate" ;;
+        --self-update=*) SELF_UPDATE="${arg#*=}" ;;
         --site-root=*)   OPT_SITE_ROOT="${arg#*=}" ;;
         --backup-dir=*)  OPT_BACKUP_DIR="${arg#*=}" ;;
         --web-user=*)    OPT_WEB_USER="${arg#*=}" ;;
@@ -53,6 +63,8 @@ for arg in "$@"; do
         *) echo "Unknown option: $arg (see the top of this script)"; exit 1 ;;
     esac
 done
+
+case "$SELF_UPDATE" in ""|build|activate) ;; *) echo "Unknown phase: --self-update=$SELF_UPDATE (build or activate)"; exit 1 ;; esac
 
 info() { echo; echo "== $*"; }
 fail() { echo; echo "!! $*" >&2; exit 1; }
@@ -92,7 +104,7 @@ find_php() {   # PHP command line (aaPanel: /www/server/php/<version>/bin/php)
 
 find_python() {   # Python 3.6+ for the runner: the system's, or aaPanel's own
     local candidate
-    for candidate in "$(command -v python3 || true)" /usr/bin/python3 /www/server/panel/pyenv/bin/python3; do
+    for candidate in "${ROLLOUT_PYTHON:-}" "$(command -v python3 || true)" /usr/bin/python3 /www/server/panel/pyenv/bin/python3; do
         if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' 2>/dev/null; then
             echo "$candidate"; return
         fi
@@ -101,6 +113,7 @@ find_python() {   # Python 3.6+ for the runner: the system's, or aaPanel's own
 
 find_web_user() {
     if [ -n "${WEB_USER:-}" ]; then echo "$WEB_USER"; return; fi
+    if [ -n "${ROLLOUT_WEB_USER:-}" ]; then echo "$ROLLOUT_WEB_USER"; return; fi
     for user in www www-data nginx apache; do
         if id -u "$user" >/dev/null 2>&1; then echo "$user"; return; fi
     done
@@ -137,6 +150,40 @@ configure_database() {
         echo "   Continuing. Fix it later with: bash deploy/install.sh --db"
         return 0
     done
+}
+
+fix_storage() {   # storage/ (in an installed release: a link to shared/storage/) belongs to the web server user
+    local user
+    user="$(find_web_user || true)"
+    if [ -n "$user" ] && [ -d storage/ ]; then
+        chown -R "$user":"$user" storage/
+    fi
+}
+
+check_runner_code() {   # the runner code of this release imports with this Python and reads the current settings
+    (cd "$WEB_DIR/runner" && PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$CONFIG" <<'PY'
+import os
+import sys
+from arsika_rollout_manager import __main__, __version__, server  # noqa: F401
+from arsika_rollout_manager.config import Config
+if os.path.exists(sys.argv[1]):
+    Config(sys.argv[1])
+print("   runner %s: code and settings OK with Python %s" % (__version__, sys.version.split()[0]))
+PY
+    ) || fail "The runner code of this release does not work with $PYTHON (see above)."
+}
+
+check_dashboard_code() {   # PHP syntax of this release, then the dashboard database (new tables are added)
+    local file failed=0
+    while IFS= read -r -d '' file; do
+        if ! "$PHP" -n -l "$file" >/dev/null 2>&1; then
+            "$PHP" -n -l "$file" 2>&1 | head -n 3
+            failed=1
+        fi
+    done < <(find app bootstrap config lang public routes -name '*.php' -print0 2>/dev/null; printf '%s\0' bin/console)
+    [ "$failed" = "0" ] || fail "PHP syntax errors in this release (see above)."
+    echo "   PHP $("$PHP" -r 'echo PHP_VERSION;'): syntax OK"
+    "$PHP" bin/console db:check || fail "The dashboard database check failed (see above)."
 }
 
 admin_link() {   # admin_link [--if-no-admin]
@@ -197,7 +244,12 @@ configure_runner() {   # runner.json: defaults for a new installation; the optio
     fi
     [ -n "$OPT_PORT" ] && options+=("--port=$OPT_PORT")
     if [ "$AGENT" = "1" ]; then
-        options+=("--listen=${OPT_LISTEN:-0.0.0.0}" "--tls-cert=$TLS_DIR/cert.pem" "--tls-key=$TLS_DIR/key.pem")
+        options+=("--tls-cert=$TLS_DIR/cert.pem" "--tls-key=$TLS_DIR/key.pem")
+        if [ -n "$OPT_LISTEN" ]; then
+            options+=("--listen=$OPT_LISTEN")
+        elif [ ! -f "$CONFIG" ] || ! "$PYTHON" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("tls_cert") else 1)' "$CONFIG" 2>/dev/null; then
+            options+=("--listen=0.0.0.0")       # a new agent (an agent's own address is kept on later runs)
+        fi
         [ -n "$OPT_ALLOW_FROM" ] && options+=("--allow-from=$OPT_ALLOW_FROM")
     fi
     (cd "$RUNNER_DIR" && "$PYTHON" -m arsika_rollout_manager init --config="$CONFIG" "${options[@]}")
@@ -209,7 +261,7 @@ configure_runner() {   # runner.json: defaults for a new installation; the optio
 
 install_service() {
     info "Installing the systemd service $SERVICE (user root)"
-    cat > "/etc/systemd/system/$SERVICE.service" <<EOF
+    cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=Arsika Rollout Manager runner (deploys, rollbacks and backups of the registered web sites)
 After=network-online.target docker.service
@@ -230,6 +282,11 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE" >/dev/null 2>&1
+    if [ -n "$SELF_UPDATE" ] && [ -n "${ROLLOUT_RESTART_FILE:-}" ]; then
+        : > "$ROLLOUT_RESTART_FILE"                 # a restart now would end the job that runs this script
+        echo "   the runner restarts with this code when the job has ended"
+        return
+    fi
     systemctl restart "$SERVICE"
     for i in $(seq 1 30); do
         if (cd "$RUNNER_DIR" && "$PYTHON" -m arsika_rollout_manager status --config="$CONFIG" >/dev/null 2>&1); then
@@ -260,6 +317,15 @@ fi
 if [ "$AGENT" = "1" ]; then
     if [ -f .env ] && grep -q '^RUNNER_SECRET=' .env; then
         fail "This folder holds a dashboard (.env with RUNNER_SECRET). --agent is for a server without its own dashboard; run it from an extracted release folder on that server."
+    fi
+    if [ -n "$SELF_UPDATE" ]; then
+        check_runner_code
+        [ "$SELF_UPDATE" = "build" ] && exit 0
+        install_runner_code
+        make_certificate
+        configure_runner
+        install_service
+        exit 0
     fi
     echo "== Agent (runner only) : $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}") · $PLATFORM · Python $("$PYTHON" -c 'import platform; print(platform.python_version())')"
     install_runner_code
@@ -309,6 +375,23 @@ if [ "$DB_ONLY" = "1" ]; then
     configure_database
     exit 0
 fi
+if [ -n "$SELF_UPDATE" ]; then                    # run by the runner: this folder is a release of the dashboard
+    [ -f .env ] || fail "No .env in $WEB_DIR: --self-update runs in a release installed by the runner (shared .env)."
+    PLATFORM_LINE="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}") · $PLATFORM"
+    echo "== Arsika Rollout Manager $(cd runner && "$PYTHON" -c 'from arsika_rollout_manager import __version__; print(__version__)') on $PLATFORM_LINE"
+    check_runner_code
+    if [ "$SELF_UPDATE" = "build" ]; then
+        check_dashboard_code
+        fix_storage
+        exit 0
+    fi
+    install_runner_code
+    configure_runner
+    install_service
+    secure_env
+    fix_storage
+    exit 0
+fi
 [ -z "$OPT_LISTEN$OPT_ALLOW_FROM" ] || fail "--listen and --allow-from are for --agent: the runner of the dashboard's own server listens on 127.0.0.1 only."
 echo "== Dashboard folder : $WEB_DIR"
 echo "== Server           : $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}") · $PLATFORM · PHP $("$PHP" -r 'echo PHP_VERSION;') · Python $("$PYTHON" -c 'import platform; print(platform.python_version())')"
@@ -329,9 +412,7 @@ fi
 printf 'RUNNER_URL=http://127.0.0.1:%s\nRUNNER_SECRET=%s\n' "$PORT" "$SECRET" | "$PHP" bin/console env:set >/dev/null
 secure_env
 WEB_USER="$(find_web_user || true)"
-if [ -n "$WEB_USER" ]; then
-    chown -R "$WEB_USER":"$WEB_USER" storage
-fi
+fix_storage
 "$PHP" bin/console runner:check || fail "The dashboard cannot reach the runner (see the message above)."
 
 # ---------- 5) administrator ----------
@@ -356,6 +437,8 @@ $STEPS
   4) Sites > Add site, with the site's own read-only GitHub token (private repositories), then "Adopt"
      the existing installation of that site
   5) Other servers: run "bash deploy/install.sh --agent" there, then Servers > Add server
+  6) Updates from the dashboard itself: Sites > Add site > "Arsika Rollout Manager (this dashboard)",
+     folder $WEB_DIR, then "Adopt now" with version $(cd runner && "$PYTHON" -c 'from arsika_rollout_manager import __version__; print(__version__)')
   IMPORTANT: keep a backup of .env and $CONFIG somewhere safe.
 ======================================================================
 EOF

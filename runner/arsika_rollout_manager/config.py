@@ -16,6 +16,8 @@
     web_user          default owner of the release files of new sites (aaPanel: www; Debian/Ubuntu: www-data)
     platform          aapanel or linux (detected by install.sh)
     docker_command    command that runs Docker (changed only by the tests)
+    update_repo       GitHub repository of Arsika Rollout Manager itself, for "Update runner" (a fork may change it)
+    update_asset      file name pattern of its release zip
 """
 import ipaddress
 import json
@@ -44,6 +46,8 @@ DEFAULTS = {
     "web_user": "www",
     "platform": "",
     "docker_command": ["docker"],
+    "update_repo": "RRBillanivo/arsika-rollout-manager",
+    "update_asset": "arsika-rollout-manager-v*.zip",
     "health_attempts": 10,
     "health_delay": 3,
 }

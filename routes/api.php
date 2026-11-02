@@ -52,6 +52,8 @@ return static function (Router $router): void {
             $router->post('/servers/test', [ServerController::class, 'test']);
             $router->put('/servers/{server}', [ServerController::class, 'update']);
             $router->delete('/servers/{server}', [ServerController::class, 'destroy']);
+            $router->post('/servers/{server}/update', [ServerController::class, 'updateRunner']);
+            $router->get('/servers/{server}/jobs/{job}', [JobController::class, 'forServer']);
 
             $router->get('/settings', [SettingsController::class, 'show']);
 

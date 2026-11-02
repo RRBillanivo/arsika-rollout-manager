@@ -38,6 +38,7 @@ DEFAULTS = {
     "reload_php_fpm": True,
     "health_url": "",
     "health_contains": "",
+    "health_local": False,
     "backup_before_deploy": True,
     "backup_env_file": "",
     "backup_paths": [],
@@ -107,12 +108,28 @@ PRESETS = {
     },
     "compose-build": dict(COMPOSE, label="Docker Compose: build the images from the release", compose_build=True),
     "compose-images": dict(COMPOSE, label="Docker Compose: pull ready-made images", compose_build=False),
+    "rollout-manager": {
+        "label": "Arsika Rollout Manager (this dashboard: updates itself and the runner of this server)",
+        "repo": "RRBillanivo/arsika-rollout-manager",
+        "asset_pattern": "arsika-rollout-manager-v*.zip",
+        "shared": [".env", "storage/"],
+        "docroot_link": "public",
+        "docroot_target": "public",
+        "build": "preset:rollout-manager",
+        "activate": "preset:rollout-manager",
+        "reload_php_fpm": True,
+        "health_url": "http://{domain}/api/v1/app",
+        "health_contains": '"version":"{version}"',
+        "health_local": True,
+        "backup_env_file": ".env",
+        "backup_paths": [".env"],
+    },
 }
 
 RELATIVE = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9_.@+-][A-Za-z0-9_./@+-]{0,199}$")
 DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 LIST_FIELDS = ("shared", "services", "backup_paths", "backup_exclude", "adopt_keep", "compose_files", "backup_volumes")
-BOOL_FIELDS = ("reload_php_fpm", "backup_before_deploy", "compose_build")
+BOOL_FIELDS = ("reload_php_fpm", "backup_before_deploy", "compose_build", "health_local")
 HOOK_FIELDS = ("build", "activate")
 CHOICES = {"deploy_mode": ("files", "compose"), "source": ("asset", "source"), "backup_db": ("auto", "mysql", "postgres", "none")}
 PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")

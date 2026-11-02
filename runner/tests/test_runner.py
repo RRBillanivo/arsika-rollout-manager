@@ -8,7 +8,9 @@ Covers: signed API, site validation, one read-only GitHub token per site (write-
 replaced, removed, deleted with the site, moved over from the single token of 1.0.0), backup before an adoption, adoption
 of an existing installation (with aaPanel's .user.ini in the document root), deployment, automatic rollback after a failed
 health check, manual rollback, backups and restore of shared files, release pruning, unsafe archives, the health check of
-a site that is not adopted yet, database settings from environment files, the init options, the address allowlist.
+a site that is not adopted yet, database settings from environment files, the init options, the address allowlist,
+health checks through this server (127.0.0.1 with the site's host name), the restart after a job that installed new
+runner code, Arsika Rollout Manager updating itself (preset rollout-manager) and the runner of a server (self-update).
 Docker Compose sites (fake docker), installed from release source code archives: adoption of a compose installation
 made by hand (its project name is kept), version-tagged images, rollback without a rebuild, a bind mount outside the
 release, automatic rollback, database dumps inside the container (no password on the command line), volume backups and
@@ -39,6 +41,7 @@ from arsika_rollout_manager.compose import ComposeError  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
 from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
+from arsika_rollout_manager import system  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
 from arsika_rollout_manager.util import certificate_pin  # noqa: E402
 from arsika_rollout_manager.worker import Worker  # noqa: E402
@@ -73,6 +76,40 @@ def make_zip(files):
 def release_files(version, page=None):
     return {"public/index.html": "<h1>demo</h1>", "public/version.txt": page or ("version " + version),
             "app/main.php": "<?php // " + version, "data/.gitignore": "*\n", "deploy/run.sh": "#!/bin/sh\necho hi\n"}
+
+
+SELF_UPDATE_SCRIPT = """#!/bin/bash
+# test double of deploy/install.sh: supports --self-update
+echo "$* $ROLLOUT_VERSION" >> "$ROLLOUT_SITE_DIR/self-update.log"
+if [ "$1" = "--self-update=activate" ]; then : > "$ROLLOUT_RESTART_FILE"; fi
+"""
+AGENT_UPDATE_SCRIPT = """#!/bin/bash
+# test double of deploy/install.sh of a new release, run by the runner's self-update
+echo "$* python=${ROLLOUT_PYTHON:+yes}" >> "$(dirname "$ROLLOUT_RUNNER_CONFIG")/update.log"
+: > "$ROLLOUT_RESTART_FILE"
+"""
+
+
+class HostCheck(BaseHTTPRequestHandler):
+    """Answers like a web server with one virtual host: dash.example.com (anything else: 404)."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if self.path == "/elsewhere":
+            body, status, extra = b"", 301, {"Location": "https://other.example.com/"}
+        elif host == "dash.example.com":
+            body, status, extra = b'{"version":"1.3.0"}', 200, {}
+        else:
+            body, status, extra = b"unknown host", 404, {}
+        self.send_response(status)
+        for key, value in extra.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def shop_files(version, page=None, extra_mount=None):
@@ -142,7 +179,7 @@ class FakeGitHub(object):
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def publish(self, version, files, digest=True, repo="o/demo"):
+    def publish(self, version, files, digest=True, repo="o/demo", asset=None):
         data = make_zip(files)
         asset_id = len(self.assets) + 1
         self.assets[asset_id] = data
@@ -150,7 +187,7 @@ class FakeGitHub(object):
             "tag_name": "v" + version, "name": "v" + version, "draft": False, "prerelease": False, "body": "notes " + version,
             "published_at": "2026-10-31T00:00:00Z", "html_url": "",
             "zipball_url": "http://127.0.0.1:%d/repos/%s/zipball/v%s" % (self.port, repo, version),
-            "assets": [{"id": asset_id, "name": "demo_v%s.zip" % version, "size": len(data),
+            "assets": [{"id": asset_id, "name": asset or "demo_v%s.zip" % version, "size": len(data),
                         "url": "http://127.0.0.1:%d/assets/%d" % (self.port, asset_id),
                         "digest": ("sha256:" + hashlib.sha256(data).hexdigest()) if digest else None}]})
 
@@ -175,6 +212,10 @@ class RunnerTest(unittest.TestCase):
         for version in ("1.0.0", "1.1.0"):
             cls.github.publish(version, release_files(version))
         cls.github.publish("1.2.0", release_files("1.2.0", page="broken build"))          # fails its health check
+        cls.github.publish("2.0.0", dict(release_files("2.0.0"), **{"deploy/install.sh": SELF_UPDATE_SCRIPT}), repo="o/self")
+        cls.github.publish("2.1.0", dict(release_files("2.1.0"), **{"deploy/install.sh": "#!/bin/bash\necho old\n"}), repo="o/self")
+        cls.github.publish("9.9.9", {"deploy/install.sh": AGENT_UPDATE_SCRIPT, "README.md": "fake release"}, repo="o/rollout",
+                           asset="arsika-rollout-manager-v9.9.9.zip")
 
         # fake web server whose document root is the site's "public" link (follows current/ on every request)
         handler = partial(QuietHandler, directory=os.path.join(cls.site_dir, "public"))
@@ -185,12 +226,15 @@ class RunnerTest(unittest.TestCase):
         os.makedirs(os.path.dirname(config_path))
         cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
                                    github_api="http://127.0.0.1:%d" % cls.github.port,
-                                   site_roots=[cls.www], shell=SHELL, port=0, health_attempts=3, health_delay=0.3)
+                                   site_roots=[cls.www], shell=SHELL, port=0, health_attempts=3, health_delay=0.3,
+                                   update_repo="o/rollout")
         cls.config.prepare_dirs()
         store = Store(cls.config.state_path("runner.db"))
         backups = Backups(cls.config, store)
         cls.deployer = Deployer(cls.config, store, backups)
         cls.worker = Worker(cls.config, store, cls.deployer)
+        cls.restarts = []
+        cls.worker.on_restart = lambda: cls.restarts.append(time.time())
         cls.worker.start()
         cls.api = Api(cls.config, store, cls.deployer, cls.worker)
         cls.server = serve(cls.api)
@@ -211,8 +255,11 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(status, expect, json.dumps(doc)[:500])
         return doc.get("data", doc)
 
-    def job(self, job_type, version=None, params=None, expect="succeeded"):
-        job = self.call("POST", "/v1/sites/demo/jobs", {"type": job_type, "version": version, "params": params or {}, "actor": "test"})
+    def job(self, job_type, version=None, params=None, expect="succeeded", site="demo"):
+        job = self.call("POST", "/v1/sites/%s/jobs" % site, {"type": job_type, "version": version, "params": params or {}, "actor": "test"})
+        return self.wait_job(job, expect)
+
+    def wait_job(self, job, expect="succeeded"):
         for _ in range(300):
             current = self.call("GET", "/v1/jobs/%d" % job["id"])
             if current["status"] in ("succeeded", "failed"):
@@ -459,6 +506,73 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(cli.main(common + ["--port=9000"]), 0)                         # an existing file: only the option changes
         second = Config(path)
         self.assertEqual((second["port"], second["secret"], second["web_user"]), (9000, first["secret"], "www-data"))
+
+    def test_19_health_check_through_this_server(self):
+        web = HTTPServer(("127.0.0.1", 0), HostCheck)
+        threading.Thread(target=web.serve_forever, daemon=True).start()
+        try:
+            url = "http://dash.example.com:%d/api/v1/app" % web.server_address[1]
+            result = system.quick_health(url, '"version":"1.3.0"', local=True)        # asked on 127.0.0.1 with Host
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(system.quick_health(url, "", timeout=3)["ok"])            # the name itself does not resolve
+            other = system.quick_health("http://dash.example.com:%d/elsewhere" % web.server_address[1], "", local=True)
+            self.assertEqual((other["ok"], other["status"]), (False, 301))              # another host is not followed
+        finally:
+            stop(web)
+        details = self.call("PUT", "/v1/sites/demo", {"health_local": True})
+        self.assertTrue(details["settings"]["health_local"])
+        self.assertTrue(self.call("GET", "/v1/sites/demo/health")["ok"])               # 127.0.0.1 is its own host
+        self.call("PUT", "/v1/sites/demo", {"health_local": False})
+
+    def test_20_restart_after_a_job_that_asks_for_it(self):
+        before = len(self.restarts)
+        old = self.call("GET", "/v1/sites/demo")["settings"]["activate"]
+        self.call("PUT", "/v1/sites/demo", {"activate": old + ' && : > "$ROLLOUT_RESTART_FILE"'})
+        try:
+            self.job("rollback")
+            time.sleep(0.3)
+            self.assertEqual(len(self.restarts), before + 1)
+            self.assertFalse(os.path.exists(self.config.state_path("restart-requested")))
+            self.job("rollback")                                     # back to the newest release; also restarts once
+            time.sleep(0.3)
+            self.assertEqual(len(self.restarts), before + 2)
+        finally:
+            self.call("PUT", "/v1/sites/demo", {"activate": old})
+        self.job("backup")                                            # a job that asks for nothing: no restart
+        time.sleep(0.3)
+        self.assertEqual(len(self.restarts), before + 2)
+
+    def test_21_arsika_rollout_manager_updates_itself(self):
+        site_dir = os.path.join(self.www, "rollout.example.com")
+        os.makedirs(site_dir)
+        created = self.call("POST", "/v1/sites", {"preset": "rollout-manager", "id": "rollout", "domain": "rollout.example.com",
+                                                  "path": site_dir, "repo": "o/self", "asset_pattern": "demo_v*.zip", "shared": [],
+                                                  "web_user": "", "backup_env_file": "", "backup_paths": [], "health_url": "",
+                                                  "reload_php_fpm": False})
+        self.assertEqual((created["settings"]["build"], created["settings"]["health_local"]), ("preset:rollout-manager", True))
+        before = len(self.restarts)
+        self.job("deploy", "2.0.0", site="rollout")
+        time.sleep(0.3)
+        with open(os.path.join(site_dir, "self-update.log"), encoding="utf-8") as f:
+            self.assertEqual(f.read().split("\n")[:2], ["--self-update=build 2.0.0", "--self-update=activate 2.0.0"])
+        self.assertEqual(len(self.restarts), before + 1)                               # new runner code: restart after the job
+        job = self.job("deploy", "2.1.0", site="rollout", expect="failed")             # a release without --self-update
+        self.assertIn("cannot update itself", job["log"]["text"])
+        self.assertEqual(self.call("GET", "/v1/sites/rollout")["current_version"], "2.0.0")
+        self.call("DELETE", "/v1/sites/rollout")
+
+    def test_22_update_the_runner_of_this_server(self):
+        before = len(self.restarts)
+        status, doc = self.client.post("/v1/runner/update", {"version": "not a version!"})
+        self.assertEqual(status, 422)
+        job = self.wait_job(self.call("POST", "/v1/runner/update", {"version": "9.9.9", "actor": "test"}))
+        self.assertEqual((job["site_id"], job["type"], job["to_version"]), ("_runner", "self-update", "9.9.9"))
+        self.assertIn("SHA-256 verified", job["log"]["text"])
+        time.sleep(0.3)
+        with open(os.path.join(os.path.dirname(self.config.path), "update.log"), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "--agent --self-update python=yes")
+        self.assertEqual(len(self.restarts), before + 1)
+        self.assertFalse([n for n in os.listdir(self.config.state_path()) if n.startswith("update-")])   # cleaned up
 
     def test_18_presets_use_the_server_web_user(self):
         presets = {p["id"]: p["settings"] for p in self.call("GET", "/v1/presets")}

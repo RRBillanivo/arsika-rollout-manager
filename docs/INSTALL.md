@@ -76,11 +76,22 @@ Open the setup link, choose a password (at least 12 characters), sign in as `adm
 
 ## Updating
 
-Upload and unzip the new release over the old files (keep `.env` and `storage/`), then run `bash deploy/install.sh`
-again and answer **N** to "Change the database settings?". The runner code is replaced and restarted; its settings,
-sites, history and backups are kept. The dashboard database gets new tables automatically. Update the runner of every
-other server too: unzip the release there and run `bash deploy/install.sh --agent` again (its certificate and key pin
-are kept).
+**From the dashboard (1.3.0 and newer).** Register the dashboard once as a site of its own server: **Sites → Add site**,
+kind **Arsika Rollout Manager (this dashboard)**, the dashboard's domain and folder, then **Adopt now** with the
+installed version (see [SITES.md](SITES.md#arsika-rollout-manager-itself)). From then on a new release shows
+**Update to X.Y.Z** like any site: backup of the dashboard database and `.env`, checks of the new release, switch,
+installation of its runner (which restarts when the job has ended), health check, automatic rollback on failure. The
+runners of other servers: **Servers → Update runner** ([SERVERS.md](SERVERS.md#changing-or-removing)).
+
+After that adoption the dashboard lives in `releases/`: never unzip a release over its folder again. The commands of
+the installer are run from `current/`, e.g. `bash current/deploy/install.sh --admin-link`. Without the dashboard (it
+does not load after an update): `cd /opt/arsika-rollout-manager && python3 -m arsika_rollout_manager rollback <id>`.
+
+**By hand** (before the adoption, or from 1.2 and older): upload and unzip the new release over the old files (keep
+`.env` and `storage/`), then run `bash deploy/install.sh` again and answer **N** to "Change the database settings?".
+The runner code is replaced and restarted; its settings, sites, history and backups are kept. The dashboard database
+gets new tables automatically. Other servers: unzip the release there and run `bash deploy/install.sh --agent` again
+(their certificate, key pin and settings are kept).
 
 ## Commands
 
@@ -93,8 +104,9 @@ python3 -m arsika_rollout_manager status                # sites, versions
 python3 -m arsika_rollout_manager deploy example 3.2.0  # deploy without the dashboard
 python3 -m arsika_rollout_manager rollback example
 python3 -m arsika_rollout_manager connection-info       # address, secret and key pin (servers installed with --agent)
+python3 -m arsika_rollout_manager update-runner 1.3.0   # install the runner of that release on this server (--agent)
 
-cd /www/wwwroot/rollout.example.com                     # from the dashboard's folder:
+cd /www/wwwroot/rollout.example.com                     # from the dashboard's folder (after the adoption: current/):
 bash deploy/install.sh --admin-link                     # forgotten administrator password
 bash deploy/install.sh --db                             # change the dashboard database
 ```

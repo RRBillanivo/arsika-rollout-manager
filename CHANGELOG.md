@@ -3,6 +3,26 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.3.0] — 2026-11-02
+
+### Added
+- **Arsika Rollout Manager updates itself.** Preset "Arsika Rollout Manager (this dashboard)": the dashboard is adopted
+  once as a site of its own server; afterwards **Update to X.Y.Z** backs up its database and `.env`, checks the new
+  release (`deploy/install.sh --self-update=build`: PHP syntax, database, the new runner code with the server's Python
+  and settings), switches, installs that release's runner and systemd unit (`--self-update=activate`) and checks the
+  health; an automatic rollback puts the previous runner code back. A release brings its own update steps.
+- **Update runner** for other servers (Servers page, or `python3 -m arsika_rollout_manager update-runner X.Y.Z`): the
+  runner downloads that release from GitHub (`update_repo`, SHA-256 checked), runs its `install.sh --agent
+  --self-update` and restarts. Job pages for jobs of a runner (`#/servers/<id>/jobs/<n>`).
+- The runner restarts with new code when a job asks for it (`ROLLOUT_RESTART_FILE`), after the job's state is saved.
+- **Health check through this server** (`health_local`): 127.0.0.1 with the site's host name (for https also SNI; one
+  redirect to the same host followed), for sites behind Cloudflare Access, a CDN or a firewall.
+
+### Fixed
+- `.env` behind a link (an installed release) is written through the link instead of being replaced by a file.
+- Running `install.sh --agent` again no longer resets a runner address set with `--listen` to `0.0.0.0`.
+- `install.sh` leaves no `__pycache__` folders behind and gives the content of a linked `storage/` to the web server user.
+
 ## [1.2.0] — 2026-11-02
 
 ### Added

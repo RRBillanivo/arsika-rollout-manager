@@ -89,6 +89,9 @@ final class Env
      */
     public static function write(string $file, array $changes): void
     {
+        if (is_link($file) && ($target = realpath($file)) !== false) {
+            $file = $target;                // an installed release links .env to shared/.env: write the shared file
+        }
         $lines = is_file($file) ? preg_split('/\r\n|\r|\n/', rtrim((string)file_get_contents($file), "\r\n")) : [];
         foreach ($lines as $i => $line) {
             if (preg_match('/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/', $line, $m) && array_key_exists($m[1], $changes)) {

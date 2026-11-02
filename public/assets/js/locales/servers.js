@@ -16,6 +16,10 @@ export default {
     removed: 'Server {name} dihapus dari dasbor.',
     added: 'Server {name} ditambahkan ({n} situs).',
     saved: 'Server {name} disimpan.',
+    update: 'Update runner ke {version}',
+    update_note: 'Runner server ini versi {runner}, dasbor versi {version}.',
+    update_title: 'Update runner {name} ke {version}?',
+    update_text: 'Runner di server itu mengunduh Arsika Rollout Manager {version} dari GitHub, memasang kode runner-nya (setelan, sertifikat, dan situs tetap), lalu restart sendiri. Situs di server itu tidak berhenti.',
     facts: {
       version: 'Runner', python: 'Python', platform: 'Platform', docker: 'Docker', no_docker: 'tidak ada', sites: 'Situs', disk: 'Disk backup',
       roots: 'Folder situs', host: 'Host', allow: 'hanya dari {list}',
@@ -54,6 +58,10 @@ export default {
     removed: 'Server {name} removed from the dashboard.',
     added: 'Server {name} added ({n} sites).',
     saved: 'Server {name} saved.',
+    update: 'Update runner to {version}',
+    update_note: 'The runner of this server is version {runner}, the dashboard {version}.',
+    update_title: 'Update the runner of {name} to {version}?',
+    update_text: 'The runner of that server downloads Arsika Rollout Manager {version} from GitHub, installs its runner code (settings, certificate and sites stay) and restarts itself. The sites on that server keep running.',
     facts: {
       version: 'Runner', python: 'Python', platform: 'Platform', docker: 'Docker', no_docker: 'none', sites: 'Sites', disk: 'Backup disk',
       roots: 'Site folders', host: 'Host', allow: 'only from {list}',

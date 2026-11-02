@@ -10,6 +10,9 @@
     python3 -m arsika_rollout_manager connection-info
                                                     address, secret and key pin to add this server in a dashboard
                                                     on another server (Servers > Add server)
+    python3 -m arsika_rollout_manager update-runner <version>
+                                                    install the runner of that Arsika Rollout Manager release (from
+                                                    GitHub) on this server; it restarts with the new code
     python3 -m arsika_rollout_manager status        runner and site overview
     python3 -m arsika_rollout_manager deploy <site> <version> [--no-backup]
     python3 -m arsika_rollout_manager rollback <site> [<version>]
@@ -23,6 +26,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 
 from . import __version__
@@ -91,8 +95,17 @@ def connection_info(config):
 
 def follow(api, job_id):
     offset = 0
+    unreachable = 0
     while True:
-        status, doc = api.get("/v1/jobs/%d?offset=%d" % (job_id, offset))
+        try:
+            status, doc = api.get("/v1/jobs/%d?offset=%d" % (job_id, offset))
+            unreachable = 0
+        except OSError:                                              # the runner restarts after a self-update
+            unreachable += 1
+            if unreachable > 60:
+                raise
+            time.sleep(1)
+            continue
         if status != 200:
             print(doc.get("error", {}).get("message", doc))
             return 1
@@ -170,6 +183,12 @@ def main(argv=None):
             return follow(api, doc["data"]["id"])
         if command == "log" and len(args) > 1:
             return follow(api, int(args[1]))
+        if command == "update-runner" and len(args) > 1:
+            status, doc = api.post("/v1/runner/update", {"version": args[1], "actor": "console"})
+            if status != 200:
+                print(doc.get("error", {}).get("message", doc))
+                return 1
+            return follow(api, doc["data"]["id"])
     except OSError as e:
         print("Cannot reach the runner service (%s). Is it running? systemctl status arsika-rollout-manager-runner" % e)
         return 1
@@ -193,9 +212,11 @@ def serve(config):
     backups = Backups(config, store)
     deployer = Deployer(config, store, backups)
     worker = Worker(config, store, deployer)
-    worker.start()
     api = Api(config, store, deployer, worker)
     server = make_server(api)
+    # after a self-update: stop serving (from another thread); systemd (Restart=always) starts the new code
+    worker.on_restart = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
+    worker.start()
     print("Arsika Rollout Manager runner %s listening on %s://%s:%d%s" % (
         __version__, "https" if config.tls_enabled() else "http", config["listen"], int(config["port"]),
         " (allowed: %s)" % ", ".join(str(n) for n in config.allowed) if config.allowed else ""), flush=True)

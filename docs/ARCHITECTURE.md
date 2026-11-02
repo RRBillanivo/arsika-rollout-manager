@@ -67,7 +67,12 @@ carries that file into every release it switches to (copied when the release has
 9. Old releases beyond `keep_releases` are removed with their images (never the current one or the rollback target).
 
 Jobs of one runner run one at a time in a background thread. A job left running by a stopped runner is marked failed at
-the next start. A job ends after its clean-up, so its log is complete when its state changes.
+the next start. A job ends after its clean-up, so its log is complete when its state changes. Jobs of the runner itself
+(`self-update`, "Update runner") belong to the pseudo site `_runner`.
+
+Health checks request the address over the network, or, with **check through this server**, from 127.0.0.1 with the
+address's host name (`Host` header; for https also SNI, without a certificate check on the loopback connection),
+following one redirect to the same host.
 
 ## Hooks
 
@@ -75,7 +80,10 @@ the next start. A job ends after its clean-up, so its log is complete when its s
 Environment variables: `ROLLOUT_SITE`, `ROLLOUT_VERSION`, `ROLLOUT_SITE_DIR`, `ROLLOUT_RELEASE_DIR`,
 `ROLLOUT_SHARED_DIR`, `ROLLOUT_CURRENT_DIR`, `ROLLOUT_CACHE_DIR`, `ROLLOUT_WEB_USER`, `ROLLOUT_DOMAIN`,
 `ROLLOUT_DEPLOY_MODE`, `ROLLOUT_PHASE` (`build`, `activate`, `adopt-revert`); Docker Compose sites also
-`COMPOSE_PROJECT_NAME`, `COMPOSE_FILE` and `ROLLOUT_COMPOSE_PROJECT`.
+`COMPOSE_PROJECT_NAME`, `COMPOSE_FILE` and `ROLLOUT_COMPOSE_PROJECT`. For updates of Arsika Rollout Manager itself:
+`ROLLOUT_RUNNER_DIR`, `ROLLOUT_RUNNER_CONFIG`, `ROLLOUT_PYTHON` and `ROLLOUT_RESTART_FILE`: a hook that creates that
+file makes the runner stop when the job has ended (its state is saved first); systemd (`Restart=always`) starts the new
+code.
 A non-zero exit code fails the job (before the switch for `build`, with an automatic rollback for `activate`).
 
 ## Backups

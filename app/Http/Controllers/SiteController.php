@@ -18,7 +18,7 @@ final class SiteController extends Controller
     /** Job types that change data or files irreversibly: the password is asked again. */
     const CONFIRMED_JOBS = ['adopt', 'restore', 'delete-release', 'cleanup-adopt'];
     const SITE_FIELDS = ['id', 'preset', 'name', 'domain', 'path', 'repo', 'asset_pattern', 'web_user', 'keep_releases', 'shared',
-        'docroot_link', 'docroot_target', 'build', 'activate', 'services', 'reload_php_fpm', 'health_url', 'health_contains',
+        'docroot_link', 'docroot_target', 'build', 'activate', 'services', 'reload_php_fpm', 'health_url', 'health_contains', 'health_local',
         'backup_before_deploy', 'backup_env_file', 'backup_paths', 'backup_exclude', 'backup_keep', 'adopt_keep',
         'deploy_mode', 'source', 'compose_files', 'compose_project', 'compose_build', 'backup_db', 'backup_db_service', 'backup_volumes'];
 

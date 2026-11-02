@@ -72,6 +72,7 @@ return [
         'secret_invalid' => 'The secret is 16-256 characters without spaces.',
         'pin_invalid' => 'The key pin looks like sha256//… (44 characters after //).',
         'site_ids_taken' => 'Sites with these ids already exist in this dashboard: :sites',
+        'update_local' => 'The runner of this server is updated together with the dashboard (site with the preset "Arsika Rollout Manager"), or with bash deploy/install.sh.',
     ],
     'jobs' => [
         'not_found' => 'Job not found.',

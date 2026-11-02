@@ -78,7 +78,12 @@ From then on **Add site** offers a choice of server; the site's folder must be i
   `bash deploy/install.sh --agent` again, then enter the new pin in the dashboard (**Edit**).
 - **New secret**: write a new value (`openssl rand -hex 32`) into `"secret"` of `/etc/arsika-rollout-manager/runner.json`,
   `systemctl restart arsika-rollout-manager-runner`, then enter it in the dashboard (**Edit**).
-- **Updating the runner**: unzip the new release on that server and run `bash deploy/install.sh --agent` again.
+- **Updating the runner**: when the runner of a server is older than the dashboard, its card shows **Update runner
+  to X.Y.Z**. The runner downloads that release of Arsika Rollout Manager from GitHub (`update_repo` in `runner.json`,
+  the official repository by default; its SHA-256 is checked), runs its `deploy/install.sh --agent --self-update`
+  (runner code and systemd unit; settings, certificate, key pin and sites stay) and restarts when the job has ended.
+  On the server itself: `cd /opt/arsika-rollout-manager && sudo python3 -m arsika_rollout_manager update-runner X.Y.Z`,
+  or unzip the release there and run `bash deploy/install.sh --agent` again.
 
 ## A dashboard without its own runner
 

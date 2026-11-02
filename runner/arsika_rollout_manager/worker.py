@@ -1,4 +1,8 @@
-"""Job queue: one background thread runs the queued jobs one after another (deployments never overlap)."""
+"""Job queue: one background thread runs the queued jobs one after another (deployments never overlap).
+
+A job (its hook, or a self-update) may ask the runner to restart with new code by creating the file
+ROLLOUT_RESTART_FILE; the runner then stops when the job has ended, and systemd starts it again."""
+import os
 import threading
 import traceback
 
@@ -10,6 +14,7 @@ from .joblog import JobLog
 from .util import exists, now, remove
 
 JOB_TYPES = ("deploy", "rollback", "adopt", "backup", "restore", "delete-release", "cleanup-adopt")
+RUNNER_SITE = "_runner"                  # jobs of the runner itself ("self-update"), not of a site
 EXPECTED = (DeployError, BackupError, GitHubError, system.CommandError)
 
 
@@ -22,11 +27,17 @@ class Worker(object):
         self.wake = threading.Event()
         self.stopping = False
         self.thread = None
+        self.on_restart = None                                       # set by serve(): stops the service (systemd restarts it)
 
     def log_path(self, job_id):
         return self.config.state_path("logs", "%d.log" % int(job_id))
 
+    def restart_file(self):
+        return self.config.state_path("restart-requested")
+
     def start(self):
+        if os.path.exists(self.restart_file()):
+            os.unlink(self.restart_file())                           # from a job before the last start
         self.store.fail_interrupted_jobs()
         self.thread = threading.Thread(target=self.loop, name="rollout-worker", daemon=True)
         self.thread.start()
@@ -47,14 +58,15 @@ class Worker(object):
 
     def run(self, job_id):
         job = self.store.job(job_id)
-        site = self.store.site(job["site_id"])
+        runner_job = job["site_id"] == RUNNER_SITE
+        site = None if runner_job else self.store.site(job["site_id"])
         self.store.update_job(job_id, status="running", started_at=now())
         log = JobLog(self.log_path(job_id))
         log.line("Arsika Rollout Manager runner %s - job #%d: %s%s on %s, requested by %s" % (
             __version__, job_id, job["type"], " " + job["version"] if job["version"] else "", job["site_id"], job["actor"] or "?"))
         outcome = {}
         try:
-            if site is None:
+            if site is None and not runner_job:
                 raise DeployError("site %s is not registered" % job["site_id"])
             handler = getattr(self, "job_" + job["type"].replace("-", "_"))
             before, after, message = handler(job, site, log)
@@ -77,6 +89,21 @@ class Worker(object):
             log.close()
             if outcome:                                                  # the job ends after its clean-up (and its last log line)
                 self.store.update_job(job_id, finished_at=now(), **outcome)
+            self.restart_if_requested(job_id)
+
+    def restart_if_requested(self, job_id):
+        """Stop the runner after a job that installed new runner code (systemd starts the new code)."""
+        path = self.restart_file()
+        if not os.path.exists(path):
+            return False
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        print("job #%d asked for a restart: the runner stops now and starts again with its new code" % job_id, flush=True)
+        if self.on_restart:
+            self.on_restart()
+        return True
 
     # ---------- job types ----------
     def job_deploy(self, job, site, log):
@@ -119,6 +146,10 @@ class Worker(object):
     def job_delete_release(self, job, site, log):
         self.deployer.delete_release(site, job["version"], log)
         return None, None, "deleted release " + job["version"]
+
+    def job_self_update(self, job, site, log):
+        self.deployer.update_runner(job, log)
+        return __version__, job["version"], "runner %s installed; it restarts with the new code now" % job["version"]
 
     def job_cleanup_adopt(self, job, site, log):
         self.deployer.delete_pre_rollout(site, log)

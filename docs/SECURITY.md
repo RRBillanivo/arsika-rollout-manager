@@ -45,6 +45,9 @@ not in a public issue.
   line. Dumps of a database in a container run inside the container with its own credentials.
 - Docker Compose: a bind mount into the release that does not exist stops a deployment (Docker would silently create an
   empty folder in its place).
+- Self-update: the runner installs only releases of `update_repo` (the official repository unless changed in
+  `runner.json`), checks the asset's SHA-256 when GitHub provides it, and is asked to do so only by a signed request;
+  the dashboard asks for the password first.
 
 ## Recommendations
 

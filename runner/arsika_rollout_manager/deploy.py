@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import zipfile
 
 from . import system
@@ -24,6 +25,7 @@ from .util import (POSIX, chown_tree, ensure_dir, exists, human_size, link_targe
                    sha256_file, switch_link, version_key, VERSION)
 
 MARKER = ".rollout-release.json"
+RUNNER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))     # /opt/arsika-rollout-manager
 RESERVED = ("releases", "shared", "current", "_pre_rollout")
 USER_INI = ".user.ini"
 
@@ -103,6 +105,7 @@ class Deployer(object):
             "ROLLOUT_CURRENT_DIR": lay["current"], "ROLLOUT_WEB_USER": site.get("web_user", ""), "ROLLOUT_DOMAIN": site.get("domain", ""),
             "ROLLOUT_CACHE_DIR": os.path.join(lay["shared"], ".rollout-cache"), "ROLLOUT_DEPLOY_MODE": site.get("deploy_mode", "files"),
         }
+        values.update(self.runner_variables())
         if self.is_compose(site):
             # a plain "docker compose run/exec ..." in a hook uses the project and the files (with the images) of this release
             values["COMPOSE_PROJECT_NAME"] = values["ROLLOUT_COMPOSE_PROJECT"] = self.compose.project(site)
@@ -114,6 +117,12 @@ class Deployer(object):
             except ComposeError:
                 pass
         return values
+
+    def runner_variables(self):
+        """For hooks that update Arsika Rollout Manager itself: where the runner lives, and the file that asks it to
+        restart (with its new code) when the job has ended."""
+        return {"ROLLOUT_RUNNER_DIR": RUNNER_DIR, "ROLLOUT_RUNNER_CONFIG": os.path.abspath(self.config.path),
+                "ROLLOUT_RESTART_FILE": self.config.state_path("restart-requested"), "ROLLOUT_PYTHON": sys.executable}
 
     @staticmethod
     def is_compose(site):
@@ -154,18 +163,7 @@ class Deployer(object):
         else:
             log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
         try:
-            size = github.download(asset, archive, lambda done, total: log.line(
-                "downloaded %s" % human_size(done) + (" of %s" % human_size(total) if total else "")))
-            if asset["size"] and size != asset["size"]:
-                raise DeployError("download incomplete: %d of %d bytes" % (size, asset["size"]))
-            digest = sha256_file(archive)
-            if asset.get("digest", "").startswith("sha256:"):
-                if asset["digest"][7:] != digest:
-                    raise DeployError("SHA-256 of the download does not match GitHub's digest")
-                log.line("SHA-256 verified: " + digest)
-            else:
-                log.line("SHA-256: " + digest)
-
+            size, digest = self.fetch(github, asset, archive, log)
             log.step("Extract into releases/" + version)
             ensure_dir(lay["releases"])
             ensure_dir(target)
@@ -190,6 +188,55 @@ class Deployer(object):
         self.store.save_release(site["id"], version, asset["name"], size, digest)
         log.line("release %s is ready" % version)
         return target
+
+    @staticmethod
+    def fetch(github, asset, archive, log):
+        """Download an asset and check its size and, when GitHub knows it, its SHA-256. -> (size, sha256)"""
+        size = github.download(asset, archive, lambda done, total: log.line(
+            "downloaded %s" % human_size(done) + (" of %s" % human_size(total) if total else "")))
+        if asset["size"] and size != asset["size"]:
+            raise DeployError("download incomplete: %d of %d bytes" % (size, asset["size"]))
+        digest = sha256_file(archive)
+        if asset.get("digest", "").startswith("sha256:"):
+            if asset["digest"][7:] != digest:
+                raise DeployError("SHA-256 of the download does not match GitHub's digest")
+            log.line("SHA-256 verified: " + digest)
+        else:
+            log.line("SHA-256: " + digest)
+        return size, digest
+
+    def update_runner(self, job, log):
+        """Install the runner of another release of Arsika Rollout Manager on this server: its deploy/install.sh
+        --agent --self-update copies the runner code and asks for a restart when the job has ended."""
+        version = job["version"]
+        if not VERSION.match(version or ""):
+            raise DeployError("invalid version: %s" % version)
+        repo = self.config.get("update_repo") or "RRBillanivo/arsika-rollout-manager"
+        log.step("Find Arsika Rollout Manager %s in %s" % (version, repo))
+        github = GitHub(self.config["github_api"])
+        release = github.release(repo, version, self.config.get("update_asset") or "arsika-rollout-manager-v*.zip")
+        asset = release["asset"]
+        if not asset:
+            raise DeployError("release %s has no %s file" % (version, self.config.get("update_asset")))
+        archive = self.config.state_path("downloads", "runner-%s-%d.zip" % (version, job["id"]))
+        folder = self.config.state_path("update-%s-%d" % (version, job["id"]))
+        log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
+        try:
+            self.fetch(github, asset, archive, log)
+            ensure_dir(folder, 0o700)
+            self.extract(archive, folder)
+            script = os.path.join(folder, "deploy", "install.sh")
+            if not os.path.isfile(script):
+                raise DeployError("the release has no deploy/install.sh")
+            log.step("Install the runner of %s (deploy/install.sh --agent --self-update)" % version)
+            env = dict(os.environ)
+            env.update(self.runner_variables())
+            system.run([self.config["shell"], script, "--agent", "--self-update"], log, cwd=folder, env=env,
+                       timeout=self.config["hook_timeout_seconds"])
+        finally:
+            for path in (archive, folder):
+                if exists(path):
+                    remove(path)
 
     @staticmethod
     def extract(archive, target):
@@ -339,9 +386,10 @@ class Deployer(object):
             log.line("no health check configured")
             return True
         url, contains = expand(site, site["health_url"], version), expand(site, site.get("health_contains", ""), version)
-        log.step("Health check " + url + (' (expects "%s")' % contains if contains else ""))
+        local = bool(site.get("health_local"))
+        log.step("Health check " + url + (" on this server (127.0.0.1)" if local else "") + (' (expects "%s")' % contains if contains else ""))
         return system.health_check(url, contains, log, attempts=int(self.config.get("health_attempts", 10)),
-                                   delay=float(self.config.get("health_delay", 3)))
+                                   delay=float(self.config.get("health_delay", 3)), local=local)
 
     def go_live(self, site, version, previous, log):
         """Switch + activate + health check; switches back to ``previous`` when anything fails."""

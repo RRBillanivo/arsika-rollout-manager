@@ -106,6 +106,7 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
       <div class="form-two">
         ${field('health_url', f('health_url'), s.health_url, { help: f('health_url_help'), mono: true, wide: true })}
         ${field('health_contains', f('health_contains'), s.health_contains, { help: f('health_contains_help'), mono: true, wide: true })}
+        <div class="field field--full">${checkbox('health_local', f('health_local'), s.health_local)}<span class="field__help">${f('health_local_help')}</span></div>
       </div>
     </fieldset>
     <fieldset class="section">
@@ -139,6 +140,7 @@ export function readSiteForm(form) {
   data.reload_php_fpm = e.reload_php_fpm.checked;
   data.backup_before_deploy = e.backup_before_deploy.checked;
   data.compose_build = e.compose_build.checked;
+  data.health_local = e.health_local.checked;
   if (e.preset && e.preset.value) data.preset = e.preset.value;
   if (e.server) data.server = e.server.value;
   const token = e.github_token.value.trim();

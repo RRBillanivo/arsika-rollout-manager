@@ -38,6 +38,16 @@ final class JobController extends Controller
         return Response::json($record);
     }
 
+    /** GET /api/v1/servers/{server}/jobs/{job}?offset= — a job of a runner itself (e.g. "Update runner"). */
+    public function forServer(Request $request, string $server, string $job): Response
+    {
+        $record = $this->servers->client($server)->get('/v1/jobs/' . (int)$job . '?offset=' . max(0, (int)$request->query('offset', 0)));
+        if (($record['site_id'] ?? '') !== '_runner') {
+            throw HttpException::notFound(trans('jobs.not_found'), 'job_not_found');
+        }
+        return Response::json($record);
+    }
+
     /** GET /api/v1/jobs/{job}?offset= — a job of this server's runner (links of version 1.1). */
     public function show(Request $request, string $job): Response
     {

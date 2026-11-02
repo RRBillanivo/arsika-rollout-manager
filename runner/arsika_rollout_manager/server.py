@@ -30,7 +30,7 @@ from .github import GitHub, GitHubError
 from .joblog import read_log
 from .sites import expand, layout, preset, presets_info, release_pattern, validate
 from .util import VERSION, exists, now, version_key
-from .worker import JOB_TYPES
+from .worker import JOB_TYPES, RUNNER_SITE
 
 MAX_BODY = 1 << 20
 WINDOW = 120
@@ -113,6 +113,7 @@ class Api(object):
         ("DELETE", r"/v1/sites/(?P<site>[a-z0-9-]+)/backups/(?P<backup>[0-9A-Za-z._+-]+)$", "delete_backup"),
         ("GET", r"/v1/jobs$", "jobs"),
         ("GET", r"/v1/jobs/(?P<job>\d+)$", "job"),
+        ("POST", r"/v1/runner/update$", "update_runner"),
     ]
 
     def __init__(self, config, store, deployer, worker):
@@ -206,7 +207,8 @@ class Api(object):
         contains = site.get("health_contains", "")
         if "{version}" in contains and not version:
             contains = ""                       # an installation that is not adopted yet: its version is not known
-        result = system.quick_health(expand(site, site["health_url"], version), expand(site, contains, version))
+        result = system.quick_health(expand(site, site["health_url"], version), expand(site, contains, version),
+                                     local=bool(site.get("health_local")))
         result["checked_at"] = now()
         self.health_cache[site["id"]] = (time.time(), result, version)
         return result
@@ -388,6 +390,17 @@ class Api(object):
             raise ApiError(409, "busy", "a job of this site is queued or running")
         self.deployer.backups.delete(site, backup)
         return {"deleted": backup}
+
+    def update_runner(self, query, data):
+        """Install the runner of another Arsika Rollout Manager release on this server (normally the dashboard's own
+        version). It restarts with the new code when the job ends."""
+        version = str(data.get("version") or "").strip()
+        if not VERSION.match(version):
+            raise ApiError(422, "validation_failed", "invalid version", {"version": "Invalid version."})
+        if self.store.active_job():
+            raise ApiError(409, "busy", "a job is queued or running on this server; try again when it has finished")
+        actor = str(data.get("actor") or "")[:80] or None
+        return self.store.job(self.worker.submit(RUNNER_SITE, "self-update", version, {}, actor))
 
     def jobs(self, query, data):
         return self.store.jobs(query.get("site") or None, min(200, int(query.get("limit", 50) or 50)))

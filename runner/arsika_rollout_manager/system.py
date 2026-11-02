@@ -1,13 +1,16 @@
 """Commands on the server: site hooks, systemd services, PHP-FPM reload and HTTP health checks."""
 import glob
+import http.client
 import os
 import shutil
+import socket
 import ssl
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urljoin, urlsplit
 
 from . import __version__
 from .util import POSIX
@@ -113,8 +116,53 @@ def reload_php_fpm(log):
     log.line("No PHP-FPM service found to reload")
 
 
-def http_get(url, timeout=10):
-    """GET url -> (status, body text). Certificate errors are reported, not ignored."""
+class _LocalHTTPS(http.client.HTTPSConnection):
+    """HTTPS to 127.0.0.1 that presents the site's own host name (SNI), so the web server picks the site. The certificate
+    is not checked: the connection never leaves this machine, and origin certificates (e.g. Cloudflare's) are not
+    publicly trusted anyway."""
+
+    def __init__(self, port, server_name, timeout):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        http.client.HTTPSConnection.__init__(self, "127.0.0.1", port, timeout=timeout, context=context)
+        self.server_name = server_name
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.server_name)
+
+
+def local_get(url, timeout=10, redirects=1):
+    """GET url from the web server of this machine (127.0.0.1) with the url's host name, so a site behind a CDN,
+    Cloudflare Access or a firewall is checked without leaving the server. A redirect to the same host (e.g. http ->
+    https) is followed on this machine as well. -> (status, body text)"""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("not an http(s) address: " + url)
+    secure = parts.scheme == "https"
+    port = parts.port or (443 if secure else 80)
+    conn = _LocalHTTPS(port, parts.hostname, timeout) if secure else http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request("GET", (parts.path or "/") + ("?" + parts.query if parts.query else ""),
+                     headers={"Host": parts.netloc.rsplit("@", 1)[-1], "User-Agent": "arsika-rollout-manager/" + __version__,
+                              "Cache-Control": "no-cache"})
+        response = conn.getresponse()
+        location = response.getheader("Location") or ""
+        if response.status in (301, 302, 303, 307, 308) and location and redirects > 0:
+            target = urljoin(url, location)
+            if urlsplit(target).hostname == parts.hostname:
+                return local_get(target, timeout, redirects - 1)
+        return response.status, response.read(1 << 20).decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def http_get(url, timeout=10, local=False):
+    """GET url -> (status, body text). Certificate errors are reported, not ignored. ``local``: ask this machine's web
+    server (see local_get)."""
+    if local:
+        return local_get(url, timeout)
     request = urllib.request.Request(url, headers={"User-Agent": "arsika-rollout-manager/" + __version__, "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
@@ -123,12 +171,12 @@ def http_get(url, timeout=10):
         return e.code, e.read(1 << 16).decode("utf-8", "replace")
 
 
-def health_check(url, contains, log=None, attempts=10, delay=3.0):
+def health_check(url, contains, log=None, attempts=10, delay=3.0, local=False):
     """True when url answers 200 (and contains the given text) within the given attempts."""
     last = ""
     for attempt in range(1, attempts + 1):
         try:
-            status, body = http_get(url)
+            status, body = http_get(url, local=local)
             if status == 200 and (not contains or contains in body):
                 if log:
                     log.line("health check OK: %s (attempt %d)" % (url, attempt))
@@ -143,11 +191,11 @@ def health_check(url, contains, log=None, attempts=10, delay=3.0):
     return False
 
 
-def quick_health(url, contains, timeout=8):
+def quick_health(url, contains, timeout=8, local=False):
     """One request for the dashboard overview. -> dict(ok, status, ms, error)"""
     t0 = time.time()
     try:
-        status, body = http_get(url, timeout=timeout)
+        status, body = http_get(url, timeout=timeout, local=local)
         ok = status == 200 and (not contains or contains in body)
         return {"ok": ok, "status": status, "ms": int((time.time() - t0) * 1000), "error": "" if ok else
                 ("HTTP %d" % status if status != 200 else "expected text not found")}

@@ -1,5 +1,6 @@
 // Live job log: the runner's log is read in pieces (from the last byte offset) every second until the job ends.
-// Job numbers count per server: #/sites/<site>/jobs/<n> (#/jobs/<n> = a job of this server, links of version 1.1).
+// Job numbers count per server: #/sites/<site>/jobs/<n>, #/servers/<server>/jobs/<n> for a job of a runner itself
+// ("Update runner"); #/jobs/<n> = a job of this server, links of version 1.1.
 import { get } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { duration, esc, formatDateTime, icon, toast } from '../core/ui.js';
@@ -18,8 +19,9 @@ function formatLog(text) {
 
 export async function render(main, params, app, isCurrent) {
   const p = (key, params) => t('jobs.page.' + key, params);
-  const [siteId, jobId] = params.length > 1 ? params : ['', params[0]];
-  const path = siteId ? `sites/${siteId}/jobs/${jobId}` : `jobs/${jobId}`;
+  const [kind, owner, jobId] = params.length > 2 ? params : ['', '', params[0]];
+  const path = kind ? `${kind}/${owner}/jobs/${jobId}` : `jobs/${jobId}`;
+  const runnerJob = kind === 'servers';
   let offset = 0;
   let text = '';
   let follow = true;
@@ -28,7 +30,8 @@ export async function render(main, params, app, isCurrent) {
   if (!isCurrent()) return null;
 
   main.innerHTML = `
-<a class="back-link" href="#/sites/${esc(job.site_id)}/history">${icon('arrow-left')}${p('back', { site: job.site_id })}</a>
+${runnerJob ? `<a class="back-link" href="#/servers">${icon('arrow-left')}${p('back_servers')}</a>`
+    : `<a class="back-link" href="#/sites/${esc(job.site_id)}/history">${icon('arrow-left')}${p('back', { site: job.site_id })}</a>`}
 <header class="page-title"><div><h1>${p('title', { id: job.id })} · ${jobType(job.type)}${job.version ? ' ' + esc(job.version) : ''}</h1>
   <p class="muted" data-summary></p></div>
   <div class="action-row"><label class="checkbox"><input type="checkbox" data-follow checked><span>${p('follow')}</span></label>
@@ -41,7 +44,8 @@ export async function render(main, params, app, isCurrent) {
 
   const drawSummary = () => {
     const change = job.from_version && job.to_version && job.from_version !== job.to_version ? `${job.from_version} → ${job.to_version}` : (job.to_version || job.version || '');
-    summary.innerHTML = `${jobStatusBadge(job.status)} · ${p('site')}: <a href="#/sites/${esc(job.site_id)}">${esc(job.site_id)}</a>
+    summary.innerHTML = `${jobStatusBadge(job.status)} · ${runnerJob ? `${p('server')}: <a href="#/servers">${p('runner')}</a>`
+      : `${p('site')}: <a href="#/sites/${esc(job.site_id)}">${esc(job.site_id)}</a>`}
       ${change ? ` · ${p('change')}: <b class="mono">${esc(change)}</b>` : ''} · ${p('actor')}: ${esc(job.actor || '–')}
       · ${p('started')}: ${job.started_at ? formatDateTime(job.started_at, true) : '–'} · ${p('duration')}: ${job.started_at ? duration(job.started_at, job.finished_at) : '–'}`;
     if (job.status === 'succeeded' || job.status === 'failed') {
