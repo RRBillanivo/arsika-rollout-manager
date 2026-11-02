@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#4f46e5">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="same-origin">
+<title>Arsika Rollout Manager</title>
+<link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/css/app.css">
+<script src="assets/js/theme-init.js"></script>
+<script type="module" src="assets/js/main.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#content">Lewati ke konten</a>
+
+<header class="header">
+  <div class="container header__inner">
+    <a class="logo" href="#/" aria-label="Arsika Rollout Manager, beranda">
+      <img src="assets/img/logo.svg" alt="" width="36" height="36">
+      <span class="logo__text"><b>Arsika <span class="logo__rest">Rollout Manager</span></b></span>
+    </a>
+    <nav class="menu" id="menu" aria-label="Menu utama"></nav>
+    <div class="header__actions">
+      <button type="button" class="icon-btn language-toggle" id="language-toggle"></button>
+      <button type="button" class="icon-btn" id="theme-toggle"></button>
+      <div class="account" id="account"></div>
+    </div>
+  </div>
+</header>
+
+<div id="banner" class="banner container" role="alert" hidden></div>
+
+<main id="content" class="content container" tabindex="-1">
+  <div class="initial-loading" aria-busy="true"><span class="spinner"></span></div>
+</main>
+
+<footer class="footer">
+  <div class="container footer__inner">
+    <p id="footer-text">Arsika Rollout Manager · Copyright © 2026 Arsika.My.Id</p>
+  </div>
+</footer>
+
+<div id="toast" class="toast-container" aria-live="polite"></div>
+<noscript><div class="noscript">Aplikasi ini butuh JavaScript. · This app needs JavaScript.</div></noscript>
+</body>
+</html>

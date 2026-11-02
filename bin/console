@@ -1,0 +1,14 @@
+#!/usr/bin/env php
+<?php
+
+/*
+ * Command-line interface. Run "php bin/console" to list the commands.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit(1);
+}
+
+$app = require dirname(__DIR__) . '/bootstrap/app.php';
+
+exit($app->make(App\Console\Kernel::class)->run($argv));

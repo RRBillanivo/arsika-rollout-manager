@@ -1,0 +1,398 @@
+"""Deployment operations: install a release, switch "current", roll back, adopt an existing installation, and clean up.
+
+Order of a deployment (any failure before step 6 leaves the site untouched):
+  1. backup of the database and shared files (if enabled)
+  2. download the release asset from GitHub and verify its size / SHA-256
+  3. extract into releases/<version>/ and link the shared files
+  4. build hook (e.g. Python environment, database migrations, self-test)
+  5. mark the release complete (.rollout-release.json)
+  6. switch current -> releases/<version>, activate hook, restart services, reload PHP-FPM
+  7. health check; on failure the previous release is switched back automatically
+"""
+import json
+import os
+import shutil
+import stat
+import zipfile
+
+from . import system
+from .github import GitHub
+from .sites import expand, layout
+from .util import (POSIX, chown_tree, ensure_dir, exists, human_size, link_target, make_link, remove, sha256_file,
+                   switch_link, version_key, VERSION)
+
+MARKER = ".rollout-release.json"
+RESERVED = ("releases", "shared", "current", "_pre_rollout")
+
+
+class DeployError(Exception):
+    pass
+
+
+class Deployer(object):
+    def __init__(self, config, store, backups):
+        self.config = config
+        self.store = store
+        self.backups = backups
+
+    def github(self):
+        return GitHub(self.config["github_api"], self.config.get("github_token", ""))
+
+    # ------------------------------------------------------------------ state
+    @staticmethod
+    def current_version(site):
+        target = link_target(layout(site)["current"])
+        return os.path.basename(target) if target else None
+
+    @staticmethod
+    def installed(site):
+        """Complete release folders on disk, newest installation first."""
+        folder = layout(site)["releases"]
+        found = []
+        if os.path.isdir(folder):
+            for name in os.listdir(folder):
+                marker = os.path.join(folder, name, MARKER)
+                if os.path.isfile(marker):
+                    try:
+                        with open(marker, encoding="utf-8") as f:
+                            info = json.load(f)
+                    except (OSError, ValueError):
+                        info = {}
+                    found.append({"version": name, "installed_at": info.get("installed_at", ""), "asset": info.get("asset"),
+                                  "size_bytes": info.get("size_bytes"), "sha256": info.get("sha256")})
+        return sorted(found, key=lambda r: (r["installed_at"], version_key(r["version"])), reverse=True)
+
+    def state(self, site):
+        """ready | classic (an installation without releases/: adopt it first) | empty | missing"""
+        path = site["path"]
+        if not os.path.isdir(path):
+            return "missing"
+        if os.path.islink(layout(site)["current"]):
+            return "ready"
+        keep = set(site.get("adopt_keep", [])) | set(RESERVED) | {site.get("docroot_link") or ""}
+        others = [n for n in os.listdir(path) if n not in keep]
+        return "classic" if others else "empty"
+
+    def variables(self, site, version):
+        lay = layout(site)
+        return {
+            "ROLLOUT_SITE": site["id"], "ROLLOUT_VERSION": version, "ROLLOUT_SITE_DIR": site["path"],
+            "ROLLOUT_RELEASE_DIR": os.path.join(lay["releases"], version), "ROLLOUT_SHARED_DIR": lay["shared"],
+            "ROLLOUT_CURRENT_DIR": lay["current"], "ROLLOUT_WEB_USER": site.get("web_user", ""), "ROLLOUT_DOMAIN": site.get("domain", ""),
+            "ROLLOUT_CACHE_DIR": os.path.join(lay["shared"], ".rollout-cache"),
+        }
+
+    # ------------------------------------------------------------------ release preparation
+    def prepare_release(self, site, version, log, job_id):
+        if not VERSION.match(version):
+            raise DeployError("invalid version: " + version)
+        lay = layout(site)
+        target = os.path.join(lay["releases"], version)
+        if os.path.isfile(os.path.join(target, MARKER)):
+            log.step("Release %s is already installed; reusing releases/%s" % (version, version))
+            return target
+        if exists(target):
+            log.line("removing an incomplete releases/%s from an earlier attempt" % version)
+            remove(target)
+
+        log.step("Find release %s in %s" % (version, site["repo"]))
+        release = self.github().release(site["repo"], version, site["asset_pattern"])
+        asset = release["asset"]
+        if not asset:
+            raise DeployError("release %s has no asset matching %s (assets: %s)" % (
+                version, site["asset_pattern"], ", ".join(release["assets"]) or "none"))
+        archive = self.config.state_path("downloads", "%s-%s-%d.zip" % (site["id"], version, job_id))
+        log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
+        try:
+            size = self.github().download(asset, archive, lambda done, total: log.line(
+                "downloaded %s of %s" % (human_size(done), human_size(total))))
+            if asset["size"] and size != asset["size"]:
+                raise DeployError("download incomplete: %d of %d bytes" % (size, asset["size"]))
+            digest = sha256_file(archive)
+            if asset.get("digest", "").startswith("sha256:"):
+                if asset["digest"][7:] != digest:
+                    raise DeployError("SHA-256 of the download does not match GitHub's digest")
+                log.line("SHA-256 verified: " + digest)
+            else:
+                log.line("SHA-256: " + digest)
+
+            log.step("Extract into releases/" + version)
+            ensure_dir(lay["releases"])
+            ensure_dir(target)
+            count = self.extract(archive, target)
+            log.line("%d files extracted" % count)
+        finally:
+            if exists(archive):
+                os.unlink(archive)
+
+        self.link_shared(site, target, log)
+        if site.get("web_user") and chown_tree(target, site["web_user"]):
+            log.line("release files given to " + site["web_user"])
+        system.run_hook(site, "build", site.get("build", ""), target, self.variables(site, version), log,
+                        self.config["shell"], self.config["hook_timeout_seconds"])
+        info = {"version": version, "installed_at": system_now(), "asset": asset["name"], "size_bytes": asset["size"], "sha256": digest,
+                "job_id": job_id}
+        with open(os.path.join(target, MARKER), "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+        self.store.save_release(site["id"], version, asset["name"], asset["size"], digest)
+        log.line("release %s is ready" % version)
+        return target
+
+    @staticmethod
+    def extract(archive, target):
+        """Extract a zip safely (no absolute paths, no ..). A single top-level folder is stripped. Unix modes and links kept."""
+        with zipfile.ZipFile(archive) as z:
+            names = [i.filename for i in z.infolist()]
+            for name in names:                                        # check before any top-level folder is stripped
+                parts = name.replace("\\", "/").split("/")
+                if name.startswith(("/", "\\")) or ".." in parts or ":" in parts[0]:
+                    raise DeployError("unsafe path in the archive: " + name)
+            tops = {n.split("/", 1)[0] for n in names if n.strip("/")}
+            strip = len(tops) == 1 and all(n.startswith(next(iter(tops)) + "/") or n == next(iter(tops)) for n in names) \
+                and any("/" in n.strip("/") for n in names)
+            prefix = next(iter(tops)) + "/" if strip else ""
+            count = 0
+            root = os.path.realpath(target)
+            for info in z.infolist():
+                name = info.filename[len(prefix):] if prefix else info.filename
+                if not name or name.endswith("/") and not name.strip("/"):
+                    continue
+                parts = name.replace("\\", "/").split("/")
+                if name.startswith("/") or ".." in parts or ":" in parts[0]:
+                    raise DeployError("unsafe path in the archive: " + info.filename)
+                path = os.path.join(target, *[p for p in parts if p])
+                if not os.path.realpath(path).startswith(root):
+                    raise DeployError("unsafe path in the archive: " + info.filename)
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if name.endswith("/"):
+                    ensure_dir(path)
+                    continue
+                ensure_dir(os.path.dirname(path))
+                if POSIX and stat.S_ISLNK(mode):
+                    link = z.read(info).decode("utf-8")
+                    if link.startswith("/") or ".." in link.split("/"):
+                        raise DeployError("unsafe link in the archive: " + info.filename)
+                    os.symlink(link, path)
+                else:
+                    with z.open(info) as src, open(path, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
+                    if POSIX and mode & 0o777:
+                        os.chmod(path, mode & 0o777)
+                count += 1
+            return count
+
+    def link_shared(self, site, release_dir, log):
+        """Replace the shared paths inside the release with links to shared/ (seeding shared/ on the first install)."""
+        shared = layout(site)["shared"]
+        if site.get("shared"):
+            log.step("Link shared files: " + ", ".join(site["shared"]))
+            ensure_dir(shared, 0o755)
+        for entry in site.get("shared", []):
+            rel = entry.rstrip("/")
+            in_shared, in_release = os.path.join(shared, rel), os.path.join(release_dir, rel)
+            if not exists(in_shared):
+                if exists(in_release) and not os.path.islink(in_release):
+                    ensure_dir(os.path.dirname(in_shared))
+                    shutil.move(in_release, in_shared)
+                    log.line("shared/%s created from the release" % rel)
+                    if site.get("web_user"):
+                        chown_tree(in_shared, site["web_user"])
+                elif entry.endswith("/"):
+                    ensure_dir(in_shared)
+                    if site.get("web_user"):
+                        chown_tree(in_shared, site["web_user"])
+                    log.line("shared/%s created (empty)" % rel)
+                else:
+                    raise DeployError("shared file %s is missing: create %s first" % (rel, in_shared))
+            if exists(in_release):
+                remove(in_release)
+            ensure_dir(os.path.dirname(in_release))
+            make_link(in_shared, in_release)
+
+    # ------------------------------------------------------------------ switching
+    def ensure_docroot(self, site, log):
+        lay = layout(site)
+        if not lay["docroot"]:
+            return
+        target = lay["current"] if site["docroot_target"] == "." else os.path.join(lay["current"], site["docroot_target"])
+        docroot = lay["docroot"]
+        if os.path.islink(docroot):
+            if os.path.normcase(link_target(docroot)) != os.path.normcase(os.path.normpath(target)):
+                switch_link(docroot, target)
+                log.line("%s -> %s" % (site["docroot_link"], target))
+        elif exists(docroot):
+            raise DeployError("%s is a real folder, not a link: adopt the existing installation first" % docroot)
+        else:
+            make_link(target, docroot)
+            log.line("%s -> %s" % (site["docroot_link"], target))
+
+    def switch(self, site, version, log):
+        lay = layout(site)
+        target = os.path.join(lay["releases"], version)
+        if not os.path.isfile(os.path.join(target, MARKER)):
+            raise DeployError("release %s is not installed" % version)
+        log.step("Switch current -> releases/" + version)
+        switch_link(lay["current"], target)
+        self.ensure_docroot(site, log)
+
+    def activate(self, site, version, log):
+        system.run_hook(site, "activate", site.get("activate", ""), os.path.join(layout(site)["releases"], version),
+                        self.variables(site, version), log, self.config["shell"], self.config["hook_timeout_seconds"])
+        system.restart_services(site.get("services", []), log)
+        if site.get("reload_php_fpm"):
+            log.step("Reload PHP-FPM")
+            system.reload_php_fpm(log)
+
+    def healthy(self, site, version, log):
+        if not site.get("health_url"):
+            log.line("no health check configured")
+            return True
+        url, contains = expand(site, site["health_url"], version), expand(site, site.get("health_contains", ""), version)
+        log.step("Health check " + url + (' (expects "%s")' % contains if contains else ""))
+        return system.health_check(url, contains, log, attempts=int(self.config.get("health_attempts", 10)),
+                                   delay=float(self.config.get("health_delay", 3)))
+
+    def go_live(self, site, version, previous, log):
+        """Switch + activate + health check; switches back to ``previous`` when anything fails."""
+        try:
+            self.switch(site, version, log)
+            self.activate(site, version, log)
+            if not self.healthy(site, version, log):
+                raise DeployError("health check failed for " + version)
+        except Exception as error:
+            log.error(str(error))
+            if previous and previous != version:
+                log.step("Automatic rollback to " + previous)
+                try:
+                    self.switch(site, previous, log)
+                    self.activate(site, previous, log)
+                    ok = self.healthy(site, previous, log)
+                    log.line("rollback done; " + ("site healthy again" if ok else "the site is still NOT healthy"))
+                except Exception as again:
+                    log.error("automatic rollback failed: %s" % again)
+                raise DeployError("%s; rolled back to %s" % (error, previous))
+            raise
+        self.store.mark_activated(site["id"], version)
+
+    # ------------------------------------------------------------------ jobs
+    def deploy(self, job, site, log):
+        version = job["version"]
+        state = self.state(site)
+        if state == "missing":
+            raise DeployError("site folder does not exist: " + site["path"])
+        if state == "classic":
+            raise DeployError("the site folder holds an installation without releases/; use Adopt first")
+        previous = self.current_version(site)
+        if job["params"].get("backup", site.get("backup_before_deploy")) and state == "ready":
+            self.backups.create(site, previous, "before deploying " + version, log, job["id"])
+        self.prepare_release(site, version, log, job["id"])
+        self.go_live(site, version, previous, log)
+        return previous, version
+
+    def rollback_target(self, site):
+        current = self.current_version(site)
+        rows = [r for r in self.store.releases(site["id"]) if r["activated_at"] and r["version"] != current]
+        on_disk = {r["version"] for r in self.installed(site)}
+        rows = [r for r in sorted(rows, key=lambda r: r["activated_at"], reverse=True) if r["version"] in on_disk]
+        return rows[0]["version"] if rows else None
+
+    def rollback(self, job, site, log):
+        current = self.current_version(site)
+        target = job["version"] or self.rollback_target(site)
+        if not target:
+            raise DeployError("no earlier release on the server to roll back to")
+        if target == current:
+            raise DeployError("%s is already the current release" % target)
+        self.go_live(site, target, current, log)
+        return current, target
+
+    def adopt(self, job, site, log):
+        """Convert an installation that lives directly in the site folder into releases/ + shared/ + current."""
+        version = job["version"]
+        if self.state(site) != "classic":
+            raise DeployError("nothing to adopt: the site folder is %s" % self.state(site))
+        lay = layout(site)
+        root = site["path"]
+        if job["params"].get("backup", True):
+            # shared/ does not exist yet: the data is still in the site folder itself
+            self.backups.create(site, version, "before adopting " + version, log, job["id"], base=root)
+
+        log.step("Move shared files to shared/ (links stay in place, so the running site is not interrupted)")
+        ensure_dir(lay["shared"])
+        for entry in site.get("shared", []):
+            rel = entry.rstrip("/")
+            old, new = os.path.join(root, rel), os.path.join(lay["shared"], rel)
+            if exists(old) and not os.path.islink(old) and not exists(new):
+                ensure_dir(os.path.dirname(new))
+                os.rename(old, new)
+                make_link(new, old)
+                log.line("%s -> shared/%s" % (rel, rel))
+        self.prepare_release(site, version, log, job["id"])
+
+        keep = set(site.get("adopt_keep", [])) | set(RESERVED)
+        moved = []
+        log.step("Move the old installation to _pre_rollout/")
+        ensure_dir(lay["pre_rollout"], 0o750)
+        try:
+            for name in sorted(os.listdir(root)):
+                if name in keep:
+                    continue
+                os.rename(os.path.join(root, name), os.path.join(lay["pre_rollout"], name))
+                moved.append(name)
+            log.line("moved: " + ", ".join(moved))
+            self.go_live(site, version, None, log)
+        except Exception as error:
+            log.error("adoption failed: %s; restoring the old installation" % error)
+            for link in (lay["current"], lay["docroot"]):
+                if link and os.path.islink(link):
+                    os.unlink(link)
+            for name in moved:
+                if not exists(os.path.join(root, name)):
+                    os.rename(os.path.join(lay["pre_rollout"], name), os.path.join(root, name))
+            try:
+                # presets put back what their activate step changed (e.g. the old systemd unit); custom hooks are not re-run
+                if site.get("activate", "").startswith("preset:"):
+                    system.run_hook(site, "adopt-revert", site["activate"], root, self.variables(site, version), log,
+                                    self.config["shell"], self.config["hook_timeout_seconds"])
+                system.restart_services(site.get("services", []), log)
+                if site.get("reload_php_fpm"):
+                    system.reload_php_fpm(log)
+            except Exception as again:
+                log.error("restart after restoring failed: %s" % again)
+            raise
+        log.line("adoption complete; the old files are in %s (delete them from the dashboard when all is well)" % lay["pre_rollout"])
+        return None, version
+
+    def prune(self, site, log, keep=None):
+        keep = int(keep or site.get("keep_releases", 5))
+        current = self.current_version(site)
+        protected = {current, self.rollback_target(site)}
+        releases = self.installed(site)
+        removable = [r for r in releases if r["version"] not in protected]
+        excess = len(releases) - keep
+        for release in sorted(removable, key=lambda r: r["installed_at"])[:max(0, excess)]:
+            remove(os.path.join(layout(site)["releases"], release["version"]))
+            self.store.forget_release(site["id"], release["version"])
+            log.line("old release removed: " + release["version"])
+
+    def delete_release(self, site, version, log):
+        if version == self.current_version(site):
+            raise DeployError("the current release cannot be deleted")
+        path = os.path.join(layout(site)["releases"], version)
+        if not VERSION.match(version) or not exists(path):
+            raise DeployError("release %s is not installed" % version)
+        remove(path)
+        self.store.forget_release(site["id"], version)
+        log.line("release removed: " + version)
+
+    def delete_pre_rollout(self, site, log):
+        path = layout(site)["pre_rollout"]
+        if not exists(path):
+            raise DeployError("there is no _pre_rollout folder")
+        log.step("Delete %s" % path)
+        remove(path)
+
+
+def system_now():
+    from .util import now
+    return now()

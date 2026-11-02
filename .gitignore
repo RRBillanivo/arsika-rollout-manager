@@ -1,0 +1,23 @@
+# Secrets (database credentials, APP_KEY, runner secret)
+.env
+.env.*
+!.env.example
+
+# Runtime data: sessions, local database, logs
+/storage/framework/sessions/*
+/storage/database/*
+/storage/logs/*
+!/storage/**/.gitignore
+
+# One-time administrator setup page (created by php bin/console install:token)
+/public/install/
+
+/vendor/
+__pycache__/
+*.pyc
+
+# Release archives, OS files
+*.zip
+.DS_Store
+Thumbs.db
+desktop.ini

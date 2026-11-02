@@ -1,0 +1,22 @@
+{
+    "name": "arsika/rollout-manager",
+    "description": "Arsika Rollout Manager: self-hosted dashboard that deploys, updates, rolls back and backs up web applications on your own server from GitHub releases.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-mbstring": "*",
+        "ext-openssl": "*",
+        "ext-pdo": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/"
+        },
+        "files": [
+            "app/Support/helpers.php"
+        ]
+    }
+}

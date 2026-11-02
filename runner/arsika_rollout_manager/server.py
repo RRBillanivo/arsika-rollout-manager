@@ -1,0 +1,370 @@
+"""HTTP API for the dashboard on 127.0.0.1 (JSON). Every request is signed:
+
+    X-Rollout-Timestamp: <unix seconds>
+    X-Rollout-Nonce: <16-64 random lowercase hex characters, new for every request>
+    X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD \\n PATH_WITH_QUERY \\n TIMESTAMP \\n NONCE \\n hex SHA-256(body))
+
+Requests older than 120 seconds and repeated nonces are refused. Answers: {"data": ...} or {"error": {code, message, fields}}.
+"""
+import hashlib
+import hmac
+import json
+import os
+import platform
+import re
+import socketserver
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+from . import __version__, system
+from .deploy import DeployError
+from .github import GitHub, GitHubError
+from .joblog import read_log
+from .sites import expand, layout, presets_info, validate
+from .util import VERSION, exists, now, version_key
+from .worker import JOB_TYPES
+
+MAX_BODY = 1 << 20
+WINDOW = 120
+
+
+class ApiError(Exception):
+    def __init__(self, status, code, message, fields=None):
+        Exception.__init__(self, message)
+        self.status, self.code, self.fields = status, code, fields or {}
+
+
+class ThreadingServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class Api(object):
+    """Request routing and the answers (kept apart from the HTTP handler so it can be tested directly)."""
+
+    ROUTES = [
+        ("GET", r"/v1/status$", "status"),
+        ("GET", r"/v1/presets$", "presets"),
+        ("GET", r"/v1/settings$", "settings"),
+        ("PUT", r"/v1/settings$", "update_settings"),
+        ("POST", r"/v1/github/check$", "github_check"),
+        ("GET", r"/v1/sites$", "sites"),
+        ("POST", r"/v1/sites$", "create_site"),
+        ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)$", "site"),
+        ("PUT", r"/v1/sites/(?P<site>[a-z0-9-]+)$", "update_site"),
+        ("DELETE", r"/v1/sites/(?P<site>[a-z0-9-]+)$", "delete_site"),
+        ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/releases$", "releases"),
+        ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/health$", "health"),
+        ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/jobs$", "create_job"),
+        ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/backups$", "backups"),
+        ("DELETE", r"/v1/sites/(?P<site>[a-z0-9-]+)/backups/(?P<backup>[0-9A-Za-z._+-]+)$", "delete_backup"),
+        ("GET", r"/v1/jobs$", "jobs"),
+        ("GET", r"/v1/jobs/(?P<job>\d+)$", "job"),
+    ]
+
+    def __init__(self, config, store, deployer, worker):
+        self.config = config
+        self.store = store
+        self.deployer = deployer
+        self.worker = worker
+        self.started = time.time()
+        self.health_cache = {}
+        self.github_client = None
+        self.seen = {}
+        self.seen_lock = threading.Lock()
+
+    # ---------- authentication ----------
+    def verify(self, method, target, headers, body):
+        secret = self.config["secret"]
+        if not secret:
+            raise ApiError(503, "not_configured", "runner secret is not set")
+        try:
+            ts = int(headers.get("X-Rollout-Timestamp", "0"))
+        except ValueError:
+            ts = 0
+        if abs(time.time() - ts) > WINDOW:
+            raise ApiError(401, "bad_signature", "request expired or clock mismatch")
+        nonce = headers.get("X-Rollout-Nonce", "")
+        if not re.match(r"^[0-9a-f]{16,64}$", nonce):
+            raise ApiError(401, "bad_signature", "missing nonce")
+        message = "%s\n%s\n%d\n%s\n%s" % (method, target, ts, nonce, hashlib.sha256(body).hexdigest())
+        expected = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+        signature = headers.get("X-Rollout-Signature", "")
+        if not hmac.compare_digest(expected, signature):
+            raise ApiError(401, "bad_signature", "invalid signature")
+        with self.seen_lock:
+            limit = time.time() - WINDOW * 2
+            for key in [k for k, v in self.seen.items() if v < limit]:
+                del self.seen[key]
+            if nonce in self.seen:
+                raise ApiError(401, "replayed", "request already used")
+            self.seen[nonce] = time.time()
+
+    def handle(self, method, target, headers, body):
+        """-> (status, document)"""
+        try:
+            self.verify(method, target, headers, body)
+            parts = urlsplit(target)
+            query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
+            for route_method, pattern, name in self.ROUTES:
+                match = re.match(pattern, parts.path)
+                if match and route_method == method:
+                    data = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(data, dict):
+                        raise ApiError(400, "bad_request", "JSON object expected")
+                    return 200, {"data": getattr(self, name)(query=query, data=data, **match.groupdict())}
+            raise ApiError(404, "not_found", "unknown endpoint " + method + " " + parts.path)
+        except ApiError as e:
+            return e.status, {"error": {"code": e.code, "message": str(e), "fields": e.fields}}
+        except (DeployError, GitHubError) as e:
+            return 422, {"error": {"code": "failed", "message": str(e), "fields": {}}}
+        except ValueError as e:
+            return 400, {"error": {"code": "bad_request", "message": str(e), "fields": {}}}
+
+    # ---------- helpers ----------
+    def github(self):
+        token = self.config.get("github_token", "")
+        if self.github_client is None or self.github_client.token != token:
+            self.github_client = GitHub(self.config["github_api"], token)
+        return self.github_client
+
+    def get_site(self, site_id):
+        site = self.store.site(site_id)
+        if site is None:
+            raise ApiError(404, "site_not_found", "site %s is not registered" % site_id)
+        return site
+
+    def site_health(self, site, refresh=False):
+        if not site.get("health_url"):
+            return None
+        version = self.deployer.current_version(site) or ""
+        cached = self.health_cache.get(site["id"])
+        if cached and not refresh and time.time() - cached[0] < 30 and cached[2] == version:
+            return cached[1]
+        result = system.quick_health(expand(site, site["health_url"], version), expand(site, site.get("health_contains", ""), version))
+        result["checked_at"] = now()
+        self.health_cache[site["id"]] = (time.time(), result, version)
+        return result
+
+    def summary(self, site, with_health=True, with_latest=True):
+        lay = layout(site)
+        current = self.deployer.current_version(site)
+        installed = self.deployer.installed(site) if os.path.isdir(lay["releases"]) else []
+        latest, latest_error = None, ""
+        if with_latest and site.get("repo"):
+            try:
+                releases = [r for r in self.github().releases(site["repo"], site["asset_pattern"]) if not r["prerelease"]]
+                latest = releases[0]["version"] if releases else None
+            except GitHubError as e:
+                latest_error = str(e)
+        jobs = self.store.jobs(site["id"], 1)
+        active = self.store.active_job(site["id"])
+        return {
+            "id": site["id"], "name": site["name"], "domain": site["domain"], "repo": site["repo"], "path": site["path"],
+            "state": self.deployer.state(site), "current_version": current, "installed": [r["version"] for r in installed],
+            "latest_version": latest, "latest_error": latest_error,
+            "update_available": bool(latest and current and latest != current and version_key(latest) > version_key(current)),
+            "rollback_version": self.deployer.rollback_target(site),
+            "health": self.site_health(site) if with_health else None,
+            "services": system.service_states(site.get("services", [])),
+            "last_job": jobs[0] if jobs else None, "active_job": active,
+        }
+
+    # ---------- endpoints ----------
+    def status(self, query, data):
+        active = self.store.active_job()
+        return {"version": __version__, "python": platform.python_version(), "uptime_seconds": int(time.time() - self.started),
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.started)) + "+00:00",
+                "github_token_set": bool(self.config.get("github_token")), "sites": len(self.store.sites()), "active_job": active,
+                "disk": system.disk_free(self.config["backup_dir"] if os.path.isdir(self.config["backup_dir"]) else "/"),
+                "site_roots": self.config.get("site_roots", ["/www/wwwroot"])}
+
+    def presets(self, query, data):
+        return presets_info()
+
+    def settings(self, query, data):
+        token = self.config.get("github_token", "")
+        return {"github_token_set": bool(token), "github_token_hint": ("…" + token[-4:]) if token else ""}
+
+    def update_settings(self, query, data):
+        if "github_token" in data:
+            token = str(data["github_token"] or "").strip()
+            if token and not re.match(r"^[A-Za-z0-9_]{20,255}$", token):
+                raise ApiError(422, "validation_failed", "invalid token", {"github_token": "This does not look like a GitHub token."})
+            self.config.update(github_token=token)
+        return self.settings(query, data)
+
+    def github_check(self, query, data):
+        repo = str(data.get("repo", "")).strip()
+        try:
+            releases = self.github().releases(repo, str(data.get("asset_pattern") or "*.zip"), refresh=True)
+        except GitHubError as e:
+            return {"ok": False, "message": str(e), "releases": 0}
+        with_asset = [r for r in releases if r["asset"]]
+        return {"ok": True, "releases": len(releases), "with_asset": len(with_asset),
+                "latest": with_asset[0]["version"] if with_asset else None, "message": ""}
+
+    def sites(self, query, data):
+        sites = self.store.sites()
+        health = query.get("health", "1") != "0"
+        with ThreadPoolExecutor(max_workers=min(8, len(sites) or 1)) as pool:
+            return list(pool.map(lambda s: self.summary(s, with_health=health), sites))
+
+    def site(self, site, query, data):
+        record = self.get_site(site)
+        lay = layout(record)
+        details = self.summary(record)
+        details["settings"] = record
+        details["releases_installed"] = self.deployer.installed(record)
+        details["pre_rollout"] = exists(lay["pre_rollout"])
+        details["disk"] = system.disk_free(record["path"]) if os.path.isdir(record["path"]) else None
+        return details
+
+    def create_site(self, query, data):
+        from .sites import preset
+        base = preset(str(data.get("preset", ""))) if data.get("preset") else None
+        merged = dict(base or {})
+        merged.update({k: v for k, v in data.items() if k != "preset"})
+        site, errors = validate(merged, self.config.get("site_roots", ["/www/wwwroot"]))
+        if not errors and self.store.site(site["id"]):
+            errors["id"] = "A site with this id already exists."
+        if not errors and any(s["path"] == site["path"] for s in self.store.sites()):
+            errors["path"] = "Another site already uses this folder."
+        if errors:
+            raise ApiError(422, "validation_failed", "check the highlighted fields", errors)
+        self.store.save_site(site)
+        return self.site(site["id"], query, {})
+
+    def update_site(self, site, query, data):
+        record = self.get_site(site)
+        updated, errors = validate(data, self.config.get("site_roots", ["/www/wwwroot"]), existing=record)
+        if not errors and updated["path"] != record["path"] and self.deployer.state(record) == "ready":
+            errors["path"] = "The folder of an installed site cannot be changed."
+        if errors:
+            raise ApiError(422, "validation_failed", "check the highlighted fields", errors)
+        updated["id"] = record["id"]
+        self.store.save_site({k: v for k, v in updated.items() if k not in ("created_at", "updated_at")})
+        self.health_cache.pop(site, None)
+        return self.site(site, query, {})
+
+    def delete_site(self, site, query, data):
+        self.get_site(site)
+        if self.store.active_job(site):
+            raise ApiError(409, "busy", "a job of this site is queued or running")
+        self.store.delete_site(site)
+        return {"deleted": site, "files_kept": True}
+
+    def releases(self, site, query, data):
+        record = self.get_site(site)
+        installed = {r["version"]: r for r in self.deployer.installed(record)}
+        current = self.deployer.current_version(record)
+        try:
+            remote = self.github().releases(record["repo"], record["asset_pattern"], refresh=query.get("refresh") == "1")
+            error = ""
+        except GitHubError as e:
+            remote, error = [], str(e)
+        listed = {r["version"] for r in remote}
+        for r in remote:
+            r["installed"] = r["version"] in installed
+            r["current"] = r["version"] == current
+        local_only = [{"version": v, "tag": v, "name": v, "published_at": None, "notes": "", "asset": None, "installed": True,
+                       "current": v == current, "local_only": True} for v in installed if v not in listed]
+        return {"releases": remote + local_only, "error": error, "current": current}
+
+    def health(self, site, query, data):
+        return self.site_health(self.get_site(site), refresh=True)
+
+    def create_job(self, site, query, data):
+        record = self.get_site(site)
+        job_type = str(data.get("type", ""))
+        if job_type not in JOB_TYPES:
+            raise ApiError(422, "validation_failed", "unknown job type", {"type": "Unknown job type."})
+        version = str(data.get("version") or "").strip() or None
+        if version and not VERSION.match(version):
+            raise ApiError(422, "validation_failed", "invalid version", {"version": "Invalid version."})
+        if job_type in ("deploy", "adopt", "delete-release") and not version:
+            raise ApiError(422, "validation_failed", "version required", {"version": "Choose a version."})
+        params = data.get("params") if isinstance(data.get("params"), dict) else {}
+        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason") if k in params}
+        if self.store.active_job(site):
+            raise ApiError(409, "busy", "a job of this site is already queued or running")
+        if job_type == "restore" and not self.store.backup(site, str(params.get("backup_id", ""))):
+            raise ApiError(422, "validation_failed", "backup not found", {"backup_id": "Backup not found."})
+        state = self.deployer.state(record)
+        if job_type == "adopt" and state != "classic":
+            raise ApiError(409, "not_classic", "nothing to adopt: the site folder is %s" % state)
+        if job_type == "deploy" and state == "classic":
+            raise ApiError(409, "needs_adopt", "the site holds an installation without releases/; adopt it first")
+        actor = str(data.get("actor") or "")[:80] or None
+        job_id = self.worker.submit(site, job_type, version, params, actor)
+        return self.store.job(job_id)
+
+    def backups(self, site, query, data):
+        self.get_site(site)
+        return self.store.backups(site)
+
+    def delete_backup(self, site, backup, query, data):
+        self.get_site(site)
+        if not self.store.backup(site, backup):
+            raise ApiError(404, "backup_not_found", "backup not found")
+        if self.store.active_job(site):
+            raise ApiError(409, "busy", "a job of this site is queued or running")
+        self.deployer.backups.delete(site, backup)
+        return {"deleted": backup}
+
+    def jobs(self, query, data):
+        return self.store.jobs(query.get("site") or None, min(200, int(query.get("limit", 50) or 50)))
+
+    def job(self, job, query, data):
+        record = self.store.job(int(job))
+        if not record:
+            raise ApiError(404, "job_not_found", "job not found")
+        text, offset, size = read_log(self.worker.log_path(record["id"]), query.get("offset", 0))
+        record["log"] = {"text": text, "offset": offset, "size": size}
+        return record
+
+
+def make_handler(api):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "arsika-rollout-manager/" + __version__
+        protocol_version = "HTTP/1.1"
+
+        def _serve(self, method):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY:
+                status, doc = 413, {"error": {"code": "too_large", "message": "request too large", "fields": {}}}
+            else:
+                body = self.rfile.read(length) if length else b""
+                status, doc = api.handle(method, self.path, self.headers, body)
+            payload = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            self._serve("GET")
+
+        def do_POST(self):
+            self._serve("POST")
+
+        def do_PUT(self):
+            self._serve("PUT")
+
+        def do_DELETE(self):
+            self._serve("DELETE")
+
+        def log_message(self, fmt, *args):
+            pass                                                     # requests are not logged (the dashboard audits them)
+
+    return Handler
+
+
+def serve(api):
+    server = ThreadingServer((api.config["listen"], int(api.config["port"])), make_handler(api))
+    return server

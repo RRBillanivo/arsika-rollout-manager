@@ -1,0 +1,17 @@
+# Apache rules (aaPanel / shared hosting with Apache). Nginx: see deploy/nginx/aapanel.conf.
+# The site's document root must be this public/ folder.
+Options -Indexes
+DirectoryIndex index.html
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # JSON API -> front controller
+    RewriteRule ^api(/.*)?$ index.php [L,QSA]
+</IfModule>
+
+# Always revalidate the app shell and assets so updates reach visitors immediately
+<IfModule mod_headers.c>
+    <FilesMatch "\.(html|css|js|svg)$">
+        Header set Cache-Control "no-cache"
+    </FilesMatch>
+</IfModule>
