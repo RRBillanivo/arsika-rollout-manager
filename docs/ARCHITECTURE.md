@@ -8,7 +8,8 @@
 | Runner (`runner/arsika_rollout_manager`, installed in `/opt/arsika-rollout-manager`) | root (systemd `arsika-rollout-manager-runner`) | `/var/lib/arsika-rollout-manager/runner.db` (SQLite): `sites`, `releases`, `jobs`, `backups`; job logs | Downloads releases, switches versions, runs hooks, restarts services, backs up and restores |
 
 The runner listens on `127.0.0.1:8790` only and answers requests signed with the shared secret (see [API.md](API.md)).
-Its settings (`/etc/arsika-rollout-manager/runner.json`, mode 0600) hold the secret and the GitHub token.
+Its settings (`/etc/arsika-rollout-manager/runner.json`, mode 0600) hold the secret and the read-only GitHub token of
+each site (one token per site; a public repository needs none).
 
 ## Site layout
 

@@ -29,12 +29,29 @@ from .worker import JOB_TYPES
 
 MAX_BODY = 1 << 20
 WINDOW = 120
+TOKEN = re.compile(r"^[A-Za-z0-9_]{20,255}$")
+TOKEN_ERROR = "This does not look like a GitHub token."
 
 
 class ApiError(Exception):
     def __init__(self, status, code, message, fields=None):
         Exception.__init__(self, message)
         self.status, self.code, self.fields = status, code, fields or {}
+
+
+def token_hint(token):
+    """Recognisable part of a token for the interface, e.g. github_pat_…a1b2 (the token itself is never sent back)."""
+    if not token:
+        return ""
+    return ("github_pat_" if token.startswith("github_pat_") else token[:4]) + "…" + token[-4:]
+
+
+def read_token(data, errors):
+    """The site's GitHub token sent by the dashboard ("" when not given)."""
+    token = str(data.get("github_token") or "").strip()
+    if token and not TOKEN.match(token):
+        errors["github_token"] = TOKEN_ERROR
+    return token
 
 
 class ThreadingServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -48,8 +65,6 @@ class Api(object):
     ROUTES = [
         ("GET", r"/v1/status$", "status"),
         ("GET", r"/v1/presets$", "presets"),
-        ("GET", r"/v1/settings$", "settings"),
-        ("PUT", r"/v1/settings$", "update_settings"),
         ("POST", r"/v1/github/check$", "github_check"),
         ("GET", r"/v1/sites$", "sites"),
         ("POST", r"/v1/sites$", "create_site"),
@@ -72,9 +87,12 @@ class Api(object):
         self.worker = worker
         self.started = time.time()
         self.health_cache = {}
-        self.github_client = None
+        self.github_clients = {}
         self.seen = {}
         self.seen_lock = threading.Lock()
+        moved = self.config.migrate_legacy_token([s["id"] for s in self.store.sites()])
+        if moved:
+            print("the GitHub token of version 1.0.0 now belongs to %d site(s)" % moved, flush=True)
 
     # ---------- authentication ----------
     def verify(self, method, target, headers, body):
@@ -125,11 +143,17 @@ class Api(object):
             return 400, {"error": {"code": "bad_request", "message": str(e), "fields": {}}}
 
     # ---------- helpers ----------
-    def github(self):
-        token = self.config.get("github_token", "")
-        if self.github_client is None or self.github_client.token != token:
-            self.github_client = GitHub(self.config["github_api"], token)
-        return self.github_client
+    def github(self, token=""):
+        """GitHub client for one token (each client keeps its own one-minute cache of releases)."""
+        client = self.github_clients.get(token)
+        if client is None:
+            if len(self.github_clients) > 50:
+                self.github_clients.clear()
+            client = self.github_clients[token] = GitHub(self.config["github_api"], token)
+        return client
+
+    def site_github(self, site):
+        return self.github(self.config.site_token(site["id"]))
 
     def get_site(self, site_id):
         site = self.store.site(site_id)
@@ -156,7 +180,7 @@ class Api(object):
         latest, latest_error = None, ""
         if with_latest and site.get("repo"):
             try:
-                releases = [r for r in self.github().releases(site["repo"], site["asset_pattern"]) if not r["prerelease"]]
+                releases = [r for r in self.site_github(site).releases(site["repo"], site["asset_pattern"]) if not r["prerelease"]]
                 latest = releases[0]["version"] if releases else None
             except GitHubError as e:
                 latest_error = str(e)
@@ -176,31 +200,27 @@ class Api(object):
     # ---------- endpoints ----------
     def status(self, query, data):
         active = self.store.active_job()
+        sites = self.store.sites()
         return {"version": __version__, "python": platform.python_version(), "uptime_seconds": int(time.time() - self.started),
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.started)) + "+00:00",
-                "github_token_set": bool(self.config.get("github_token")), "sites": len(self.store.sites()), "active_job": active,
+                "sites": len(sites), "github_tokens": sum(1 for s in sites if self.config.site_token(s["id"])), "active_job": active,
                 "disk": system.disk_free(self.config["backup_dir"] if os.path.isdir(self.config["backup_dir"]) else "/"),
                 "site_roots": self.config.get("site_roots", ["/www/wwwroot"])}
 
     def presets(self, query, data):
         return presets_info()
 
-    def settings(self, query, data):
-        token = self.config.get("github_token", "")
-        return {"github_token_set": bool(token), "github_token_hint": ("…" + token[-4:]) if token else ""}
-
-    def update_settings(self, query, data):
-        if "github_token" in data:
-            token = str(data["github_token"] or "").strip()
-            if token and not re.match(r"^[A-Za-z0-9_]{20,255}$", token):
-                raise ApiError(422, "validation_failed", "invalid token", {"github_token": "This does not look like a GitHub token."})
-            self.config.update(github_token=token)
-        return self.settings(query, data)
-
     def github_check(self, query, data):
+        """Can this repository be read? Uses the token typed in the form, else the saved token of the site being edited."""
         repo = str(data.get("repo", "")).strip()
+        errors = {}
+        token = read_token(data, errors)
+        if errors:
+            return {"ok": False, "message": TOKEN_ERROR, "releases": 0}
+        if not token and data.get("site"):
+            token = self.config.site_token(str(data["site"]))
         try:
-            releases = self.github().releases(repo, str(data.get("asset_pattern") or "*.zip"), refresh=True)
+            releases = self.github(token).releases(repo, str(data.get("asset_pattern") or "*.zip"), refresh=True)
         except GitHubError as e:
             return {"ok": False, "message": str(e), "releases": 0}
         with_asset = [r for r in releases if r["asset"]]
@@ -218,6 +238,8 @@ class Api(object):
         lay = layout(record)
         details = self.summary(record)
         details["settings"] = record
+        token = self.config.site_token(record["id"])
+        details["github_token_set"], details["github_token_hint"] = bool(token), token_hint(token)
         details["releases_installed"] = self.deployer.installed(record)
         details["pre_rollout"] = exists(lay["pre_rollout"])
         details["disk"] = system.disk_free(record["path"]) if os.path.isdir(record["path"]) else None
@@ -227,8 +249,9 @@ class Api(object):
         from .sites import preset
         base = preset(str(data.get("preset", ""))) if data.get("preset") else None
         merged = dict(base or {})
-        merged.update({k: v for k, v in data.items() if k != "preset"})
+        merged.update({k: v for k, v in data.items() if k not in ("preset", "github_token", "remove_github_token")})
         site, errors = validate(merged, self.config.get("site_roots", ["/www/wwwroot"]))
+        token = read_token(data, errors)
         if not errors and self.store.site(site["id"]):
             errors["id"] = "A site with this id already exists."
         if not errors and any(s["path"] == site["path"] for s in self.store.sites()):
@@ -236,17 +259,22 @@ class Api(object):
         if errors:
             raise ApiError(422, "validation_failed", "check the highlighted fields", errors)
         self.store.save_site(site)
+        self.config.set_site_token(site["id"], token)
         return self.site(site["id"], query, {})
 
     def update_site(self, site, query, data):
+        """Settings sent are changed, the others kept. github_token replaces the site's token, remove_github_token removes it."""
         record = self.get_site(site)
         updated, errors = validate(data, self.config.get("site_roots", ["/www/wwwroot"]), existing=record)
+        token = read_token(data, errors)
         if not errors and updated["path"] != record["path"] and self.deployer.state(record) == "ready":
             errors["path"] = "The folder of an installed site cannot be changed."
         if errors:
             raise ApiError(422, "validation_failed", "check the highlighted fields", errors)
         updated["id"] = record["id"]
         self.store.save_site({k: v for k, v in updated.items() if k not in ("created_at", "updated_at")})
+        if token or data.get("remove_github_token"):
+            self.config.set_site_token(site, token)
         self.health_cache.pop(site, None)
         return self.site(site, query, {})
 
@@ -255,6 +283,7 @@ class Api(object):
         if self.store.active_job(site):
             raise ApiError(409, "busy", "a job of this site is queued or running")
         self.store.delete_site(site)
+        self.config.set_site_token(site, "")
         return {"deleted": site, "files_kept": True}
 
     def releases(self, site, query, data):
@@ -262,7 +291,7 @@ class Api(object):
         installed = {r["version"]: r for r in self.deployer.installed(record)}
         current = self.deployer.current_version(record)
         try:
-            remote = self.github().releases(record["repo"], record["asset_pattern"], refresh=query.get("refresh") == "1")
+            remote = self.site_github(record).releases(record["repo"], record["asset_pattern"], refresh=query.get("refresh") == "1")
             error = ""
         except GitHubError as e:
             remote, error = [], str(e)

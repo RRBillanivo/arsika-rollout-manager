@@ -5,7 +5,8 @@ public/install/, which deletes itself).
     python tests/smoke_test.py --php php [--php-ini php.ini] [--shell bash]
 
 Covers: setup page, sign-in and lockout messages, CSRF, password confirmation, site registration and validation,
-GitHub access check, deploy, rollback, backups, settings (GitHub token), activity log, sign-out."""
+the site's own GitHub token (write-only, access check, removal), deploy, rollback, backups, settings, activity log,
+sign-out."""
 import argparse
 import base64
 import http.cookiejar
@@ -136,7 +137,7 @@ def main():
     config = tmp / "runner.json"
     config.write_text(json.dumps({
         "listen": "127.0.0.1", "port": runner_port, "secret": secret, "state_dir": str(tmp / "state"), "backup_dir": str(tmp / "backup"),
-        "github_api": "http://127.0.0.1:%d" % github.port, "github_token": "", "shell": args.shell, "site_roots": [str(www)],
+        "github_api": "http://127.0.0.1:%d" % github.port, "shell": args.shell, "site_roots": [str(www)],
         "health_attempts": 3, "health_delay": 0.3}), encoding="utf-8")
     env = dict(os.environ, APP_ENV="local", APP_DEBUG="false", APP_URL="http://127.0.0.1:%d" % php_port,
                APP_KEY="base64:" + base64.b64encode(secrets.token_bytes(32)).decode(), DB_CONNECTION="sqlite",
@@ -196,10 +197,16 @@ def main():
         check("adding a site needs the password", status == 422 and "password" in doc["error"]["fields"])
         status, doc = admin.post("sites", dict(site, id="Bad Id", path="/etc", password=admin_password))
         check("invalid site settings -> field errors", status == 422 and {"id", "path"} <= set(doc["error"]["fields"]), json.dumps(doc)[:300])
-        status, doc = admin.post("sites", dict(site, password=admin_password))
-        check("site registered", status == 201 and doc["data"]["state"] == "empty", json.dumps(doc)[:300])
-        status, doc = admin.post("github/check", {"repo": "o/demo", "asset_pattern": "demo_v*.zip"})
-        check("GitHub access check", status == 200 and doc["data"]["ok"] and doc["data"]["latest"] == "1.1.0")
+        site_token = "github_pat_" + "a" * 40
+        status, doc = admin.post("sites", dict(site, password=admin_password, github_token=site_token))
+        check("site registered with its own GitHub token", status == 201 and doc["data"]["state"] == "empty"
+              and doc["data"]["github_token_set"] and doc["data"]["github_token_hint"] == "github_pat_…aaaa", json.dumps(doc)[:300])
+        status, doc = admin.get("sites/demo")
+        check("the token is never sent back", status == 200 and site_token not in json.dumps(doc))
+        status, doc = admin.post("github/check", {"repo": "o/demo", "asset_pattern": "demo_v*.zip", "site": "demo"})
+        check("GitHub access check with the site's token", status == 200 and doc["data"]["ok"] and doc["data"]["latest"] == "1.1.0")
+        status, doc = admin.post("github/check", {"repo": "o/demo", "github_token": "not a token"})
+        check("access check refuses a malformed token", status == 200 and not doc["data"]["ok"])
 
         def run_job(payload, expect="succeeded"):
             status, doc = admin.post("sites/demo/jobs", payload)
@@ -244,15 +251,18 @@ def main():
         check("backup deleted", status == 200)
 
         print("== settings & activity")
-        status, doc = admin.put("settings", {"github_token": "github_pat_" + "a" * 40, "password": admin_password})
-        check("GitHub token saved (write-only)", status == 200 and doc["data"]["github_token_set"] and doc["data"]["github_token_hint"] == "…aaaa")
         status, doc = admin.get("settings")
-        check("settings show the runner", status == 200 and doc["data"]["runner"]["version"] and "github_token" not in json.dumps(doc["data"]["settings"]).replace("github_token_set", "").replace("github_token_hint", ""))
-        status, doc = admin.put("settings", {"github_token": "", "password": admin_password})
-        check("GitHub token removed", status == 200 and not doc["data"]["github_token_set"])
+        check("settings show the runner and the sites with a token", status == 200 and doc["data"]["runner"]["version"]
+              and doc["data"]["runner"]["github_tokens"] == 1 and "settings" not in doc["data"], json.dumps(doc)[:300])
+        status, doc = admin.put("settings", {"github_token": "github_pat_" + "c" * 40, "password": admin_password})
+        check("no single GitHub token for every site any more", status in (404, 405), str(status))
+        status, doc = admin.put("sites/demo", {"remove_github_token": True, "password": admin_password})
+        check("site token removed in the site settings", status == 200 and not doc["data"]["github_token_set"], json.dumps(doc)[:300])
         status, doc = admin.get("activity")
         actions = {a["action"] for a in doc["data"]["actions"]}
-        check("activity log", {"admin_created", "site_created", "job_deploy", "job_rollback", "job_restore", "backup_deleted", "github_token_changed"} <= actions, str(actions))
+        check("activity log", {"admin_created", "site_created", "site_updated", "job_deploy", "job_rollback", "job_restore",
+                               "backup_deleted"} <= actions, str(actions))
+        check("tokens never appear in the activity log", site_token not in json.dumps(doc["data"]))
 
         print("== account")
         new_password = admin_password + "Z9"

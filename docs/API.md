@@ -12,15 +12,18 @@ POST/PUT/DELETE (token from `GET /app`); `X-Locale: id|en` for the message langu
 | POST | `/auth/login` · `/auth/logout` | `{username, password}` |
 | GET / PUT | `/account` · `/account/password` | `{current_password, password, password_confirmation}` |
 | GET | `/presets` | presets with their default settings |
-| POST | `/github/check` | `{repo, asset_pattern}` → can the runner read the releases? |
-| GET / POST 🔒 | `/sites` | list with health and versions / register |
-| GET / PUT 🔒 / DELETE 🔒 | `/sites/{site}` | details / settings / unregister (files kept) |
+| POST | `/github/check` | `{repo, asset_pattern, github_token?, site?}` → can the runner read the releases? Uses the typed token, else the saved token of `site` |
+| GET / POST 🔒 | `/sites` | list with health and versions / register (`github_token` optional: the site's read-only token) |
+| GET / PUT 🔒 / DELETE 🔒 | `/sites/{site}` | details (`github_token_set`, `github_token_hint`; never the token) / settings (`github_token` replaces the token, `remove_github_token: true` removes it) / unregister (files kept, token deleted) |
 | GET | `/sites/{site}/releases?refresh=1` · `/sites/{site}/health` | GitHub releases with installed/current flags · health now |
 | POST | `/sites/{site}/jobs` | `{type, version, params}`; 🔒 for `adopt`, `restore`, `delete-release`, `cleanup-adopt` |
 | GET / DELETE 🔒 | `/sites/{site}/backups` · `/sites/{site}/backups/{backup}` | |
 | GET | `/jobs?site=&limit=` · `/jobs/{job}?offset=` | history · job with the log from byte `offset` |
-| GET / PUT 🔒 | `/settings` | runner state / `{github_token}` (empty removes it) |
+| GET | `/settings` | runner state (`github_tokens`: number of sites with their own token), versions |
 | GET | `/activity` | sign-ins and administrator actions |
+
+GitHub tokens belong to the sites: each site has its own read-only token (or none for a public repository). Tokens are
+write-only: answers only say whether one is saved and show a hint such as `github_pat_…a1b2`.
 
 Job types: `deploy` (`version`, `params.backup`), `rollback` (`version` optional: the previous release),
 `adopt` (`version`, `params.backup`), `backup` (`params.reason`), `restore` (`params.backup_id`, `params.safety_backup`),
@@ -38,11 +41,10 @@ X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD "\n" PATH_WITH_QUERY "\n" TI
 
 | Method | Path |
 |---|---|
-| GET | `/v1/status`, `/v1/presets`, `/v1/settings` |
-| PUT | `/v1/settings` `{github_token}` |
-| POST | `/v1/github/check` |
-| GET / POST | `/v1/sites` (`?health=0` skips the health checks) |
-| GET / PUT / DELETE | `/v1/sites/{site}` |
+| GET | `/v1/status`, `/v1/presets` |
+| POST | `/v1/github/check` `{repo, asset_pattern, github_token?, site?}` |
+| GET / POST | `/v1/sites` (`?health=0` skips the health checks; POST takes the optional `github_token` of the site) |
+| GET / PUT / DELETE | `/v1/sites/{site}` (PUT: `github_token` or `remove_github_token`) |
 | GET | `/v1/sites/{site}/releases`, `/v1/sites/{site}/health`, `/v1/sites/{site}/backups` |
 | POST | `/v1/sites/{site}/jobs` `{type, version, params, actor}` (409 `busy` while a job of the site is queued or running) |
 | DELETE | `/v1/sites/{site}/backups/{backup}` |

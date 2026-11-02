@@ -1,8 +1,7 @@
-// Settings: runner state, GitHub token (write-only), administrator password.
+// Settings: runner state, administrator password, versions. GitHub tokens belong to the sites (site form).
 import { get, put } from '../core/api.js';
-import { t, tList } from '../core/i18n.js';
+import { t } from '../core/i18n.js';
 import { attachPasswordToggles, clearErrors, esc, formatBytes, icon, passwordStrength, showErrors, toast } from '../core/ui.js';
-import { passwordField } from './shared/bits.js';
 
 function uptime(seconds) {
   const hours = Math.floor(seconds / 3600), minutes = Math.floor((seconds % 3600) / 60);
@@ -21,7 +20,6 @@ export async function render(main, _params, app, isCurrent) {
   }
   if (!isCurrent()) return null;
   const runner = data && data.runner;
-  const settings = data && data.settings;
   const min = (app.info && app.info.password_min_length) || 12;
 
   main.innerHTML = `
@@ -39,21 +37,8 @@ export async function render(main, _params, app, isCurrent) {
         </dl>
         <p class="small muted">${s('runner.roots')}: <span class="mono">${(runner.site_roots || []).map(esc).join(', ')}</span></p>`
       : `<div class="box box--red">${icon('alert')}<div><b>${s('runner.down')}</b> ${esc(runnerError ? runnerError.message : '')}</div></div>`}
+      ${runner ? `<p class="small muted">${s('runner.tokens', { n: runner.github_tokens || 0, sites: runner.sites || 0 })}</p>` : ''}
     </section>
-    <form class="card" data-token-form novalidate>
-      <h2 class="card__title">${icon('github')}${s('github.title')}</h2>
-      <p class="muted">${s('github.lead')}</p>
-      ${settings ? `<div class="box box--${settings.github_token_set ? 'green' : 'yellow'}">${icon(settings.github_token_set ? 'key' : 'info')}<div>
-        ${settings.github_token_set ? s('github.set', { hint: settings.github_token_hint }) : s('github.not_set')}</div></div>` : ''}
-      <details class="tech-section"><summary>${icon('info')}${s('github.how')}</summary><ol class="bullet-list">${tList('settings.github.steps').map((x) => `<li>${esc(x)}</li>`).join('')}</ol></details>
-      <label class="field"><span class="field__label">${s('github.token')}</span>
-        <input type="password" name="github_token" autocomplete="off" spellcheck="false" class="mono" placeholder="github_pat_…">
-        <span class="field__help">${s('github.token_help')}</span></label>
-      ${passwordField()}
-      <div class="box box--red" data-form-error hidden></div>
-      <div class="form-actions"><button type="submit" class="btn btn--primary" ${runner ? '' : 'disabled'}>${icon('key')}${s('github.save')}</button>
-        ${settings && settings.github_token_set ? `<button type="button" class="btn btn--danger-outline" data-remove-token>${icon('trash')}${s('github.remove')}</button>` : ''}</div>
-    </form>
   </div>
   <div class="stack">
     <form class="card" data-password-form novalidate>
@@ -74,22 +59,6 @@ export async function render(main, _params, app, isCurrent) {
     </section>
   </div>
 </div>`;
-
-  const tokenForm = main.querySelector('[data-token-form]');
-  attachPasswordToggles(tokenForm);
-  const saveToken = async (token) => {
-    clearErrors(tokenForm);
-    try {
-      await put('settings', { github_token: token, password: tokenForm.elements.password.value });
-      toast(s(token ? 'github.saved' : 'github.removed'), 'success');
-      render(main, _params, app, isCurrent);
-    } catch (error) {
-      showErrors(tokenForm, error);
-    }
-  };
-  tokenForm.addEventListener('submit', (e) => { e.preventDefault(); saveToken(tokenForm.elements.github_token.value.trim()); });
-  const remove = tokenForm.querySelector('[data-remove-token]');
-  if (remove) remove.addEventListener('click', () => saveToken(''));
 
   const passwordForm = main.querySelector('[data-password-form]');
   attachPasswordToggles(passwordForm);

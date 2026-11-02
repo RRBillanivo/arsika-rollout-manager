@@ -1,7 +1,8 @@
 // Site settings form, used by "Add site" and the Settings tab of a site. With a preset, only the basics need filling in;
 // the folder layout, deployment steps, health check and backups are folded away under "Advanced".
+// Every site has its own read-only GitHub token: write-only here, kept by the runner, never shown again.
 import { post } from '../../core/api.js';
-import { t } from '../../core/i18n.js';
+import { t, tList } from '../../core/i18n.js';
 import { esc, icon } from '../../core/ui.js';
 import { checkbox } from './bits.js';
 
@@ -20,7 +21,20 @@ function area(name, label, list, help) {
     ${help ? `<span class="field__help">${help}</span>` : ''}</label>`;
 }
 
-export function siteFormHtml(site, presets, { isNew = false } = {}) {
+function tokenField(isNew, token) {
+  const saved = !isNew && token && token.set;
+  const status = isNew ? '' : saved ? f('github_token_saved', { hint: esc(token.hint) }) : f('github_token_none');
+  return `<label class="field field--full"><span class="field__label">${f('github_token')}</span>
+      <input type="password" name="github_token" class="mono" value="" placeholder="github_pat_…" autocomplete="new-password" spellcheck="false"
+        data-1p-ignore data-lpignore="true">
+      ${status ? `<span class="field__help"><b>${status}</b></span>` : ''}
+      <span class="field__help">${f('github_token_help')}</span></label>
+    ${saved ? `<div class="field field--full">${checkbox('remove_github_token', f('github_token_remove'), false)}</div>` : ''}
+    <details class="tech-section field--full"><summary>${icon('info')}${f('github_token_how')}</summary>
+      <ol class="bullet-list">${tList('sites.form.github_token_steps').map((x) => `<li>${esc(x)}</li>`).join('')}</ol></details>`;
+}
+
+export function siteFormHtml(site, presets, { isNew = false, token = null } = {}) {
   const s = site || {};
   return `
   <fieldset class="section">
@@ -29,14 +43,15 @@ export function siteFormHtml(site, presets, { isNew = false } = {}) {
       ${isNew ? `<label class="field field--full"><span class="field__label">${f('preset')}</span>
         <select name="preset">${presets.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('')}<option value="">${f('preset_custom')}</option></select>
         <span class="field__help">${f('preset_help')}</span></label>` : ''}
-      ${field('domain', f('domain'), s.domain, { help: f('domain_help'), placeholder: 'anemia.arsika.my.id' })}
-      ${field('name', f('name'), s.name, { placeholder: 'Anemia' })}
-      ${isNew ? field('id', f('id'), s.id, { help: f('id_help'), placeholder: 'anemia', mono: true }) : ''}
-      ${field('path', f('path'), s.path, { help: f('path_help'), placeholder: '/www/wwwroot/anemia.arsika.my.id', mono: true, wide: !isNew })}
+      ${field('domain', f('domain'), s.domain, { help: f('domain_help'), placeholder: 'example.com' })}
+      ${field('name', f('name'), s.name, { placeholder: 'Example' })}
+      ${isNew ? field('id', f('id'), s.id, { help: f('id_help'), placeholder: 'example', mono: true }) : ''}
+      ${field('path', f('path'), s.path, { help: f('path_help'), placeholder: '/www/wwwroot/example.com', mono: true, wide: !isNew })}
       <label class="field field--full"><span class="field__label">${f('repo')}</span>
-        <span class="field__combo"><input type="text" name="repo" class="mono" value="${esc(s.repo || '')}" placeholder="RRBillanivo/Anemia_Web" autocomplete="off" spellcheck="false">
+        <span class="field__combo"><input type="text" name="repo" class="mono" value="${esc(s.repo || '')}" placeholder="owner/repository" autocomplete="off" spellcheck="false">
         <button type="button" class="btn btn--outline btn--small" data-check-repo>${icon('github')}${f('check_repo')}</button></span>
         <span class="field__help">${f('repo_help')}</span><span class="field__help" data-repo-result></span></label>
+      ${tokenField(isNew, token)}
       ${field('asset_pattern', f('asset_pattern'), s.asset_pattern || '*.zip', { help: f('asset_pattern_help'), mono: true, wide: true })}
     </div>
   </fieldset>
@@ -96,11 +111,14 @@ export function readSiteForm(form) {
   data.reload_php_fpm = e.reload_php_fpm.checked;
   data.backup_before_deploy = e.backup_before_deploy.checked;
   if (e.preset && e.preset.value) data.preset = e.preset.value;
+  const token = e.github_token.value.trim();
+  if (token) data.github_token = token;
+  else if (e.remove_github_token && e.remove_github_token.checked) data.remove_github_token = true;
   return data;
 }
 
 /** Preset defaults, domain -> folder / name / id suggestions, and the "Check access" button. */
-export function attachSiteForm(form, presets, { isNew = false } = {}) {
+export function attachSiteForm(form, presets, { isNew = false, siteId = '' } = {}) {
   const e = form.elements;
   const fill = (settings) => {
     Object.entries(settings).forEach(([name, value]) => {
@@ -136,7 +154,10 @@ export function attachSiteForm(form, presets, { isNew = false } = {}) {
     result.className = 'field__help';
     result.textContent = t('common.loading');
     try {
-      const { data } = await post('github/check', { repo: e.repo.value.trim(), asset_pattern: e.asset_pattern.value.trim() });
+      const check = { repo: e.repo.value.trim(), asset_pattern: e.asset_pattern.value.trim() };
+      if (e.github_token.value.trim()) check.github_token = e.github_token.value.trim();
+      if (siteId) check.site = siteId;                 // editing: without a new token the saved one is tried
+      const { data } = await post('github/check', check);
       if (!data.ok) {
         result.className = 'field__help text-danger';
         result.textContent = f('repo_fail', { message: data.message });

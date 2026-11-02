@@ -114,7 +114,7 @@ def validate(data, site_roots, existing=None):
     if existing is None:
         site["id"] = str(data.get("id", "")).strip().lower()
         if not SITE_ID.match(site["id"]):
-            errors["id"] = "Use 1-40 lowercase letters, digits and hyphens (e.g. anemia)."
+            errors["id"] = "Use 1-40 lowercase letters, digits and hyphens (e.g. example)."
     site["name"] = str(site["name"]).strip()[:80] or site.get("id", "")
     site["domain"] = str(site["domain"]).strip().lower()
     if site["domain"] and not DOMAIN.match(site["domain"]):

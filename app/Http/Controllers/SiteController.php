@@ -39,12 +39,13 @@ final class SiteController extends Controller
         return Response::json($this->runner->get('/v1/presets'));
     }
 
-    /** POST /api/v1/sites {settings..., password} */
+    /** POST /api/v1/sites {settings..., github_token, password} */
     public function store(Request $request): Response
     {
         $this->confirmPassword($request);
-        $site = $this->runner->post('/v1/sites', $this->fields($request));
-        $this->audit($request, 'site_created', 'site:' . $site['id'], $site['domain'] . ' · ' . $site['repo']);
+        $site = $this->runner->post('/v1/sites', $this->fields($request) + $this->tokenFields($request));
+        $this->audit($request, 'site_created', 'site:' . $site['id'], $site['domain'] . ' · ' . $site['repo']
+            . (!empty($site['github_token_set']) ? ' · token ' . $site['github_token_hint'] : ''));
         return Response::json($site, 201);
     }
 
@@ -54,14 +55,19 @@ final class SiteController extends Controller
         return Response::json($this->runner->get('/v1/sites/' . $site));
     }
 
-    /** PUT /api/v1/sites/{site} {settings..., password} */
+    /** PUT /api/v1/sites/{site} {settings..., github_token | remove_github_token, password} */
     public function update(Request $request, string $site): Response
     {
         $this->confirmPassword($request);
         $fields = $this->fields($request);
         unset($fields['id'], $fields['preset']);
-        $updated = $this->runner->put('/v1/sites/' . $site, $fields);
-        $this->audit($request, 'site_updated', 'site:' . $site, implode(', ', array_keys($fields)));
+        $token = $this->tokenFields($request);
+        $updated = $this->runner->put('/v1/sites/' . $site, $fields + $token);
+        $changes = array_keys($fields);
+        if ($token) {
+            $changes[] = isset($token['github_token']) ? 'github_token ' . $updated['github_token_hint'] : 'github_token removed';
+        }
+        $this->audit($request, 'site_updated', 'site:' . $site, implode(', ', $changes));
         return Response::json($updated);
     }
 
@@ -116,15 +122,26 @@ final class SiteController extends Controller
         return Response::json($result);
     }
 
-    /** POST /api/v1/github/check {repo, asset_pattern} — can the runner read this repository's releases? */
+    /**
+     * POST /api/v1/github/check {repo, asset_pattern, github_token?, site?} — can the runner read this repository's releases?
+     * Uses the token typed in the form, else the saved token of the site being edited.
+     */
     public function checkRepository(Request $request): Response
     {
         $repo = $request->string('repo', 200);
         if ($repo === '') {
             throw HttpException::validation(['repo' => trans('sites.repo_required')]);
         }
-        return Response::json($this->runner->post('/v1/github/check', ['repo' => $repo,
-            'asset_pattern' => $request->string('asset_pattern', 100) ?: '*.zip']));
+        $check = ['repo' => $repo, 'asset_pattern' => $request->string('asset_pattern', 100) ?: '*.zip'];
+        $token = $request->string('github_token', 255);
+        $site = $request->string('site', 40);
+        if ($token !== '') {
+            $check['github_token'] = $token;
+        }
+        if ($site !== '') {
+            $check['site'] = $site;
+        }
+        return Response::json($this->runner->post('/v1/github/check', $check));
     }
 
     private function fields(Request $request): array
@@ -136,5 +153,15 @@ final class SiteController extends Controller
             }
         }
         return $fields;
+    }
+
+    /** The site's read-only GitHub token: write-only, kept by the runner, never logged or sent back. */
+    private function tokenFields(Request $request): array
+    {
+        $token = $request->string('github_token', 255);
+        if ($token !== '') {
+            return ['github_token' => $token];
+        }
+        return $request->boolean('remove_github_token') ? ['remove_github_token' => true] : [];
     }
 }

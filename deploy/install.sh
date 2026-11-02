@@ -4,7 +4,7 @@
 # The dashboard (PHP, this folder) is an ordinary aaPanel site. The work is done by the runner, a small Python service
 # that runs as root and listens on 127.0.0.1 only:
 #   /opt/arsika-rollout-manager/                 runner code (copied from runner/, root only)
-#   /etc/arsika-rollout-manager/runner.json      runner settings + shared secret + GitHub token (root only, 0600)
+#   /etc/arsika-rollout-manager/runner.json      settings + shared secret + GitHub token of each site (root, 0600)
 #   /var/lib/arsika-rollout-manager/             runner database and job logs
 #   /www/backup/arsika-rollout-manager/          site backups
 #   systemd unit arsika-rollout-manager-runner   starts the runner at boot
@@ -241,8 +241,8 @@ Next steps:
   1) aaPanel > Website > this site > Site directory: Running directory = /public
   2) aaPanel > Website > this site > URL rewrite: paste deploy/nginx/aapanel.conf
   3) Open the administrator setup link above (once), choose the password, sign in as "admin"
-  4) Settings: paste a read-only GitHub token (needed for private repositories)
-  5) Sites > Add site (e.g. preset "Anemia Web 3.x"), then "Adopt" its existing installation
+  4) Sites > Add site, with the site's own read-only GitHub token (private repositories), then "Adopt"
+     the existing installation of that site
   IMPORTANT: keep a backup of .env and $CONFIG somewhere safe.
 ======================================================================
 EOF

@@ -185,7 +185,7 @@ final class Kernel
             return 1;
         }
         $this->line('Runner OK: version ' . $status['version'] . ' · Python ' . $status['python'] . ' · ' . $status['sites'] . ' site(s) · '
-            . 'GitHub token ' . ($status['github_token_set'] ? 'set' : 'not set'));
+            . (int)($status['github_tokens'] ?? 0) . ' with a GitHub token');
         return 0;
     }
 

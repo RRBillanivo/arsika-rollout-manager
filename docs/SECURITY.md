@@ -18,7 +18,7 @@ not in a public issue.
   rotates on sign-in and every password change signs out other devices.
 - CSRF token on every state-changing request.
 - **The password is asked again** for adoption, restore, deleting a release, `_pre_rollout`, a backup or a site,
-  changing site settings and the GitHub token (10 wrong passwords lock it for 15 minutes).
+  changing site settings, including a site's GitHub token (10 wrong passwords lock it for 15 minutes).
 - Every action is recorded in the audit log with the administrator and IP address.
 - The page is `noindex` and must not be framed (CSP `frame-ancestors 'none'`, `X-Frame-Options: DENY`).
 
@@ -27,8 +27,10 @@ not in a public issue.
 - Listens on `127.0.0.1` only; a different address is refused at start.
 - Every request carries a timestamp (±120 s), a random nonce (never accepted twice) and an HMAC-SHA256 signature over
   method, path, timestamp, nonce and body hash, with the 256-bit secret shared with the dashboard's `.env`.
-- Settings and secret: `/etc/arsika-rollout-manager/runner.json`, root only (0600). The GitHub token is write-only
-  from the dashboard and is only sent to `api.github.com` (never to the storage host the downloads redirect to).
+- Settings, secret and GitHub tokens: `/etc/arsika-rollout-manager/runner.json`, root only (0600). Every site has its
+  own token, so a leaked token exposes one repository only. Tokens are write-only from the dashboard (answers carry a
+  hint, never the token, and the activity log never records them) and are only sent to `api.github.com` (never to the
+  storage host the downloads redirect to). Removing a site deletes its token.
 - Site folders must be inside `/www/wwwroot/`; paths in settings are relative and may not contain `..`.
 - Archives: absolute paths, `..` and links leaving the release folder are refused; SHA-256 checked when GitHub provides it.
 - Database passwords for backups go through a temporary 0600 option file, never the command line.
@@ -36,5 +38,5 @@ not in a public issue.
 ## Recommendations
 
 - HTTPS only (Let's Encrypt in aaPanel) and, if possible, restrict the dashboard to your IP addresses.
-- Fine-grained GitHub token with read-only Contents access to the web repositories only.
+- One fine-grained GitHub token per site, with read-only Contents access to that site's repository only.
 - Keep copies of `.env` (dashboard) and `/etc/arsika-rollout-manager/runner.json` outside the server.

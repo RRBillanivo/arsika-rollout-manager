@@ -42,15 +42,16 @@ prints a **one-time administrator setup link**.
 3. **SSL → Let's Encrypt** → apply, then **Force HTTPS**. The dashboard can deploy code as root: always use HTTPS.
    Restricting access by IP (aaPanel **Site → Access restriction**) adds another layer.
 
-## 5. Administrator and GitHub token
+## 5. Administrator
 
-1. Open the setup link, choose a password (at least 12 characters), sign in as `admin`.
-2. **Settings → GitHub token**: create a fine-grained token on GitHub (Repository access: only the web repositories;
-   Permissions: Contents → Read-only) and paste it. It is stored by the runner (root only) and never shown again.
+Open the setup link, choose a password (at least 12 characters), sign in as `admin`.
 
 ## 6. Register the sites
 
-See [SITES.md](SITES.md).
+**Sites → Add site**. Every site has its own read-only GitHub token, entered in the site form: create a fine-grained
+token on GitHub (Repository access: only that site's repository; Permissions: Contents → Read-only), paste it into
+**GitHub token** and use **Check access**. A public repository needs no token. The token is stored by the runner (root
+only) and never shown again. Details: [SITES.md](SITES.md).
 
 ## Updating the dashboard
 
@@ -80,6 +81,6 @@ bash deploy/install.sh --db                            # change the dashboard da
 |---|---|
 | Banner "The runner does not answer" | `systemctl status arsika-rollout-manager-runner`; `journalctl -u arsika-rollout-manager-runner -n 50` |
 | "The runner refused the request" | `RUNNER_SECRET` in `.env` differs from `/etc/arsika-rollout-manager/runner.json`: run `bash deploy/install.sh` again |
-| GitHub: repository or release not found | Private repository without a token, or the token has no access to it (Settings → GitHub token) |
+| GitHub: repository or release not found | Private repository without a token, or the site's token has no access to it (site → Settings → GitHub token) |
 | Blank page or 403 | Running directory is not `/public` |
 | "API not found" | URL rewrite rules missing |

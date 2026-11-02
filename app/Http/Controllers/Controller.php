@@ -25,7 +25,7 @@ abstract class Controller
     }
 
     /**
-     * Sensitive actions (restore, deletions, site settings, GitHub token) need the password again, so an open session
+     * Sensitive actions (restore, deletions, site settings and their GitHub token) need the password again, so an open session
      * left on another computer cannot be misused. Ten wrong passwords in 15 minutes lock the confirmation.
      */
     protected function confirmPassword(Request $request): array

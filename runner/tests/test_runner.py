@@ -2,9 +2,10 @@
 
     python runner/tests/test_runner.py            (Linux, or Windows with symlink rights; bash in PATH or ROLLOUT_TEST_SHELL)
 
-Covers: signed API, site validation, backup before an adoption, adoption of an existing installation (with aaPanel's
-.user.ini in the document root), deployment, automatic rollback after a failed health check, manual rollback, backups and
-restore of shared files, release pruning, unsafe archives."""
+Covers: signed API, site validation, one read-only GitHub token per site (write-only, used for checks and downloads,
+replaced, removed, deleted with the site, moved over from the single token of 1.0.0), backup before an adoption, adoption
+of an existing installation (with aaPanel's .user.ini in the document root), deployment, automatic rollback after a failed
+health check, manual rollback, backups and restore of shared files, release pruning, unsafe archives."""
 import hashlib
 import io
 import json
@@ -30,6 +31,7 @@ from arsika_rollout_manager.store import Store  # noqa: E402
 from arsika_rollout_manager.worker import Worker  # noqa: E402
 
 SHELL = os.environ.get("ROLLOUT_TEST_SHELL") or shutil.which("bash") or "/bin/bash"
+SITE_TOKEN = "github_pat_" + "s" * 40                    # the demo site's own (fake) read-only token
 
 
 def make_zip(files):
@@ -54,6 +56,7 @@ class FakeGitHub(object):
         self.assets = {}
         self.releases = []
         self.token_seen_by_storage = False
+        self.auth_seen = []                                # Authorization headers of the API requests
         github = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -71,6 +74,8 @@ class FakeGitHub(object):
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                if path.startswith(("/repos/", "/assets/")):
+                    github.auth_seen.append(self.headers.get("Authorization") or "")
                 if path == "/repos/o/demo/releases":
                     return self.send(200, json.dumps(github.releases).encode())
                 if path.startswith("/repos/o/demo/releases/tags/"):
@@ -123,7 +128,7 @@ class RunnerTest(unittest.TestCase):
         config_path = os.path.join(cls.tmp, "etc", "runner.json")
         os.makedirs(os.path.dirname(config_path))
         cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
-                                   github_api="http://127.0.0.1:%d" % cls.github.port, github_token="ghp_" + "x" * 36,
+                                   github_api="http://127.0.0.1:%d" % cls.github.port,
                                    site_roots=[cls.www], shell=SHELL, port=0, health_attempts=3, health_delay=0.3)
         cls.config.prepare_dirs()
         store = Store(cls.config.state_path("runner.db"))
@@ -173,24 +178,35 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(status, 401)
         status, doc = self.client.get("/v1/status")
         self.assertEqual(status, 200)
-        self.assertTrue(doc["data"]["github_token_set"])
+        self.assertEqual(doc["data"]["github_tokens"], 0)
 
     def test_01_site_validation(self):
-        status, doc = self.client.post("/v1/sites", {"id": "Bad Id", "path": "/etc", "repo": "nope"})
+        status, doc = self.client.post("/v1/sites", {"id": "Bad Id", "path": "/etc", "repo": "nope", "github_token": "not a token!"})
         self.assertEqual(status, 422)
-        self.assertTrue({"id", "path", "repo"} <= set(doc["error"]["fields"]))
+        self.assertTrue({"id", "path", "repo", "github_token"} <= set(doc["error"]["fields"]))
 
     def test_02_register_and_check_github(self):
         site = {"id": "demo", "name": "Demo", "domain": "demo.example.com", "path": self.site_dir, "repo": "o/demo",
                 "asset_pattern": "demo_v*.zip", "web_user": "", "shared": [".env", "data/"], "docroot_link": "public",
                 "docroot_target": "public", "build": "echo \"$ROLLOUT_VERSION\" > built.txt", "activate": "echo $ROLLOUT_VERSION >> \"$ROLLOUT_SHARED_DIR/activations.log\"",
                 "reload_php_fpm": False, "health_url": "http://127.0.0.1:%d/version.txt" % self.web.server_address[1],
-                "health_contains": "version {version}", "backup_paths": [".env", "data/"], "backup_keep": 3, "keep_releases": 2}
+                "health_contains": "version {version}", "backup_paths": [".env", "data/"], "backup_keep": 3, "keep_releases": 2,
+                "github_token": SITE_TOKEN}
         created = self.call("POST", "/v1/sites", site)
         self.assertEqual(created["state"], "empty")
         self.assertEqual(created["latest_version"], "1.2.0")
-        check = self.call("POST", "/v1/github/check", {"repo": "o/demo", "asset_pattern": "demo_v*.zip"})
+        self.assertEqual((created["github_token_set"], created["github_token_hint"]), (True, "github_pat_…ssss"))
+        self.assertNotIn(SITE_TOKEN, json.dumps(created))                                      # write-only
+        self.assertIn("Bearer " + SITE_TOKEN, self.github.auth_seen)                           # the site's own token
+        self.github.auth_seen.clear()
+        check = self.call("POST", "/v1/github/check", {"repo": "o/demo", "asset_pattern": "demo_v*.zip", "site": "demo"})
         self.assertTrue(check["ok"] and check["releases"] == 3)
+        self.assertEqual(self.github.auth_seen, ["Bearer " + SITE_TOKEN])                      # saved token of the site
+        typed = "github_pat_" + "t" * 40
+        self.call("POST", "/v1/github/check", {"repo": "o/demo", "site": "demo", "github_token": typed})
+        self.assertEqual(self.github.auth_seen[-1], "Bearer " + typed)                         # a token typed in the form wins
+        self.assertFalse(self.call("POST", "/v1/github/check", {"repo": "o/demo", "github_token": "bad token"})["ok"])
+        self.assertEqual(self.call("GET", "/v1/status")["github_tokens"], 1)
         status, doc = self.client.post("/v1/sites", site)
         self.assertEqual(status, 422)
 
@@ -233,7 +249,9 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse(self.github.token_seen_by_storage)
 
     def test_04_deploy(self):
+        self.github.auth_seen.clear()
         job = self.job("deploy", "1.1.0")
+        self.assertTrue(self.github.auth_seen and set(self.github.auth_seen) == {"Bearer " + SITE_TOKEN})   # release + asset
         self.assertEqual((job["from_version"], job["to_version"]), ("1.0.0", "1.1.0"))
         self.assertEqual(self.page(), "version 1.1.0")
         self.assertIn("SHA-256 verified", job["log"]["text"])
@@ -307,6 +325,42 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(merge_user_ini("open_basedir=/\nmemory_limit=256M\n", live),
                          "memory_limit=256M\nopen_basedir=/www/wwwroot/site/:/tmp/\n")            # the panel's limit wins
         self.assertEqual(merge_user_ini("memory_limit=256M\n", "; no limit here\n"), "memory_limit=256M\n")
+
+    def test_12_site_token_replace_and_remove(self):
+        new = "github_pat_" + "n" * 40
+        details = self.call("PUT", "/v1/sites/demo", {"github_token": new})
+        self.assertEqual(details["github_token_hint"], "github_pat_…nnnn")
+        self.assertEqual(self.config.site_token("demo"), new)
+        self.assertTrue(self.call("PUT", "/v1/sites/demo", {"name": "Demo site"})["github_token_set"])   # other changes keep it
+        status, doc = self.client.put("/v1/sites/demo", {"github_token": "short"})
+        self.assertEqual((status, list(doc["error"]["fields"])), (422, ["github_token"]))
+        self.assertFalse(self.call("PUT", "/v1/sites/demo", {"remove_github_token": True})["github_token_set"])
+        self.assertEqual(self.config.site_token("demo"), "")
+        with open(self.config.path, encoding="utf-8") as f:
+            self.assertNotIn(new, f.read())
+
+    def test_13_legacy_token_moves_to_sites(self):
+        folder = os.path.join(self.tmp, "legacy")
+        os.makedirs(folder)
+        legacy, own = "ghp_" + "l" * 36, "github_pat_" + "o" * 40
+        config = Config.create(os.path.join(folder, "runner.json"), state_dir=folder, github_token=legacy)   # as 1.0.0 saved it
+        store = Store(os.path.join(folder, "runner.db"))
+        store.save_site({"id": "old", "repo": "o/old"})
+        store.save_site({"id": "own", "repo": "o/own"})
+        config.set_site_token("own", own)
+        Api(config, store, None, None)
+        saved = Config(config.path)
+        self.assertNotIn("github_token", saved.values)
+        self.assertEqual((saved.site_token("old"), saved.site_token("own")), (legacy, own))   # a site's own token is kept
+
+    def test_14_deleting_a_site_deletes_its_token(self):
+        site_dir = os.path.join(self.www, "second.example.com")
+        os.makedirs(site_dir)
+        self.call("POST", "/v1/sites", {"id": "second", "domain": "second.example.com", "path": site_dir, "repo": "o/demo",
+                                        "asset_pattern": "demo_v*.zip", "github_token": "github_pat_" + "d" * 40})
+        self.assertTrue(self.config.site_token("second"))
+        self.call("DELETE", "/v1/sites/second")
+        self.assertEqual(self.config.site_token("second"), "")
 
 
 if __name__ == "__main__":

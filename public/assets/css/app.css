@@ -603,7 +603,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--bg-2); padd
 .stat span { display: flex; align-items: center; gap: 7px; font-size: .84rem; color: var(--muted); font-weight: 600; }
 .stat b { font-size: 2rem; font-weight: 850; letter-spacing: -.03em; margin: 4px 0 0; line-height: 1.1; }
 .stat small { color: var(--muted); font-size: .78rem; }
-.stat--anemia span .icon { color: var(--red); }
+.stat--problem span .icon { color: var(--red); }
 .stat--normal span .icon { color: var(--green); }
 .card--table { padding: 0; overflow: hidden; }
 .table-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 16px 18px; border-bottom: 1px solid var(--border); }

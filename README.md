@@ -3,10 +3,10 @@
 A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux server**,
 straight from the zip assets of their **GitHub Releases**.
 
-![version](https://img.shields.io/badge/version-1.0.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
+![version](https://img.shields.io/badge/version-1.1.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![php](https://img.shields.io/badge/PHP-7.4%2B-777bb4) ![python](https://img.shields.io/badge/Python-3.6%2B-3776ab)
 
-> **Status: first release.** Version 1.0.0 passes its automated tests (a runner integration test and an end-to-end
+> **Status: early release.** Version 1.1.0 passes its automated tests (a runner integration test and an end-to-end
 > smoke test on PHP 7.4 and 8.3), but it has not been proven on production servers yet. Try it on a test server first
 > and keep your own backups.
 
@@ -33,6 +33,8 @@ One installation manages several sites on the same server.
 - **Backups** of the database (mysqldump) and the shared files (.env, storage) before every update, on demand, and
   **restore** with a safety backup first.
 - **Adoption** of an installation made by hand (files directly in the site folder) without downtime.
+- **One GitHub token per site:** each site has its own read-only token (or none for a public repository), so a leaked
+  token exposes one repository only. Tokens are kept by the runner and never shown again.
 - **Live job logs**, job history, activity log (sign-ins and every administrator action).
 - Presets for PHP applications and static sites, plus Anemia Web 3.x as a complete example with a Python service; any
   site can define its own build and activation commands.

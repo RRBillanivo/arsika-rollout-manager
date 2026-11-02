@@ -38,8 +38,7 @@ final class AppController extends Controller
         if ($user !== null) {
             try {
                 $status = $this->runner->get('/v1/status');
-                $runner = ['ok' => true, 'version' => $status['version'] ?? '', 'github_token_set' => (bool)($status['github_token_set'] ?? false),
-                           'active_job' => $status['active_job'] ?? null];
+                $runner = ['ok' => true, 'version' => $status['version'] ?? '', 'active_job' => $status['active_job'] ?? null];
             } catch (HttpException $e) {
                 $runner = ['ok' => false, 'code' => $e->getErrorCode(), 'message' => $e->getMessage()];
             }

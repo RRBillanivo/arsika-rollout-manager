@@ -139,7 +139,7 @@ function settingsTab(container, site, app) {
   const f = (key, params) => t('sites.form.' + key, params);
   container.innerHTML = `<form class="card site-form" novalidate>
     <h2 class="card__title">${icon('settings')}${f('edit_title')}</h2>
-    ${siteFormHtml(site.settings, [], { isNew: false })}
+    ${siteFormHtml(site.settings, [], { isNew: false, token: { set: site.github_token_set, hint: site.github_token_hint } })}
     <div class="form-two form-confirm">${passwordField()}</div>
     <div class="box box--red" data-form-error hidden></div>
     <div class="form-actions"><button type="submit" class="btn btn--primary">${icon('check')}${f('save')}</button></div>
@@ -147,7 +147,7 @@ function settingsTab(container, site, app) {
   <section class="card danger-zone"><div><h2>${icon('trash')}${f('danger')}</h2><p class="muted">${f('danger_text')}</p></div>
     <button type="button" class="btn btn--danger-outline" data-delete-site ${site.active_job ? 'disabled' : ''}>${icon('trash')}${f('delete')}</button></section>`;
   const form = container.querySelector('form');
-  attachSiteForm(form, [], { isNew: false });
+  attachSiteForm(form, [], { isNew: false, siteId: site.id });
   attachPasswordToggles(form.querySelector('.form-confirm'));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();

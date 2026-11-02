@@ -15,7 +15,7 @@ function summary(sites) {
     <div class="stat"><span>${icon('server')}${s('total')}</span><b>${sites.length}</b></div>
     <div class="stat stat--normal"><span>${icon('check-circle')}${s('online')}</span><b>${online}</b></div>
     <div class="stat"><span>${icon('upload-cloud')}${s('updates')}</span><b>${updates}</b></div>
-    <div class="stat stat--anemia"><span>${icon('alert')}${s('problems')}</span><b>${problems}</b></div></section>`;
+    <div class="stat stat--problem"><span>${icon('alert')}${s('problems')}</span><b>${problems}</b></div></section>`;
 }
 
 function card(site) {

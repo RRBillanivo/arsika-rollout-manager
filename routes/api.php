@@ -45,7 +45,6 @@ return static function (Router $router): void {
             $router->get('/jobs/{job}', [JobController::class, 'show']);
 
             $router->get('/settings', [SettingsController::class, 'show']);
-            $router->put('/settings', [SettingsController::class, 'update']);
 
             $router->get('/activity', [ActivityController::class, 'index']);
         });

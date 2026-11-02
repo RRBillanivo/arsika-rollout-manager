@@ -52,8 +52,9 @@ class Deployer(object):
         self.store = store
         self.backups = backups
 
-    def github(self):
-        return GitHub(self.config["github_api"], self.config.get("github_token", ""))
+    def github(self, site):
+        """GitHub client with the site's own read-only token (none for a public repository)."""
+        return GitHub(self.config["github_api"], self.config.site_token(site["id"]))
 
     # ------------------------------------------------------------------ state
     @staticmethod
@@ -113,7 +114,8 @@ class Deployer(object):
             remove(target)
 
         log.step("Find release %s in %s" % (version, site["repo"]))
-        release = self.github().release(site["repo"], version, site["asset_pattern"])
+        github = self.github(site)
+        release = github.release(site["repo"], version, site["asset_pattern"])
         asset = release["asset"]
         if not asset:
             raise DeployError("release %s has no asset matching %s (assets: %s)" % (
@@ -121,7 +123,7 @@ class Deployer(object):
         archive = self.config.state_path("downloads", "%s-%s-%d.zip" % (site["id"], version, job_id))
         log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
         try:
-            size = self.github().download(asset, archive, lambda done, total: log.line(
+            size = github.download(asset, archive, lambda done, total: log.line(
                 "downloaded %s of %s" % (human_size(done), human_size(total))))
             if asset["size"] and size != asset["size"]:
                 raise DeployError("download incomplete: %d of %d bytes" % (size, asset["size"]))

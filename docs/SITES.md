@@ -20,7 +20,10 @@
 | Static site | – | `public` → `current` | – | `https://{domain}/` |
 
 Then fill in the domain (the folder `/www/wwwroot/<domain>` is suggested), the repository (`owner/name`) and the
-release file pattern, and use **Check access** to confirm that the runner can read the releases.
+release file pattern. For a private repository, paste the site's own **GitHub token**: a fine-grained token with access
+to that repository only and the permission Contents: Read-only (a public repository needs none). Use **Check access**
+to confirm that the runner can read the releases with it. The token is stored by the runner, never shown again, and
+can be replaced or removed later in the site's **Settings** tab.
 
 Settings under **Advanced**:
 
@@ -46,8 +49,9 @@ Settings under **Advanced**:
 
 ### Example: Anemia Web (anemia.arsika.my.id)
 
-1. Add site → preset **Anemia Web 3.x**, domain `anemia.arsika.my.id`, repository `RRBillanivo/Anemia_Web`.
-2. Versions tab → **Adopt now** with version `3.1.0` (backup first stays on).
+1. Add site → preset **Anemia Web 3.x**, domain `anemia.arsika.my.id`, repository `RRBillanivo/Anemia_Web` and its
+   fine-grained GitHub token (the repository is private).
+2. Versions tab → **Adopt now** with version `3.1.2` (backup first stays on).
    The preset builds a new Python environment in `shared/.rollout-cache/anemia-web/` (torch download, a few minutes),
    checks the models and the database, then points the `anemia-engine` service to `current/`.
 3. Check the site, then delete `_pre_rollout/` (it holds the old Python environment, about 1.5 GB).
