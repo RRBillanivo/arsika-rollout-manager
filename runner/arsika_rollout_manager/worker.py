@@ -90,7 +90,9 @@ class Worker(object):
 
     def job_backup(self, job, site, log):
         version = self.deployer.current_version(site)
-        backup_id = self.backups.create(site, version, job["params"].get("reason") or "manual backup", log, job["id"])
+        # before an adoption the data is still in the site folder itself (shared/ does not exist yet)
+        base = site["path"] if self.deployer.state(site) == "classic" else None
+        backup_id = self.backups.create(site, version, job["params"].get("reason") or "manual backup", log, job["id"], base=base)
         if not backup_id:
             raise BackupError("nothing to back up: set the backup paths or the database environment file of the site")
         return version, version, "backup " + backup_id

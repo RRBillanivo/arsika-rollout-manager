@@ -31,6 +31,12 @@ Paths inside a release that are listed in the site's `shared` setting are replac
 (`storage/` is created from the release on the first install). The web server keeps serving `public`, which always
 points into `current`, so no aaPanel setting changes when a version is switched.
 
+aaPanel's protection against cross-site access writes PHP's `open_basedir` limit into `.user.ini` in the running
+directory (`public/.user.ini`) and locks it with `chattr +i`. Since `public` points into the running release, the runner
+carries that file into every release it switches to (copied when the release has none, otherwise only its
+`open_basedir` line is taken over) and locks the copy again. Locked files are unlocked before a release or
+`_pre_rollout/` is deleted.
+
 ## Deployment
 
 1. Optional backup (database + shared files).
@@ -65,6 +71,12 @@ A non-zero exit code fails the job (before the switch for `build`, with an autom
 A restore verifies the checksums, replaces the shared files (the replaced ones are kept until the site is healthy),
 imports the database, then runs the activation steps and the health check.
 
+A site that is not adopted yet can be backed up too: the data is read from the site folder itself. Such a backup is
+restored after the adoption (a restore needs the release layout).
+
+The runner service has no `PrivateTmp`: MySQL in aaPanel listens on `/tmp/mysql.sock`, which mysqldump and the build
+hooks must reach.
+
 ## Adoption
 
 For a site installed by hand (application files directly in the site folder):
@@ -72,6 +84,7 @@ For a site installed by hand (application files directly in the site folder):
 1. Backup from the old location.
 2. Shared paths are moved to `shared/` and replaced by links, so the running site keeps working.
 3. The chosen release is downloaded and built as a normal release.
-4. Everything else in the site folder (except `.user.ini`, `.well-known`, `.htaccess`) is moved to `_pre_rollout/`;
-   `current` and the document root link are created; activation and health check follow.
+4. The `.user.ini` of the old document root folder is carried into the release. Everything else in the site folder
+   (except `.user.ini`, `.well-known`, `.htaccess`) is moved to `_pre_rollout/`; `current` and the document root link
+   are created; activation and health check follow.
 5. On failure the files are moved back and presets restore what they changed (e.g. the old systemd unit).

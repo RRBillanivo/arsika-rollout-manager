@@ -192,7 +192,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=$PYTHON -m arsika_rollout_manager serve --config=$CONFIG
 Restart=always
 RestartSec=3
-PrivateTmp=true
+# No PrivateTmp: MySQL in aaPanel listens on /tmp/mysql.sock, which backups (mysqldump) and build hooks must reach.
 
 [Install]
 WantedBy=multi-user.target

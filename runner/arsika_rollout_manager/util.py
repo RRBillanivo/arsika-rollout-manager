@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 from datetime import datetime, timezone
 
 SITE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -92,13 +93,38 @@ def exists(path):
     return os.path.lexists(path)
 
 
+def _chattr(flags, path):
+    """chattr on Linux as root; -> True when it worked. aaPanel locks .user.ini with chattr +i."""
+    if not POSIX or os.geteuid() != 0 or not shutil.which("chattr"):
+        return False
+    return subprocess.run(["chattr", flags, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def lock_file(path):
+    """Give a file to root, make it read-only for everyone else and immutable (chattr +i), as aaPanel does with .user.ini.
+    -> True (locked), False (chattr failed, e.g. a file system without support) or None (not root on Linux)."""
+    if not POSIX or os.geteuid() != 0:
+        return None
+    os.chown(path, 0, 0)
+    os.chmod(path, 0o644)
+    return _chattr("+i", path)
+
+
 def remove(path):
-    """Delete a file, a link (never its target) or a folder tree."""
+    """Delete a file, a link (never its target) or a folder tree, also when files in it are locked with chattr +i."""
     if os.path.islink(path) or (os.path.lexists(path) and not os.path.isdir(path)):
-        os.unlink(path)
+        try:
+            os.unlink(path)
+        except PermissionError:
+            if not _chattr("-i", path):
+                raise
+            os.unlink(path)
     elif os.path.isdir(path):
         def onerror(func, p, _exc):
-            os.chmod(p, stat.S_IWRITE)
+            if POSIX:
+                _chattr("-i", p)                                # immutable file or folder (aaPanel's .user.ini)
+            else:
+                os.chmod(p, stat.S_IWRITE)                      # read-only file (Windows, tests only)
             func(p)
         shutil.rmtree(path, onerror=onerror)
 

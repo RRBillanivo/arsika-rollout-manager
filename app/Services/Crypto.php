@@ -68,18 +68,18 @@ final class Crypto
         if ($plaintext === null || $plaintext === '') {
             return null;
         }
-        $key = $this->key('anemia/data/v1');
+        $key = $this->key('rollout/data/v1');
         if (function_exists('openssl_encrypt')) {
             $iv = random_bytes(12);
             $tag = '';
-            $ciphertext = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, 'anemia', 16);
+            $ciphertext = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, 'rollout', 16);
             if ($ciphertext !== false) {
                 return 'v1:' . base64_encode($iv . $tag . $ciphertext);
             }
         }
         if (function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt')) {
             $nonce = random_bytes(24);
-            return 's1:' . base64_encode($nonce . sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, 'anemia', $nonce, $key));
+            return 's1:' . base64_encode($nonce . sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, 'rollout', $nonce, $key));
         }
         throw new RuntimeException('Neither OpenSSL nor Sodium is available for data encryption.');
     }
@@ -95,14 +95,14 @@ final class Crypto
         if ($raw === false) {
             return null;
         }
-        $key = $this->key('anemia/data/v1');
+        $key = $this->key('rollout/data/v1');
         if ($version === 'v1:' && strlen($raw) > 28 && function_exists('openssl_decrypt')) {
             $plaintext = openssl_decrypt(substr($raw, 28), 'aes-256-gcm', $key, OPENSSL_RAW_DATA, substr($raw, 0, 12),
-                substr($raw, 12, 16), 'anemia');
+                substr($raw, 12, 16), 'rollout');
             return $plaintext === false ? null : $plaintext;
         }
         if ($version === 's1:' && strlen($raw) > 24 && function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_decrypt')) {
-            $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt(substr($raw, 24), 'anemia', substr($raw, 0, 24), $key);
+            $plaintext = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt(substr($raw, 24), 'rollout', substr($raw, 0, 24), $key);
             return $plaintext === false ? null : $plaintext;
         }
         return null;
@@ -112,7 +112,7 @@ final class Crypto
 
     private function pepper(string $password): string
     {
-        return base64_encode(hash_hmac('sha256', $password, $this->key('anemia/password/v1'), true));
+        return base64_encode(hash_hmac('sha256', $password, $this->key('rollout/password/v1'), true));
     }
 
     /** Password hashing scheme used on this server (shown on the admin System page). */
@@ -181,6 +181,6 @@ final class Crypto
     /** Keyed IP fingerprint for unique-visitor counts (the IP itself is not stored). */
     public function ipFingerprint(string $ip): string
     {
-        return substr(hash_hmac('sha256', $ip, $this->key('anemia/ip/v1')), 0, 16);
+        return substr(hash_hmac('sha256', $ip, $this->key('rollout/ip/v1')), 0, 16);
     }
 }

@@ -296,7 +296,7 @@ class Api(object):
         state = self.deployer.state(record)
         if job_type == "adopt" and state != "classic":
             raise ApiError(409, "not_classic", "nothing to adopt: the site folder is %s" % state)
-        if job_type == "deploy" and state == "classic":
+        if job_type in ("deploy", "restore") and state == "classic":
             raise ApiError(409, "needs_adopt", "the site holds an installation without releases/; adopt it first")
         actor = str(data.get("actor") or "")[:80] or None
         job_id = self.worker.submit(site, job_type, version, params, actor)

@@ -18,11 +18,28 @@ import zipfile
 from . import system
 from .github import GitHub
 from .sites import expand, layout
-from .util import (POSIX, chown_tree, ensure_dir, exists, human_size, link_target, make_link, remove, sha256_file,
-                   switch_link, version_key, VERSION)
+from .util import (POSIX, chown_tree, ensure_dir, exists, human_size, link_target, lock_file, make_link, remove,
+                   sha256_file, switch_link, version_key, VERSION)
 
 MARKER = ".rollout-release.json"
 RESERVED = ("releases", "shared", "current", "_pre_rollout")
+USER_INI = ".user.ini"
+
+
+def _ini_key(line):
+    text = line.strip()
+    if not text or text[0] in ";#" or "=" not in text:
+        return None
+    return text.split("=", 1)[0].strip()
+
+
+def merge_user_ini(release_text, live_text):
+    """The release's own .user.ini, with the open_basedir line of the running version (the panel manages that limit)."""
+    limit = [line for line in live_text.splitlines() if _ini_key(line) == "open_basedir"]
+    if not limit:
+        return release_text
+    kept = [line for line in release_text.splitlines() if _ini_key(line) != "open_basedir"]
+    return "\n".join(kept + limit) + "\n"
 
 
 class DeployError(Exception):
@@ -226,12 +243,45 @@ class Deployer(object):
             make_link(target, docroot)
             log.line("%s -> %s" % (site["docroot_link"], target))
 
+    def carry_user_ini(self, site, release_dir, log):
+        """aaPanel keeps PHP's open_basedir limit in <document root>/.user.ini, locked with chattr +i. The document root
+        is a link into the running release, so that file is carried into the release that goes live: copied when the
+        release has none, otherwise only its open_basedir line is taken over. The copy is locked again."""
+        docroot = layout(site)["docroot"]
+        if not docroot:
+            return
+        source = os.path.join(docroot, USER_INI)
+        target_dir = release_dir if site["docroot_target"] == "." else os.path.join(release_dir, site["docroot_target"])
+        target = os.path.join(target_dir, USER_INI)
+        if not os.path.isfile(source) or not os.path.isdir(target_dir):
+            return
+        if os.path.isfile(target) and os.path.realpath(source) == os.path.realpath(target):
+            return                                                   # the release is already the live one
+        with open(source, encoding="utf-8", errors="replace") as f:
+            live = f.read()
+        own = None
+        if os.path.isfile(target):
+            with open(target, encoding="utf-8", errors="replace") as f:
+                own = f.read()
+        wanted = live if own is None else merge_user_ini(own, live)
+        if wanted == own:
+            return
+        if own is not None:
+            remove(target)                                           # also unlocks an earlier copy
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write(wanted)
+        locked = lock_file(target)
+        log.line("%s/%s of the running version carried over (PHP open_basedir)%s" % (
+            site["docroot_link"], USER_INI, {True: ", locked with chattr +i", False: "; chattr +i failed, the copy is not locked",
+                                             None: ""}[locked]))
+
     def switch(self, site, version, log):
         lay = layout(site)
         target = os.path.join(lay["releases"], version)
         if not os.path.isfile(os.path.join(target, MARKER)):
             raise DeployError("release %s is not installed" % version)
         log.step("Switch current -> releases/" + version)
+        self.carry_user_ini(site, target, log)
         switch_link(lay["current"], target)
         self.ensure_docroot(site, log)
 
@@ -327,7 +377,8 @@ class Deployer(object):
                 os.rename(old, new)
                 make_link(new, old)
                 log.line("%s -> shared/%s" % (rel, rel))
-        self.prepare_release(site, version, log, job["id"])
+        release_dir = self.prepare_release(site, version, log, job["id"])
+        self.carry_user_ini(site, release_dir, log)                  # the old document root folder is still in place
 
         keep = set(site.get("adopt_keep", [])) | set(RESERVED)
         moved = []

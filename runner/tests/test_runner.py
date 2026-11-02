@@ -2,8 +2,9 @@
 
     python runner/tests/test_runner.py            (Linux, or Windows with symlink rights; bash in PATH or ROLLOUT_TEST_SHELL)
 
-Covers: signed API, site validation, adoption of an existing installation, deployment, automatic rollback after a failed
-health check, manual rollback, backups and restore of shared files, release pruning, unsafe archives."""
+Covers: signed API, site validation, backup before an adoption, adoption of an existing installation (with aaPanel's
+.user.ini in the document root), deployment, automatic rollback after a failed health check, manual rollback, backups and
+restore of shared files, release pruning, unsafe archives."""
 import hashlib
 import io
 import json
@@ -23,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from arsika_rollout_manager.backup import Backups  # noqa: E402
 from arsika_rollout_manager.client import Client  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
-from arsika_rollout_manager.deploy import Deployer, DeployError  # noqa: E402
+from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
 from arsika_rollout_manager.server import Api, serve  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
 from arsika_rollout_manager.worker import Worker  # noqa: E402
@@ -205,8 +206,14 @@ class RunnerTest(unittest.TestCase):
             f.write("user data")
         with open(os.path.join(self.site_dir, ".user.ini"), "w") as f:
             f.write("open_basedir=...")
+        with open(os.path.join(self.site_dir, "public", ".user.ini"), "w") as f:          # aaPanel: Running directory /public
+            f.write("open_basedir=/www/wwwroot/demo.example.com/:/tmp/\n")
         self.assertEqual(self.call("GET", "/v1/sites/demo")["state"], "classic")
         status, doc = self.client.post("/v1/sites/demo/jobs", {"type": "deploy", "version": "1.1.0"})
+        self.assertEqual((status, doc["error"]["code"]), (409, "needs_adopt"))
+        backup_id = self.job("backup", params={"reason": "before adoption"})["message"].split()[-1]   # data still in the site folder
+        self.assertEqual(len(self.call("GET", "/v1/sites/demo/backups")), 1)
+        status, doc = self.client.post("/v1/sites/demo/jobs", {"type": "restore", "params": {"backup_id": backup_id}})
         self.assertEqual((status, doc["error"]["code"]), (409, "needs_adopt"))
         job = self.job("adopt", "1.0.0")
         self.assertIn("adopted", job["message"])
@@ -215,11 +222,14 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(details["pre_rollout"])
         self.assertTrue(os.path.islink(os.path.join(self.site_dir, "public")))
         self.assertTrue(os.path.isfile(os.path.join(self.site_dir, ".user.ini")))              # kept in place
+        with open(os.path.join(self.site_dir, "public", ".user.ini")) as f:                    # carried into the release
+            self.assertEqual(f.read(), "open_basedir=/www/wwwroot/demo.example.com/:/tmp/\n")
+        self.assertIn(".user.ini of the running version carried over", job["log"]["text"])
         with open(os.path.join(self.site_dir, "current", "data", "user.txt")) as f:
             self.assertEqual(f.read(), "user data")                                            # shared data linked into the release
         with open(os.path.join(self.site_dir, "current", "built.txt")) as f:
             self.assertEqual(f.read().strip(), "1.0.0")                                        # build hook ran in the release
-        self.assertEqual(len(self.call("GET", "/v1/sites/demo/backups")), 1)                   # backup before adoption
+        self.assertEqual(len(self.call("GET", "/v1/sites/demo/backups")), 2)                   # manual one + before adoption
         self.assertFalse(self.github.token_seen_by_storage)
 
     def test_04_deploy(self):
@@ -227,6 +237,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual((job["from_version"], job["to_version"]), ("1.0.0", "1.1.0"))
         self.assertEqual(self.page(), "version 1.1.0")
         self.assertIn("SHA-256 verified", job["log"]["text"])
+        self.assertTrue(os.path.isfile(os.path.join(self.site_dir, "releases", "1.1.0", "public", ".user.ini")))
         details = self.call("GET", "/v1/sites/demo")
         self.assertEqual(details["rollback_version"], "1.0.0")
         self.assertEqual(details["latest_version"], "1.2.0")
@@ -288,6 +299,14 @@ class RunnerTest(unittest.TestCase):
         with self.assertRaises(DeployError):
             Deployer.extract(path, target)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "escape.txt")))
+
+    def test_11_user_ini_merge(self):
+        live = "open_basedir=/www/wwwroot/site/:/tmp/\n"
+        self.assertEqual(merge_user_ini("upload_max_filesize=20M\n", live),
+                         "upload_max_filesize=20M\nopen_basedir=/www/wwwroot/site/:/tmp/\n")      # the release keeps its settings
+        self.assertEqual(merge_user_ini("open_basedir=/\nmemory_limit=256M\n", live),
+                         "memory_limit=256M\nopen_basedir=/www/wwwroot/site/:/tmp/\n")            # the panel's limit wins
+        self.assertEqual(merge_user_ini("memory_limit=256M\n", "; no limit here\n"), "memory_limit=256M\n")
 
 
 if __name__ == "__main__":

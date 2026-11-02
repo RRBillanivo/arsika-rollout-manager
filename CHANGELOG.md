@@ -3,7 +3,7 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
-## [1.0.0] — Unreleased
+## [1.0.0] — 2026-11-02
 
 First version, released under the MIT license.
 
@@ -14,10 +14,14 @@ First version, released under the MIT license.
 - Sites from GitHub releases: overview with health checks and update notices, deploy with automatic rollback after a
   failed health check, rollback to any installed version, release pruning, live job logs and history.
 - Release layout `releases/<version>` + `shared/` + `current` + document root link (aaPanel Running directory unchanged).
-- Backups (mysqldump + shared files, SHA-256 manifest) before updates and on demand; restore with a safety backup.
+- Backups (mysqldump + shared files, SHA-256 manifest) before updates and on demand, also of a site that is not adopted
+  yet; restore with a safety backup.
 - Adoption of installations made by hand, without downtime, with automatic revert on failure.
+- aaPanel's `.user.ini` (PHP `open_basedir`) in the document root is carried into every release and locked again with
+  `chattr +i`; locked files do not block the deletion of releases or `_pre_rollout/`.
 - Presets: Anemia Web 3.x (shared Python environment per requirements, `db:check`, model self-test, `anemia-engine`
   unit pointing at `current/`), PHP application, static site.
 - `deploy/install.sh` (runner in `/opt/arsika-rollout-manager`, settings in `/etc/arsika-rollout-manager`, systemd
-  unit, dashboard `.env`, setup link), nginx rules for aaPanel.
+  unit without `PrivateTmp` so backups reach aaPanel's MySQL socket in `/tmp`, dashboard `.env`, setup link), nginx
+  rules for aaPanel.
 - Tests: runner integration test and end-to-end smoke test with a fake GitHub (PHP 7.4 and 8.3).

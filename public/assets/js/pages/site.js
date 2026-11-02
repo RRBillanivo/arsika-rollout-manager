@@ -24,7 +24,7 @@ function header(site) {
     <div class="site-header__actions">
       <button type="button" class="btn btn--outline btn--small" data-health>${icon('activity')}${d('check_health')}</button>
       ${ready && site.rollback_version ? `<button type="button" class="btn btn--outline btn--small" data-rollback="${esc(site.rollback_version)}" ${busy ? 'disabled' : ''}>${icon('rollback')}${d('rollback_to', { version: site.rollback_version })}</button>` : ''}
-      ${ready ? `<button type="button" class="btn btn--outline btn--small" data-backup ${busy ? 'disabled' : ''}>${icon('archive')}${d('backup_now')}</button>` : ''}
+      ${ready || site.state === 'classic' ? `<button type="button" class="btn btn--outline btn--small" data-backup ${busy ? 'disabled' : ''}>${icon('archive')}${d('backup_now')}</button>` : ''}
     </div>
   </header>
   ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' ? 'red' : 'yellow'}">${icon('info')}<div>${t('sites.state.' + site.state + '_hint')}</div></div>` : ''}
@@ -117,7 +117,7 @@ async function backupsTab(container, site, isCurrent) {
   container.innerHTML = `<section class="card card--table">
     <div class="card__header card__header--padded"><div><h2 class="card__title">${icon('archive')}${b('title')}</h2>
       <p class="small muted">${b('lead', { keep: site.settings.backup_keep })}</p></div>
-      ${site.state === 'ready' ? `<button type="button" class="btn btn--primary btn--small" data-backup ${site.active_job || !configured ? 'disabled' : ''}>${icon('archive')}${b('create')}</button>` : ''}</div>
+      ${site.state === 'ready' || site.state === 'classic' ? `<button type="button" class="btn btn--primary btn--small" data-backup ${site.active_job || !configured ? 'disabled' : ''}>${icon('archive')}${b('create')}</button>` : ''}</div>
     ${!configured ? `<div class="box box--yellow">${icon('info')}<div>${b('not_configured')}</div></div>` : ''}
     ${backups.length ? `<div class="table-scroll"><table class="table">
       <thead><tr><th>${c('time')}</th><th>${c('version')}</th><th>${c('contents')}</th><th class="right">${c('size')}</th><th>${c('reason')}</th><th></th></tr></thead>
@@ -128,7 +128,7 @@ async function backupsTab(container, site, isCurrent) {
           ${x.has_files ? `<span class="badge badge--failed">${icon('folder')}${b('files')}</span>` : ''}</td>
         <td data-label="${c('size')}" class="right">${formatBytes(x.size_bytes)}</td>
         <td data-label="${c('reason')}" class="small muted">${esc(x.reason || '')}</td>
-        <td class="right cell-actions"><button type="button" class="btn btn--outline btn--small" data-restore="${esc(x.id)}" ${site.active_job ? 'disabled' : ''}>${icon('rollback')}${b('restore')}</button>
+        <td class="right cell-actions">${site.state === 'ready' ? `<button type="button" class="btn btn--outline btn--small" data-restore="${esc(x.id)}" ${site.active_job ? 'disabled' : ''}>${icon('rollback')}${b('restore')}</button>` : ''}
           <button type="button" class="icon-btn icon-btn--danger" data-delete-backup="${esc(x.id)}" aria-label="${t('common.delete')}" title="${t('common.delete')}">${icon('trash')}</button></td>
       </tr>`).join('')}</tbody></table></div>` : `<div class="empty">${icon('archive', 'icon--large')}<p>${b('empty')}</p></div>`}
   </section>`;

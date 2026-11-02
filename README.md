@@ -6,8 +6,9 @@ straight from the zip assets of their **GitHub Releases**.
 ![version](https://img.shields.io/badge/version-1.0.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![php](https://img.shields.io/badge/PHP-7.4%2B-777bb4) ![python](https://img.shields.io/badge/Python-3.6%2B-3776ab)
 
-> **Status: pre-release.** Version 1.0.0 passes its automated tests (a runner integration test and an end-to-end smoke
-> test on PHP 7.4 and 8.3), but it has not run on a production server yet. Try it on a test server first.
+> **Status: first release.** Version 1.0.0 passes its automated tests (a runner integration test and an end-to-end
+> smoke test on PHP 7.4 and 8.3), but it has not been proven on production servers yet. Try it on a test server first
+> and keep your own backups.
 
 ## What it is for
 
