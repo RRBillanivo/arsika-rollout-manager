@@ -3,6 +3,24 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.4.0] — 2026-11-06
+
+### Added
+- **Websites on a hosting without a terminal** (only a file manager, no SSH): "Add site" first asks where the website
+  runs, on a full server (VPS / VM) or on a hosting. For a hosting the dashboard generates a PHP agent file with a
+  one-time key; it is uploaded with the file manager, opened in the browser and connected with one click ("Connect to
+  the dashboard", then the password). The runner of the dashboard's server then downloads the releases from GitHub,
+  uploads them to the agent in pieces, and the agent unpacks them next to the live files, swaps them in, keeps the
+  previous version for a rollback and the files from before the first installation (`_pre_rollout`). Work is split
+  into short requests (PHP time limits). Any kind of website: static, a build (`dist/` published), PHP.
+- **Database changes shown before an update** (hosting sites): numbered SQL files of the release
+  (`database/migrations/*.sql`) that have not run yet, with their SQL; run automatically with PHP on the hosting, or
+  marked as done after running them by hand. Database settings from `.env` (`DB_*`, `DATABASE_URL`) or `wp-config.php`.
+- Backups of hosting sites (SQL dump by PHP for MySQL/MariaDB and SQLite, zip of the backup paths) kept on the
+  runner's server and restored through the agent.
+- Presets "Hosting: static site or built files" and "Hosting: PHP website"; new site states "not connected" and
+  "hosting not answering"; guide `docs/HOSTING.md`.
+
 ## [1.3.0] — 2026-11-02
 
 ### Added

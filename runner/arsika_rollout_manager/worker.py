@@ -10,6 +10,7 @@ from . import __version__, system
 from .backup import BackupError
 from .deploy import DeployError
 from .github import GitHubError
+from .hosting import Hosting
 from .joblog import JobLog
 from .util import exists, now, remove
 
@@ -28,6 +29,7 @@ class Worker(object):
         self.stopping = False
         self.thread = None
         self.on_restart = None                                       # set by serve(): stops the service (systemd restarts it)
+        self.hosting = Hosting(config, store, deployer)               # sites on a hosting without a terminal
 
     def log_path(self, job_id):
         return self.config.state_path("logs", "%d.log" % int(job_id))
@@ -81,11 +83,13 @@ class Worker(object):
                 log.error(line)
             outcome = {"status": "failed", "message": ("unexpected error: %s" % error)[:500]}
         finally:
-            if site is not None and job["type"] in ("deploy", "rollback"):
+            if site is not None and job["type"] in ("deploy", "rollback", "adopt"):
                 try:                                                     # also after a failed deployment (its release stays only if needed)
-                    self.deployer.prune(site, log)
+                    self.ops(site).prune(site, log)
                 except Exception as error:
                     log.error("cleaning up old releases failed: %s" % error)
+            if site is not None and self.hosting.is_hosting(site):
+                self.hosting.forget_cache(site)
             log.close()
             if outcome:                                                  # the job ends after its clean-up (and its last log line)
                 self.store.update_job(job_id, finished_at=now(), **outcome)
@@ -105,20 +109,33 @@ class Worker(object):
             self.on_restart()
         return True
 
+    def ops(self, site):
+        """What installs the site: the deployer (this server) or the agent of its hosting."""
+        return self.hosting if self.hosting.is_hosting(site) else self.deployer
+
     # ---------- job types ----------
     def job_deploy(self, job, site, log):
-        before, after = self.deployer.deploy(job, site, log)
+        before, after = self.ops(site).deploy(job, site, log)
         return before, after, "deployed %s%s" % (after, " (was %s)" % before if before and before != after else "")
 
     def job_rollback(self, job, site, log):
-        before, after = self.deployer.rollback(job, site, log)
+        before, after = self.ops(site).rollback(job, site, log)
         return before, after, "rolled back from %s to %s" % (before, after)
 
     def job_adopt(self, job, site, log):
-        before, after = self.deployer.adopt(job, site, log)
+        if self.hosting.is_hosting(site):
+            before, after = self.hosting.deploy(job, site, log, adopt=True)
+        else:
+            before, after = self.deployer.adopt(job, site, log)
         return before, after, "adopted the existing installation as release %s" % after
 
     def job_backup(self, job, site, log):
+        if self.hosting.is_hosting(site):
+            version = self.hosting.current_version(site)
+            backup_id = self.hosting.backup(site, version, job["params"].get("reason") or "manual backup", log, job["id"])
+            if not backup_id:
+                raise BackupError("nothing to back up: set the database (environment file) or the backup paths of the site")
+            return version, version, "backup " + backup_id
         version = self.deployer.current_version(site)
         # before an adoption the data is still in the site folder itself (shared/ does not exist yet)
         base = site["path"] if self.deployer.state(site) == "classic" else None
@@ -132,6 +149,15 @@ class Worker(object):
         backup_id = str(job["params"].get("backup_id", ""))
         if not self.store.backup(site["id"], backup_id):
             raise BackupError("backup %s not found" % backup_id)
+        if self.hosting.is_hosting(site):
+            version = self.hosting.current_version(site)
+            if job["params"].get("safety_backup", True):
+                self.hosting.backup(site, version, "before restoring " + backup_id, log, job["id"])
+            replaced = self.hosting.restore(site, backup_id, log)
+            if not self.deployer.healthy(site, version, log):
+                raise DeployError("data restored, but the health check failed; the replaced files are kept on the hosting in %s" % replaced)
+            self.hosting.clear_replaced(site, replaced)
+            return version, version, "restored backup " + backup_id
         version = self.deployer.current_version(site)
         if job["params"].get("safety_backup", True):
             self.backups.create(site, version, "before restoring " + backup_id, log, job["id"])
@@ -144,7 +170,7 @@ class Worker(object):
         return version, version, "restored backup " + backup_id
 
     def job_delete_release(self, job, site, log):
-        self.deployer.delete_release(site, job["version"], log)
+        self.ops(site).delete_release(site, job["version"], log)
         return None, None, "deleted release " + job["version"]
 
     def job_self_update(self, job, site, log):
@@ -152,5 +178,5 @@ class Worker(object):
         return __version__, job["version"], "runner %s installed; it restarts with the new code now" % job["version"]
 
     def job_cleanup_adopt(self, job, site, log):
-        self.deployer.delete_pre_rollout(site, log)
+        self.ops(site).delete_pre_rollout(site, log)
         return None, None, "deleted the files of the installation before Arsika Rollout Manager (_pre_rollout)"

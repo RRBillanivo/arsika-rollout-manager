@@ -51,6 +51,7 @@ function card(site, showServer) {
     <div class="site-card__meta">
       ${showServer && site.server ? serverBadge(site.server) : ''}
       ${site.deploy_mode === 'compose' ? `<span class="badge badge--failed">${icon('layers')}Compose</span>` : ''}
+      ${site.deploy_mode === 'hosting' ? `<span class="badge badge--failed">${icon('upload-cloud')}Hosting</span>` : ''}
       ${site.state !== 'ready' ? stateBadge(site.state) : ''}
       ${services.map(([name, state]) => `<span class="badge ${state === 'active' ? 'badge--normal' : state === 'unknown' ? 'badge--failed' : 'badge--danger'}">${esc(name)}: ${esc(state)}</span>`).join('')}
     </div>

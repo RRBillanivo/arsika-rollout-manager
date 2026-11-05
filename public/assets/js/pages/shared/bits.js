@@ -4,7 +4,8 @@ import { lang, t } from '../../core/i18n.js';
 import { esc, formDialog, icon, toast } from '../../core/ui.js';
 
 const JOB_STATUS = { queued: 'badge--yellow', running: 'badge--admin', succeeded: 'badge--normal', failed: 'badge--danger' };
-const STATE = { ready: 'badge--normal', classic: 'badge--yellow', empty: 'badge--failed', missing: 'badge--danger' };
+const STATE = { ready: 'badge--normal', classic: 'badge--yellow', empty: 'badge--failed', missing: 'badge--danger', unpaired: 'badge--yellow',
+  unreachable: 'badge--danger' };
 
 export const jobType = (type) => t('jobs.types.' + type);
 

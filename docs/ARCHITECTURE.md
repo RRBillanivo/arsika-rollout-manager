@@ -19,6 +19,10 @@ the dashboard. The overview asks all runners at the same time (`curl_multi`), so
 connection timeout and does not hide the others. Job numbers count per runner, so job pages are addressed through
 their site (`/sites/{site}/jobs/{job}`).
 
+A site on a **hosting without a terminal** (`deploy_mode` `hosting`) belongs to a runner too (normally the one of the
+dashboard's server), but its files live on the hosting: the runner drives a generated PHP agent there with signed
+requests (upload in pieces, unpack, migrate, swap, back up, in short steps). See [HOSTING.md](HOSTING.md).
+
 ## Site layout
 
 ```

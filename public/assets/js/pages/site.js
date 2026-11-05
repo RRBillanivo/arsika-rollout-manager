@@ -1,6 +1,6 @@
 // Site details: status, quick actions (health check, rollback, backup) and the tabs Versions, History, Backups, Settings.
-import { del, get, put } from '../core/api.js';
-import { t } from '../core/i18n.js';
+import { del, get, post, put } from '../core/api.js';
+import { t, tList } from '../core/i18n.js';
 import { attachPasswordToggles, clearErrors, duration, esc, formatBytes, formatDate, formatDateTime, icon, showErrors, toast } from '../core/ui.js';
 import { actionDialog, checkbox, healthBadge, jobStatusBadge, jobType, localizeFields, passwordField, startJob, stateBadge, versionPill } from './shared/bits.js';
 import { attachSiteForm, readSiteForm, siteFormHtml } from './shared/site-form.js';
@@ -18,9 +18,11 @@ function header(site) {
       <p class="site-header__links">
         ${site.domain ? `<a href="https://${esc(site.domain)}" target="_blank" rel="noopener">${icon('globe')}${esc(site.domain)}</a>` : ''}
         <a href="https://github.com/${esc(site.repo)}" target="_blank" rel="noopener">${icon('github')}${esc(site.repo)}</a>
-        <span class="mono small">${icon('folder')}${esc(site.path)}</span></p>
+        ${site.path ? `<span class="mono small">${icon('folder')}${esc(site.path)}</span>` : ''}
+        ${site.hosting && site.hosting.url ? `<span class="mono small">${icon('external-link')}${esc(site.hosting.url)}</span>` : ''}</p>
       <div class="badge-row">${site.server && !site.server.local ? serverBadge(site.server) : ''} ${stateBadge(site.state)} ${healthBadge(site.health)} ${versionPill(site.current_version, 'current')}
         ${site.deploy_mode === 'compose' ? `<span class="badge badge--failed">${icon('layers')}Docker Compose</span>` : ''}
+        ${site.deploy_mode === 'hosting' ? `<span class="badge badge--server">${icon('upload-cloud')}Hosting</span>` : ''}
         ${site.disk ? `<span class="small muted">${icon('hard-drive')}${d('disk', { free: formatBytes(site.disk.free), total: formatBytes(site.disk.total) })}</span>` : ''}</div>
     </div>
     <div class="site-header__actions">
@@ -29,10 +31,41 @@ function header(site) {
       ${ready || site.state === 'classic' ? `<button type="button" class="btn btn--outline btn--small" data-backup ${busy ? 'disabled' : ''}>${icon('archive')}${d('backup_now')}</button>` : ''}
     </div>
   </header>
-  ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' ? 'red' : 'yellow'}">${icon('info')}<div>${t('sites.state.' + site.state + '_hint')}</div></div>` : ''}
+  ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' || site.state === 'unreachable' ? 'red' : 'yellow'}">${icon('info')}<div>${t('sites.state.' + site.state + '_hint')}
+    ${site.state === 'unreachable' && site.hosting && site.hosting.error ? `<br><small>${esc(site.hosting.error)}</small>` : ''}</div></div>` : ''}
+  ${site.deploy_mode === 'hosting' && site.state === 'unpaired' ? connectCard() : ''}
   ${busy ? `<div class="box box--blue">${icon('activity')}<div>${t('jobs.in_progress')} ${jobStatusBadge(site.active_job.status)}
     <a href="#/sites/${esc(site.id)}/jobs/${site.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}`;
 }
+
+/** Hosting site that is not connected: get the agent file, upload it, open it (the page waits for the connection). */
+function connectCard() {
+  const hs = (key, params) => t('sites.hosting.' + key, params);
+  return `<section class="card connect-card"><h2 class="card__title">${icon('upload-cloud')}${hs('title')}</h2><p>${hs('lead')}</p>
+    <ol class="bullet-list">${tList('sites.hosting.steps').map((x) => `<li>${x}</li>`).join('')}</ol>
+    <div class="action-row"><button type="button" class="btn btn--primary" data-agent-file>${icon('download')}${hs('download')}</button>
+      <span class="small muted live-note">${icon('refresh')}${hs('waiting')}</span></div></section>`;
+}
+
+/** The database changes a release brings to a hosting site, and how to apply them (adoption: they are there already). */
+async function dbChanges(site, version, adopt) {
+  if (site.deploy_mode !== 'hosting') return '';
+  const v = (key, params) => t('sites.versions.' + key, params);
+  let plan;
+  try {
+    plan = (await get(`sites/${site.id}/plan?version=${encodeURIComponent(version)}`)).data;
+  } catch (error) {
+    return `<div class="box box--yellow">${icon('alert')}<div>${esc(error.message)}</div></div>`;
+  }
+  if (!plan.migrations.length) return `<p class="small muted">${icon('database')} ${v('db_none')}</p>`;
+  return `<div class="db-changes"><p><b>${icon('database')} ${v('db_title', { n: plan.migrations.length, folder: plan.folder })}</b></p>
+    ${plan.migrations.map((m) => `<details class="release__notes"><summary class="mono">${esc(m.name)}${m.status === 'changed' ? ` · <span class="text-warning">${v('db_changed')}</span>` : ''}</summary>
+      <pre>${esc(m.sql)}${m.truncated ? '\n…' : ''}</pre></details>`).join('')}
+    <label class="checkbox"><input type="radio" name="migrations" value="auto" ${adopt ? '' : 'checked'}><span>${v('db_auto')}</span></label>
+    <label class="checkbox"><input type="radio" name="migrations" value="manual" ${adopt ? 'checked' : ''}><span>${v(adopt ? 'db_manual_adopt' : 'db_manual')}</span></label></div>`;
+}
+
+const migrationsChoice = (form) => (form.elements.migrations ? form.elements.migrations.value : undefined);
 
 // ---------- Versions ----------
 function releaseItem(site, release) {
@@ -42,7 +75,7 @@ function releaseItem(site, release) {
     release.installed && !release.current ? `<span class="badge badge--admin">${icon('hard-drive')}${v('installed')}</span>` : '',
     release.prerelease ? '<span class="badge badge--yellow">pre-release</span>' : ''].join('');
   let actions = '';
-  if (site.state === 'classic' || busy) {
+  if (site.state === 'classic' || site.state === 'unpaired' || site.state === 'unreachable' || busy) {
     actions = '';
   } else if (release.current) {
     actions = '';
@@ -72,7 +105,7 @@ async function versionsTab(container, site, isCurrent, refresh = false) {
   const withAsset = releases.filter((r) => r.asset);
   container.innerHTML = `
   ${site.state === 'classic' ? `<section class="card adopt-card">
-    <h2 class="card__title">${icon('package')}${t('sites.adopt.title')}</h2><p>${t('sites.adopt.text')}</p>
+    <h2 class="card__title">${icon('package')}${t('sites.adopt.title')}</h2><p>${t(site.deploy_mode === 'hosting' ? 'sites.adopt.text_hosting' : 'sites.adopt.text')}</p>
     <label class="field"><span class="field__label">${t('sites.adopt.version')}</span>
       <select name="adopt_version">${withAsset.map((r) => `<option value="${esc(r.version)}">${esc(r.version)} — ${esc(r.name || r.tag)}</option>`).join('')}</select>
       <span class="field__help">${t('sites.adopt.version_help')}</span></label>
@@ -208,10 +241,30 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
     }
     if ('refreshReleases' in d) { await versionsTab(container, site, isCurrent, true); return; }
     if (d.deploy) {
+      target.disabled = true;
+      const changes = await dbChanges(site, d.deploy, false);
+      target.disabled = false;
       await actionDialog({ title: v('deploy_title', { version: d.deploy }), message: v('deploy_text', { version: d.deploy }),
-        extra: site.state === 'ready' ? checkbox('backup', v('deploy_backup'), site.settings.backup_before_deploy) : '',
+        extra: changes + (site.state === 'ready' ? checkbox('backup', v('deploy_backup'), site.settings.backup_before_deploy) : ''),
         submitLabel: v('deploy_submit'),
-        onSubmit: job((form) => ({ type: 'deploy', version: d.deploy, params: { backup: form.elements.backup ? form.elements.backup.checked : false } })) });
+        onSubmit: job((form) => ({ type: 'deploy', version: d.deploy,
+          params: { backup: form.elements.backup ? form.elements.backup.checked : false, migrations: migrationsChoice(form) } })) });
+      return;
+    }
+    if ('agentFile' in d) {
+      const hs = (key, params) => t('sites.hosting.' + key, params);
+      const file = await actionDialog({ title: hs('download_title'), message: hs('download_text'), password: true, submitLabel: hs('download'),
+        onSubmit: async (form) => (await post(`sites/${site.id}/agent-file`, { password: form.elements.password.value })).data });
+      if (file) {
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(new Blob([file.content], { type: 'application/octet-stream' }));
+        link.download = file.filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+        toast(hs('downloaded', { name: file.filename }), 'success', 9000);
+      }
       return;
     }
     if (d.activate || d.rollback) {
@@ -227,9 +280,12 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
     }
     if ('adopt' in d) {
       const version = main.querySelector('[name=adopt_version]').value;
-      await actionDialog({ title: t('sites.adopt.confirm_title', { version }), message: t('sites.adopt.text'),
-        extra: checkbox('backup', t('sites.adopt.backup'), true), password: true, submitLabel: t('sites.adopt.submit'),
-        onSubmit: job((form) => ({ type: 'adopt', version, params: { backup: form.elements.backup.checked } })) });
+      target.disabled = true;
+      const changes = await dbChanges(site, version, true);
+      target.disabled = false;
+      await actionDialog({ title: t('sites.adopt.confirm_title', { version }), message: t(site.deploy_mode === 'hosting' ? 'sites.adopt.text_hosting' : 'sites.adopt.text'),
+        extra: changes + checkbox('backup', t('sites.adopt.backup'), true), password: true, submitLabel: t('sites.adopt.submit'),
+        onSubmit: job((form) => ({ type: 'adopt', version, params: { backup: form.elements.backup.checked, migrations: migrationsChoice(form) } })) });
       return;
     }
     if ('cleanup' in d) {
@@ -263,5 +319,15 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
     }
   };
   main.addEventListener('click', onClick);
-  return () => main.removeEventListener('click', onClick);
+  let waiting = null;
+  if (site.deploy_mode === 'hosting' && site.state === 'unpaired') {       // the agent's "Connect" button finishes elsewhere
+    waiting = setInterval(async () => {
+      if (document.hidden || document.querySelector('.overlay')) return;
+      try {
+        const { data } = await get('sites/' + site.id);
+        if (data.state !== 'unpaired' && isCurrent()) app.reloadPage();
+      } catch (e) { /* try again */ }
+    }, 5000);
+  }
+  return () => { main.removeEventListener('click', onClick); if (waiting) clearInterval(waiting); };
 }

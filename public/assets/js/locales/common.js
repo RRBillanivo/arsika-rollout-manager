@@ -8,7 +8,7 @@ export default {
     footer: 'Arsika Rollout Manager {version} · Copyright © {year} Arsika.My.Id',
     home_label: 'Arsika Rollout Manager, beranda',
     titles: {
-      login: 'Masuk', overview: 'Situs', site_new: 'Tambah situs', site: 'Situs', job: 'Log job', settings: 'Pengaturan', servers: 'Server',
+      login: 'Masuk', overview: 'Situs', site_new: 'Tambah situs', site: 'Situs', job: 'Log job', settings: 'Pengaturan', servers: 'Server', connect: 'Hubungkan hosting',
       activity: 'Log aktivitas', not_found: 'Tidak ditemukan',
     },
     menu: { main: 'Menu utama', overview: 'Situs', servers: 'Server', activity: 'Aktivitas', settings: 'Pengaturan' },
@@ -53,7 +53,7 @@ export default {
     footer: 'Arsika Rollout Manager {version} · Copyright © {year} Arsika.My.Id',
     home_label: 'Arsika Rollout Manager, home',
     titles: {
-      login: 'Sign in', overview: 'Sites', site_new: 'Add site', site: 'Site', job: 'Job log', settings: 'Settings', servers: 'Servers',
+      login: 'Sign in', overview: 'Sites', site_new: 'Add site', site: 'Site', job: 'Job log', settings: 'Settings', servers: 'Servers', connect: 'Connect a hosting',
       activity: 'Activity log', not_found: 'Not found',
     },
     menu: { main: 'Main menu', overview: 'Sites', servers: 'Servers', activity: 'Activity', settings: 'Settings' },

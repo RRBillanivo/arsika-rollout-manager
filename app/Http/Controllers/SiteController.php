@@ -20,7 +20,8 @@ final class SiteController extends Controller
     const SITE_FIELDS = ['id', 'preset', 'name', 'domain', 'path', 'repo', 'asset_pattern', 'web_user', 'keep_releases', 'shared',
         'docroot_link', 'docroot_target', 'build', 'activate', 'services', 'reload_php_fpm', 'health_url', 'health_contains', 'health_local',
         'backup_before_deploy', 'backup_env_file', 'backup_paths', 'backup_exclude', 'backup_keep', 'adopt_keep',
-        'deploy_mode', 'source', 'compose_files', 'compose_project', 'compose_build', 'backup_db', 'backup_db_service', 'backup_volumes'];
+        'deploy_mode', 'source', 'compose_files', 'compose_project', 'compose_build', 'backup_db', 'backup_db_service', 'backup_volumes',
+        'migrations_dir'];
 
     /** @var Servers */
     private $servers;
@@ -152,6 +153,36 @@ final class SiteController extends Controller
         $this->audit($request, 'job_' . str_replace('-', '_', $type), 'site:' . $site,
             trim('#' . $job['id'] . ' ' . ($job['version'] ?? '') . (isset($params['backup_id']) ? ' ' . $params['backup_id'] : '')));
         return Response::json($job, 201);
+    }
+
+    /**
+     * POST /api/v1/sites/{site}/agent-file {password} — a new agent file for a hosting site (with a new one-time key;
+     * an earlier file that is not connected stops working). The file opens the dashboard at APP_URL to connect.
+     */
+    public function agentFile(Request $request, string $site): Response
+    {
+        $this->confirmPassword($request);
+        $file = $this->servers->clientForSite($site)->post('/v1/sites/' . $site . '/agent-file', ['dashboard' => (string)config('app.url', '')]);
+        $this->audit($request, 'agent_file', 'site:' . $site, (string)$file['filename']);
+        return Response::json($file);
+    }
+
+    /** POST /api/v1/sites/{site}/agent/connect {url, password} — connect the agent file uploaded to the hosting. */
+    public function connectAgent(Request $request, string $site): Response
+    {
+        $this->confirmPassword($request);
+        $url = $request->string('url', 500);
+        $key = $this->servers->serverOf($site);
+        $details = $this->servers->client($key)->post('/v1/sites/' . $site . '/agent/connect', ['url' => $url]);
+        $this->audit($request, 'agent_connected', 'site:' . $site, $url);
+        return Response::json((array)$details + ['server' => $this->badge($this->servers->get($key))]);
+    }
+
+    /** GET /api/v1/sites/{site}/plan?version= — the database changes a release brings to a hosting site. */
+    public function plan(Request $request, string $site): Response
+    {
+        $version = (string)$request->query('version', '');
+        return Response::json($this->servers->clientForSite($site)->get('/v1/sites/' . $site . '/plan?' . http_build_query(['version' => $version])));
     }
 
     /** GET /api/v1/sites/{site}/backups */

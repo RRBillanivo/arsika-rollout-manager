@@ -16,6 +16,8 @@
     web_user          default owner of the release files of new sites (aaPanel: www; Debian/Ubuntu: www-data)
     platform          aapanel or linux (detected by install.sh)
     docker_command    command that runs Docker (changed only by the tests)
+    agent_keys        one-time key of the agent file of each hosting site (until it is connected)
+    agent_secrets     secret of each connected hosting agent, by site id (never shown again)
     update_repo       GitHub repository of Arsika Rollout Manager itself, for "Update runner" (a fork may change it)
     update_asset      file name pattern of its release zip
 """
@@ -46,6 +48,8 @@ DEFAULTS = {
     "web_user": "www",
     "platform": "",
     "docker_command": ["docker"],
+    "agent_keys": {},
+    "agent_secrets": {},
     "update_repo": "RRBillanivo/arsika-rollout-manager",
     "update_asset": "arsika-rollout-manager-v*.zip",
     "health_attempts": 10,
@@ -120,6 +124,19 @@ class Config(object):
             else:
                 tokens.pop(site_id, None)
             self.update(site_tokens=tokens)
+
+    # ---------- secrets of hosting agents (same rules as the tokens: write-only, per site) ----------
+    def secret_of(self, kind, site_id):
+        return (self.values.get(kind) or {}).get(site_id, "")
+
+    def set_secret_of(self, kind, site_id, value):
+        with self.lock:
+            values = dict(self.values.get(kind) or {})
+            if value:
+                values[site_id] = value
+            else:
+                values.pop(site_id, None)
+            self.update(**{kind: values})
 
     def migrate_legacy_token(self, site_ids):
         """Version 1.0.0 kept one GitHub token for every site. Since 1.1.0 each site has its own: the old token is given

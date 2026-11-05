@@ -13,12 +13,14 @@ import * as jobPage from './pages/job.js';
 import * as settingsPage from './pages/settings.js';
 import * as activityPage from './pages/activity.js';
 import * as serversPage from './pages/servers.js';
+import * as connectPage from './pages/connect.js';
 
 // access: guest (signed out only) or auth; title = key in common.titles; menu = key in common.menu
 const router = new Router([
   { pattern: /^\/login$/, page: loginPage, access: 'guest', menu: '', title: 'login' },
   { pattern: /^\/$/, page: overviewPage, access: 'auth', menu: 'overview', title: 'overview' },
   { pattern: /^\/sites\/new$/, page: siteNewPage, access: 'auth', menu: 'overview', title: 'site_new' },
+  { pattern: /^\/sites\/([a-z0-9][a-z0-9-]{0,39})\/connect(?:\?.*)?$/, page: connectPage, access: 'auth', menu: 'overview', title: 'connect' },
   { pattern: /^\/sites\/([a-z0-9][a-z0-9-]{0,39})(?:\/(versions|history|backups|settings))?$/, page: sitePage, access: 'auth', menu: 'overview', title: 'site' },
   { pattern: /^\/(sites)\/([a-z0-9][a-z0-9-]{0,39})\/jobs\/(\d+)$/, page: jobPage, access: 'auth', menu: 'overview', title: 'job' },
   { pattern: /^\/(servers)\/(\d+)\/jobs\/(\d+)$/, page: jobPage, access: 'auth', menu: 'servers', title: 'job' },
@@ -233,7 +235,19 @@ function installNotice() {
   toast(t('common.toast.installed'), 'success', 9000);
 }
 
+/**
+ * The agent page of a hosting links to ?connect=<site>&agent=<address> (a query survives a sign-in in front of the
+ * dashboard, e.g. Cloudflare Access, where a #fragment would be lost): open its confirmation page.
+ */
+function connectLink() {
+  const params = new URLSearchParams(location.search);
+  const site = params.get('connect') || '';
+  if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(site) || !params.get('agent')) return;
+  history.replaceState(null, '', location.pathname + `#/sites/${site}/connect?agent=${encodeURIComponent(params.get('agent'))}`);
+}
+
 async function start() {
+  connectLink();
   redrawTheme = setupThemeToggle(document.getElementById('theme-toggle'));
   setupLanguageToggle();
   renderStaticTexts();

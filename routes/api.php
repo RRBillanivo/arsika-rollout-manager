@@ -43,6 +43,9 @@ return static function (Router $router): void {
             $router->get('/sites/{site}/backups', [SiteController::class, 'backups']);
             $router->delete('/sites/{site}/backups/{backup}', [SiteController::class, 'destroyBackup']);
             $router->get('/sites/{site}/jobs/{job}', [JobController::class, 'forSite']);
+            $router->post('/sites/{site}/agent-file', [SiteController::class, 'agentFile']);
+            $router->post('/sites/{site}/agent/connect', [SiteController::class, 'connectAgent']);
+            $router->get('/sites/{site}/plan', [SiteController::class, 'plan']);
 
             $router->get('/jobs', [JobController::class, 'index']);
             $router->get('/jobs/{job}', [JobController::class, 'show']);

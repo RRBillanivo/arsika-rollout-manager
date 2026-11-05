@@ -15,7 +15,9 @@
 
 ## Adding a site
 
-**Sites → Add site**: choose the server (when the dashboard controls more than one) and the kind of site:
+**Sites → Add site**: first **where the website runs**: a *full server* (VPS / VM with the runner) or a *hosting* with
+only a file manager (a PHP agent file, see [HOSTING.md](HOSTING.md)). Then the server (when the dashboard controls more
+than one) and the kind of site:
 
 | Preset | Runs as | Source | Shared | Document root | Hooks / health check |
 |---|---|---|---|---|---|
@@ -24,6 +26,8 @@
 | Static site | files | asset | – | `public` → `current` | `https://{domain}/` |
 | Docker Compose: build | compose | source code | `.env` | – | images built from the release; `https://{domain}/` |
 | Docker Compose: images | compose | source code | `.env` | – | images pulled from a registry; `https://{domain}/` |
+| Hosting: static site or built files | hosting | asset | – | release folder `.` or e.g. `dist` | no database |
+| Hosting: PHP website | hosting | asset | `.env` | release folder `.` | database changes from `database/migrations/*.sql` |
 | Arsika Rollout Manager (this dashboard) | files | asset `arsika-rollout-manager-v*.zip` | `.env`, `storage/` | `public` → `current/public` | `preset:rollout-manager` (see [below](#arsika-rollout-manager-itself)); `http://{domain}/api/v1/app` checked on this server |
 
 Then fill in the domain (a folder in the server's site folder is suggested), the repository (`owner/name`) and, for a

@@ -199,12 +199,14 @@ admin_link() {   # admin_link [--if-no-admin]
 install_runner_code() {
     info "Installing the runner in $RUNNER_DIR"
     mkdir -p "$RUNNER_DIR"
-    rm -rf "$RUNNER_DIR/arsika_rollout_manager.new" "$RUNNER_DIR/presets.new"
+    rm -rf "$RUNNER_DIR/arsika_rollout_manager.new" "$RUNNER_DIR/presets.new" "$RUNNER_DIR/agent.new"
     cp -r runner/arsika_rollout_manager "$RUNNER_DIR/arsika_rollout_manager.new"
     cp -r runner/presets "$RUNNER_DIR/presets.new"
-    rm -rf "$RUNNER_DIR/arsika_rollout_manager" "$RUNNER_DIR/presets"
+    cp -r runner/agent "$RUNNER_DIR/agent.new"                  # template of the PHP agent for hosting sites
+    rm -rf "$RUNNER_DIR/arsika_rollout_manager" "$RUNNER_DIR/presets" "$RUNNER_DIR/agent"
     mv "$RUNNER_DIR/arsika_rollout_manager.new" "$RUNNER_DIR/arsika_rollout_manager"
     mv "$RUNNER_DIR/presets.new" "$RUNNER_DIR/presets"
+    mv "$RUNNER_DIR/agent.new" "$RUNNER_DIR/agent"
     find "$RUNNER_DIR" -name '__pycache__' -prune -exec rm -rf {} +
     chown -R root:root "$RUNNER_DIR"
     chmod -R u=rwX,go=rX "$RUNNER_DIR"
@@ -301,7 +303,7 @@ EOF
 # ---------- 0) checks ----------
 [ "$(uname -s)" = "Linux" ] || fail "This script is for Linux servers."
 [ "$(id -u)" = "0" ] || fail "Run as root (type: sudo -i, then repeat)."
-for f in runner/arsika_rollout_manager/__main__.py runner/presets/anemia-web.sh; do
+for f in runner/arsika_rollout_manager/__main__.py runner/presets/anemia-web.sh runner/agent/rollout-agent.php; do
     [ -f "$f" ] || fail "Missing $f. Run this from the folder of the release (now: $WEB_DIR) and make sure the upload is complete."
 done
 PYTHON="$(find_python || true)"

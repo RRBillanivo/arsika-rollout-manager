@@ -53,6 +53,19 @@ DEFAULTS = {
     "backup_db": "auto",
     "backup_db_service": "",
     "backup_volumes": [],
+    "agent_url": "",
+    "migrations_dir": "database/migrations",
+}
+
+HOSTING = {
+    "deploy_mode": "hosting",
+    "web_user": "",
+    "docroot_link": "",
+    "docroot_target": ".",
+    "reload_php_fpm": False,
+    "keep_releases": 2,
+    "health_url": "https://{domain}/",
+    "adopt_keep": [".well-known", "cgi-bin", ".user.ini"],
 }
 
 COMPOSE = {
@@ -108,6 +121,10 @@ PRESETS = {
     },
     "compose-build": dict(COMPOSE, label="Docker Compose: build the images from the release", compose_build=True),
     "compose-images": dict(COMPOSE, label="Docker Compose: pull ready-made images", compose_build=False),
+    "hosting-static": dict(HOSTING, label="Hosting: static site or built files (HTML, CSS, JS, dist/)", shared=[], backup_paths=[],
+                           backup_db="none"),
+    "hosting-php": dict(HOSTING, label="Hosting: PHP website (.env and database)", shared=[".env"], backup_env_file=".env",
+                        backup_paths=[".env"]),
     "rollout-manager": {
         "label": "Arsika Rollout Manager (this dashboard: updates itself and the runner of this server)",
         "repo": "RRBillanivo/arsika-rollout-manager",
@@ -131,7 +148,7 @@ DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]
 LIST_FIELDS = ("shared", "services", "backup_paths", "backup_exclude", "adopt_keep", "compose_files", "backup_volumes")
 BOOL_FIELDS = ("reload_php_fpm", "backup_before_deploy", "compose_build", "health_local")
 HOOK_FIELDS = ("build", "activate")
-CHOICES = {"deploy_mode": ("files", "compose"), "source": ("asset", "source"), "backup_db": ("auto", "mysql", "postgres", "none")}
+CHOICES = {"deploy_mode": ("files", "compose", "hosting"), "source": ("asset", "source"), "backup_db": ("auto", "mysql", "postgres", "none")}
 PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 CONTAINER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -178,11 +195,14 @@ def validate(data, site_roots, existing=None):
     if site["domain"] and not DOMAIN.match(site["domain"]):
         errors["domain"] = "Not a valid domain name."
 
+    hosting = str(site.get("deploy_mode") or "") == "hosting"
     path = os.path.normpath(str(site["path"]).strip()) if str(site["path"]).strip() else ""
     site["path"] = path.replace("\\", "/") if os.name != "posix" else path
     roots = [os.path.normpath(r) for r in site_roots]
     inside = any(os.path.normcase(path).startswith(os.path.normcase(r) + os.sep) for r in roots)
-    if not path or not os.path.isabs(path):
+    if hosting:
+        site["path"] = str(site["path"])[:300]                       # the folder on the hosting, reported by its agent
+    elif not path or not os.path.isabs(path):
         errors["path"] = "Absolute path of the site folder, e.g. /www/wwwroot/example.com."
     elif not inside:
         errors["path"] = "The site folder must be inside " + ", ".join(site_roots) + "."
@@ -260,6 +280,12 @@ def validate(data, site_roots, existing=None):
         errors["backup_volumes"] = "Volume names only: " + ", ".join(bad[:3])
     if site["deploy_mode"] == "compose" and site["reload_php_fpm"]:
         site["reload_php_fpm"] = False                               # the containers serve the site
+    site["migrations_dir"] = str(site["migrations_dir"] or "database/migrations").strip().strip("/")
+    if not RELATIVE.match(site["migrations_dir"]):
+        errors["migrations_dir"] = "Folder inside the release, e.g. database/migrations."
+    site["agent_url"] = str(site["agent_url"] or "").strip()
+    if site["deploy_mode"] == "hosting":
+        site["reload_php_fpm"], site["services"], site["build"], site["activate"] = False, [], "", ""
     return site, errors
 
 

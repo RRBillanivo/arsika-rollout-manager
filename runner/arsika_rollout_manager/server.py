@@ -114,6 +114,9 @@ class Api(object):
         ("GET", r"/v1/jobs$", "jobs"),
         ("GET", r"/v1/jobs/(?P<job>\d+)$", "job"),
         ("POST", r"/v1/runner/update$", "update_runner"),
+        ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent-file$", "agent_file"),
+        ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent/connect$", "agent_connect"),
+        ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/plan$", "plan"),
     ]
 
     def __init__(self, config, store, deployer, worker):
@@ -121,6 +124,7 @@ class Api(object):
         self.store = store
         self.deployer = deployer
         self.worker = worker
+        self.hosting = getattr(worker, "hosting", None)
         self.started = time.time()
         self.health_cache = {}
         self.github_clients = {}
@@ -191,6 +195,10 @@ class Api(object):
     def site_github(self, site):
         return self.github(self.config.site_token(site["id"]))
 
+    def ops(self, site):
+        """What installs a site: the deployer (this server) or the agent of its hosting."""
+        return self.hosting if self.hosting is not None and self.hosting.is_hosting(site) else self.deployer
+
     def get_site(self, site_id):
         site = self.store.site(site_id)
         if site is None:
@@ -200,7 +208,7 @@ class Api(object):
     def site_health(self, site, refresh=False):
         if not site.get("health_url"):
             return None
-        version = self.deployer.current_version(site) or ""
+        version = self.ops(site).current_version(site) or ""
         cached = self.health_cache.get(site["id"])
         if cached and not refresh and time.time() - cached[0] < 30 and cached[2] == version:
             return cached[1]
@@ -214,9 +222,9 @@ class Api(object):
         return result
 
     def summary(self, site, with_health=True, with_latest=True):
-        lay = layout(site)
-        current = self.deployer.current_version(site)
-        installed = self.deployer.installed(site) if os.path.isdir(lay["releases"]) else []
+        ops = self.ops(site)
+        current = ops.current_version(site)
+        installed = ops.installed(site) if ops is not self.deployer or os.path.isdir(layout(site)["releases"]) else []
         latest, latest_error = None, ""
         if with_latest and site.get("repo"):
             try:
@@ -228,10 +236,10 @@ class Api(object):
         active = self.store.active_job(site["id"])
         return {
             "id": site["id"], "name": site["name"], "domain": site["domain"], "repo": site["repo"], "path": site["path"],
-            "deploy_mode": site.get("deploy_mode", "files"), "state": self.deployer.state(site), "current_version": current, "installed": [r["version"] for r in installed],
+            "deploy_mode": site.get("deploy_mode", "files"), "state": ops.state(site), "current_version": current, "installed": [r["version"] for r in installed],
             "latest_version": latest, "latest_error": latest_error,
             "update_available": bool(latest and current and latest != current and version_key(latest) > version_key(current)),
-            "rollback_version": self.deployer.rollback_target(site),
+            "rollback_version": ops.rollback_target(site),
             "health": self.site_health(site) if with_health else None,
             "services": system.service_states(site.get("services", [])),
             "last_job": jobs[0] if jobs else None, "active_job": active,
@@ -284,6 +292,12 @@ class Api(object):
         details["settings"] = record
         token = self.config.site_token(record["id"])
         details["github_token_set"], details["github_token_hint"] = bool(token), token_hint(token)
+        if self.ops(record) is self.hosting:
+            details["releases_installed"] = self.hosting.installed(record)
+            details["pre_rollout"] = self.hosting.pre_rollout(record)
+            details["disk"] = None
+            details["hosting"] = self.hosting.details(record)
+            return details
         details["releases_installed"] = self.deployer.installed(record)
         details["pre_rollout"] = exists(lay["pre_rollout"])
         details["disk"] = system.disk_free(record["path"]) if os.path.isdir(record["path"]) else None
@@ -297,7 +311,8 @@ class Api(object):
         token = read_token(data, errors)
         if not errors and self.store.site(site["id"]):
             errors["id"] = "A site with this id already exists."
-        if not errors and any(s["path"] == site["path"] for s in self.store.sites()):
+        if not errors and site["deploy_mode"] != "hosting" and any(s["path"] == site["path"] and s.get("deploy_mode") != "hosting"
+                                                                    for s in self.store.sites()):
             errors["path"] = "Another site already uses this folder."
         if errors:
             raise ApiError(422, "validation_failed", "check the highlighted fields", errors)
@@ -310,8 +325,14 @@ class Api(object):
         record = self.get_site(site)
         updated, errors = validate(data, self.config.get("site_roots", ["/www/wwwroot"]), existing=record)
         token = read_token(data, errors)
-        installed = self.deployer.state(record) == "ready"
-        if not errors and updated["path"] != record["path"] and installed:
+        installed = self.ops(record).state(record) == "ready"
+        if not errors and record.get("deploy_mode") == "hosting":
+            updated["path"], updated["agent_url"] = record.get("path", ""), record.get("agent_url", "")   # set by the agent
+            if updated["deploy_mode"] != "hosting":
+                errors["deploy_mode"] = "A hosting site stays a hosting site (remove it and add it again)."
+        elif not errors and updated["deploy_mode"] == "hosting":
+            errors["deploy_mode"] = "Add a hosting site as a new site."
+        if not errors and updated["path"] != record["path"] and installed and record.get("deploy_mode") != "hosting":
             errors["path"] = "The folder of an installed site cannot be changed."
         if not errors and installed and record.get("compose_project") and updated["compose_project"] != record["compose_project"] \
                 and record.get("deploy_mode") == "compose":
@@ -329,14 +350,17 @@ class Api(object):
         self.get_site(site)
         if self.store.active_job(site):
             raise ApiError(409, "busy", "a job of this site is queued or running")
+        record = self.store.site(site)
+        if self.hosting is not None and self.hosting.is_hosting(record):
+            self.hosting.disconnect(record)
         self.store.delete_site(site)
         self.config.set_site_token(site, "")
         return {"deleted": site, "files_kept": True}
 
     def releases(self, site, query, data):
         record = self.get_site(site)
-        installed = {r["version"]: r for r in self.deployer.installed(record)}
-        current = self.deployer.current_version(record)
+        installed = {r["version"]: r for r in self.ops(record).installed(record)}
+        current = self.ops(record).current_version(record)
         try:
             remote = self.site_github(record).releases(record["repo"], release_pattern(record), refresh=query.get("refresh") == "1")
             error = ""
@@ -364,12 +388,17 @@ class Api(object):
         if job_type in ("deploy", "adopt", "delete-release") and not version:
             raise ApiError(422, "validation_failed", "version required", {"version": "Choose a version."})
         params = data.get("params") if isinstance(data.get("params"), dict) else {}
-        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason") if k in params}
+        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason", "migrations") if k in params}
+        if params.get("migrations") not in (None, "auto", "manual"):
+            raise ApiError(422, "validation_failed", "migrations: auto or manual", {"migrations": "Choose auto or manual."})
         if self.store.active_job(site):
             raise ApiError(409, "busy", "a job of this site is already queued or running")
         if job_type == "restore" and not self.store.backup(site, str(params.get("backup_id", ""))):
             raise ApiError(422, "validation_failed", "backup not found", {"backup_id": "Backup not found."})
-        state = self.deployer.state(record)
+        state = self.ops(record).state(record)
+        if state in ("unpaired", "unreachable"):
+            raise ApiError(409, "not_connected", "the hosting of this site is %s" % ("not connected yet" if state == "unpaired"
+                                                                                       else "not answering"))
         if job_type == "adopt" and state != "classic":
             raise ApiError(409, "not_classic", "nothing to adopt: the site folder is %s" % state)
         if job_type in ("deploy", "restore") and state == "classic":
@@ -401,6 +430,24 @@ class Api(object):
             raise ApiError(409, "busy", "a job is queued or running on this server; try again when it has finished")
         actor = str(data.get("actor") or "")[:80] or None
         return self.store.job(self.worker.submit(RUNNER_SITE, "self-update", version, {}, actor))
+
+    def hosting_site(self, site):
+        record = self.get_site(site)
+        if self.hosting is None or not self.hosting.is_hosting(record):
+            raise ApiError(409, "not_hosting", "site %s is not a hosting site" % site)
+        return record
+
+    def agent_file(self, site, query, data):
+        return self.hosting.agent_file(self.hosting_site(site), str(data.get("dashboard") or ""))
+
+    def agent_connect(self, site, query, data):
+        record = self.hosting_site(site)
+        self.hosting.connect(record, str(data.get("url") or ""))
+        self.health_cache.pop(site, None)
+        return self.site(site, query, {})
+
+    def plan(self, site, query, data):
+        return self.hosting.plan(self.hosting_site(site), str(query.get("version") or ""))
 
     def jobs(self, query, data):
         return self.store.jobs(query.get("site") or None, min(200, int(query.get("limit", 50) or 50)))

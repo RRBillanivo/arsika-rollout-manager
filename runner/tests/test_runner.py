@@ -14,7 +14,11 @@ runner code, Arsika Rollout Manager updating itself (preset rollout-manager) and
 Docker Compose sites (fake docker), installed from release source code archives: adoption of a compose installation
 made by hand (its project name is kept), version-tagged images, rollback without a rebuild, a bind mount outside the
 release, automatic rollback, database dumps inside the container (no password on the command line), volume backups and
-restore. HTTPS runner: public key pin (same as openssl computes it), wrong pin, plain HTTP refused."""
+restore. HTTPS runner: public key pin (same as openssl computes it), wrong pin, plain HTTP refused.
+Hosting without a terminal (PHP in PATH or ROLLOUT_TEST_PHP, ini ROLLOUT_TEST_PHP_INI; needs zip and pdo_sqlite): the
+generated agent file served by PHP's built-in server, connecting, adoption of files made by hand, database changes run
+or marked as done by hand, automatic rollback, rollback, backups kept on the runner and restore, a published subfolder,
+signatures, replays and unsafe archives refused."""
 import base64
 import hashlib
 import io
@@ -28,6 +32,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
@@ -40,6 +47,7 @@ from arsika_rollout_manager.client import Client, PinError  # noqa: E402
 from arsika_rollout_manager.compose import ComposeError  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
+from arsika_rollout_manager.hosting import AgentClient, AgentError  # noqa: E402
 from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
 from arsika_rollout_manager import system  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
@@ -48,6 +56,8 @@ from arsika_rollout_manager.worker import Worker  # noqa: E402
 
 SHELL = os.environ.get("ROLLOUT_TEST_SHELL") or shutil.which("bash") or "/bin/bash"
 OPENSSL = os.environ.get("ROLLOUT_TEST_OPENSSL") or shutil.which("openssl")
+PHP = os.environ.get("ROLLOUT_TEST_PHP") or shutil.which("php")
+PHP_INI = os.environ.get("ROLLOUT_TEST_PHP_INI") or ""
 FAKE_DOCKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_docker.py")
 SITE_TOKEN = "github_pat_" + "s" * 40                    # the demo site's own (fake) read-only token
 
@@ -845,6 +855,263 @@ class TlsTest(unittest.TestCase):
             json.dump({"listen": "0.0.0.0", "secret": "x"}, f)
         with self.assertRaises(ValueError):
             Config(path)
+
+
+def free_port():
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def php_server(folder):
+    port = free_port()
+    proc = subprocess.Popen([PHP] + (["-c", PHP_INI] if PHP_INI else []) + ["-S", "127.0.0.1:%d" % port, "-t", folder],
+                            cwd=folder, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(80):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=1).close()
+            break
+        except urllib.error.HTTPError as e:
+            e.close()
+            break
+        except Exception:
+            time.sleep(0.1)
+    return proc, port
+
+
+def hosting_files(version, page=None, migration=None, extra=None):
+    files = {"index.html": "<h1>%s</h1>" % version, "version.txt": page or ("version " + version), "uploads/.keep": "",
+             "database/migrations/001_create_notes.sql": "-- notes of the site\nCREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);\n"
+                                                         "INSERT INTO notes (body) VALUES ('first; with a semicolon');\n"}
+    if migration:
+        files["database/migrations/002_add_created.sql"] = migration
+    files.update(extra or {})
+    return files
+
+
+@unittest.skipUnless(PHP, "PHP is needed to run the hosting agent")
+class HostingTest(unittest.TestCase):
+    """A website on a "hosting": a folder served by PHP's built-in server that only the agent file changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-hosting-")
+        cls.home = os.path.join(cls.tmp, "home")
+        cls.docroot = os.path.join(cls.home, "public_html")
+        cls.db = os.path.join(cls.tmp, "site.sqlite").replace("\\", "/")
+        os.makedirs(os.path.join(cls.docroot, "uploads"))
+        os.makedirs(os.path.join(cls.docroot, ".well-known"))
+        for name, text in (("index.html", "old site made by hand"), ("version.txt", "old"), ("uploads/photo.txt", "photo"),
+                           (".htaccess", "# my own rules\n"), (".well-known/acme.txt", "acme"),
+                           (".env", "DB_CONNECTION=sqlite\nDB_DATABASE=%s\n" % cls.db)):
+            with open(os.path.join(cls.docroot, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        cls.github = FakeGitHub()
+        cls.github.publish("1.0.0", hosting_files("1.0.0"), repo="o/host")
+        cls.github.publish("1.1.0", hosting_files("1.1.0", migration="ALTER TABLE notes ADD COLUMN created TEXT;\n"), repo="o/host")
+        cls.github.publish("1.2.0", hosting_files("1.2.0", page="broken build"), repo="o/host")
+        cls.github.publish("1.3.0", hosting_files("1.3.0", extra={"../evil.txt": "x"}), repo="o/host")
+        cls.github.publish_source("o/spa", "2.0.0", {"src/app.js": "source", "dist/index.html": "spa 2.0.0", "dist/version.txt": "version 2.0.0"})
+        cls.github.publish_source("o/spa", "2.1.0", {"src/app.js": "source", "dist/index.html": "spa 2.1.0", "dist/version.txt": "version 2.1.0"})
+        cls.php, cls.port = php_server(cls.docroot)
+        config_path = os.path.join(cls.tmp, "etc", "runner.json")
+        os.makedirs(os.path.dirname(config_path))
+        cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
+                                   github_api="http://127.0.0.1:%d" % cls.github.port, site_roots=[cls.tmp], shell=SHELL, port=0,
+                                   health_attempts=2, health_delay=0.3)
+        cls.config.prepare_dirs()
+        store = Store(cls.config.state_path("runner.db"))
+        cls.deployer = Deployer(cls.config, store, Backups(cls.config, store))
+        cls.worker = Worker(cls.config, store, cls.deployer)
+        cls.worker.start()
+        cls.server = serve(Api(cls.config, store, cls.deployer, cls.worker))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.client = Client("http://127.0.0.1:%d" % cls.server.server_address[1], cls.config["secret"])
+
+    @classmethod
+    def tearDownClass(cls):
+        stop(cls.server, cls.github.server)
+        cls.worker.stopping = True
+        cls.worker.wake.set()
+        for proc in [cls.php] + getattr(cls, "extra_php", []):
+            proc.terminate()
+            proc.wait(10)
+        time.sleep(0.3)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    call = RunnerTest.call
+    wait_job = RunnerTest.wait_job
+
+    def job(self, job_type, version=None, params=None, expect="succeeded", site="shop"):
+        job = self.call("POST", "/v1/sites/%s/jobs" % site, {"type": job_type, "version": version, "params": params or {}, "actor": "test"})
+        return self.wait_job(job, expect)
+
+    def live(self, name):
+        with open(os.path.join(self.docroot, name), encoding="utf-8") as f:
+            return f.read()
+
+    def notes(self):
+        import sqlite3
+        with sqlite3.connect(self.db) as db:
+            return [r[0] for r in db.execute("SELECT body FROM notes ORDER BY id")], [r[1] for r in db.execute("PRAGMA table_info(notes)")]
+
+    def agent_url(self):
+        return "http://127.0.0.1:%d/%s" % (self.port, self.agent_name)
+
+    # ---------- tests (run in order) ----------
+    def test_00_register_and_download_the_agent(self):
+        created = self.call("POST", "/v1/sites", {
+            "preset": "hosting-php", "id": "shop", "domain": "shop.example.com", "repo": "o/host", "asset_pattern": "demo_v*.zip",
+            "shared": [".env", "uploads/"], "backup_paths": [".env", "uploads/"], "backup_env_file": ".env", "backup_db": "auto",
+            "health_url": "http://127.0.0.1:%d/version.txt" % self.port, "health_contains": "version {version}"})
+        self.assertEqual((created["state"], created["deploy_mode"], created["hosting"]["connected"]), ("unpaired", "hosting", False))
+        status, doc = self.client.post("/v1/sites/shop/jobs", {"type": "deploy", "version": "1.0.0"})
+        self.assertEqual((status, doc["error"]["code"]), (409, "not_connected"))
+        agent = self.call("POST", "/v1/sites/shop/agent-file", {"dashboard": "https://dash.example.com"})
+        self.assertIn("const RA_SITE = 'shop';", agent["content"])
+        self.assertNotIn("__RA_PAIRING_KEY__", agent["content"])
+        type(self).agent_name = agent["filename"]
+        with open(os.path.join(self.docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        with urllib.request.urlopen(self.agent_url(), timeout=10) as response:
+            page = response.read().decode("utf-8")
+        self.assertIn("https://dash.example.com/?connect=shop&amp;agent=" + urllib.parse.quote(self.agent_url(), safe=""), page)
+        self.assertNotIn(self.docroot, page)                                                   # no paths on the page
+
+    def test_01_connect(self):
+        status, doc = self.client.post("/v1/sites/shop/agent/connect", {"url": "http://example.com/" + self.agent_name})
+        self.assertEqual(status, 422)                                                          # plain http only on this machine
+        details = self.call("POST", "/v1/sites/shop/agent/connect", {"url": self.agent_url()})
+        self.assertEqual((details["state"], details["hosting"]["connected"], details["hosting"]["data_outside"]), ("classic", True, True))
+        self.assertTrue(os.path.isdir(os.path.join(self.home, ".rollout-agent-shop")))       # outside the website folder
+        status, doc = self.client.post("/v1/sites/shop/agent/connect", {"url": self.agent_url()})
+        self.assertIn("download the agent file first", doc["error"]["message"])               # the key works once
+        with self.assertRaises(AgentError) as error:
+            AgentClient(self.agent_url(), "0" * 64).call("status")
+        self.assertEqual(error.exception.code, "bad_signature")
+        with urllib.request.urlopen(self.agent_url(), timeout=10) as response:
+            page = response.read().decode("utf-8")
+        self.assertIn("Terhubung", page)
+        self.assertNotIn("connect?agent", page)
+
+    def test_02_adopt_files_made_by_hand(self):
+        status, doc = self.client.post("/v1/sites/shop/jobs", {"type": "deploy", "version": "1.0.0"})
+        self.assertEqual((status, doc["error"]["code"]), (409, "needs_adopt"))
+        job = self.job("adopt", "1.0.0", params={"migrations": "auto"})               # here the database is still empty
+        log = job["log"]["text"]
+        self.assertIn("Upload the release to the hosting", log)
+        self.assertIn("Database changes run on the hosting: 001_create_notes.sql", log)
+        self.assertEqual(self.live("version.txt"), "version 1.0.0")
+        self.assertEqual(self.live("uploads/photo.txt"), "photo")                              # shared data stays
+        self.assertEqual(self.live(".htaccess"), "# my own rules\n")                          # the release has none
+        self.assertEqual(self.live(".well-known/acme.txt"), "acme")
+        self.assertTrue(os.path.isfile(os.path.join(self.docroot, self.agent_name)))
+        self.assertIn("DB_CONNECTION=sqlite", self.live(".env"))
+        with open(os.path.join(self.home, ".rollout-agent-shop", "releases", "_pre_rollout", "index.html"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old site made by hand")
+        self.assertEqual(self.notes()[0], ["first; with a semicolon"])
+        details = self.call("GET", "/v1/sites/shop")
+        self.assertEqual((details["state"], details["current_version"], details["pre_rollout"]), ("ready", "1.0.0", True))
+        backups = self.call("GET", "/v1/sites/shop/backups")
+        self.assertEqual((len(backups), backups[0]["has_database"], backups[0]["has_files"]), (1, 1, 1))   # before adopting
+
+    def test_03_database_changes_shown_and_marked_as_done_by_hand(self):
+        plan = self.call("GET", "/v1/sites/shop/plan?version=1.1.0")
+        self.assertEqual([(m["name"], m["status"]) for m in plan["migrations"]], [("002_add_created.sql", "pending")])
+        self.assertIn("ALTER TABLE notes ADD COLUMN created", plan["migrations"][0]["sql"])
+        job = self.job("deploy", "1.1.0", params={"migrations": "manual", "backup": False})
+        self.assertIn("marked as done by hand: 002_add_created.sql", job["log"]["text"])
+        self.assertNotIn("created", self.notes()[1])                                           # not run: the user does it
+        self.assertEqual(self.call("GET", "/v1/sites/shop/plan?version=1.1.0")["migrations"], [])
+        self.assertEqual(self.live("version.txt"), "version 1.1.0")
+
+    def test_04_failed_health_check_rolls_back(self):
+        job = self.job("deploy", "1.2.0", params={"backup": False}, expect="failed")
+        self.assertIn("rolled back to 1.1.0", job["message"])
+        self.assertEqual(self.live("version.txt"), "version 1.1.0")
+
+    def test_05_rollback(self):
+        details = self.call("GET", "/v1/sites/shop")
+        self.assertEqual(details["rollback_version"], "1.0.0")                                 # not the failed 1.2.0
+        self.assertNotIn("1.2.0", details["installed"])                                        # pruned: never live and healthy
+        job = self.job("rollback", "1.0.0")
+        self.assertEqual((job["from_version"], job["to_version"]), ("1.1.0", "1.0.0"))
+        self.assertEqual(self.live("version.txt"), "version 1.0.0")
+        self.assertEqual(self.live("uploads/photo.txt"), "photo")
+        self.job("rollback", "1.1.0")
+        self.assertEqual(self.live("version.txt"), "version 1.1.0")
+
+    def test_06_backup_on_the_runner_and_restore(self):
+        backup_id = self.job("backup")["message"].split()[-1]
+        self.assertTrue(os.path.isfile(os.path.join(self.config["backup_dir"], "shop", backup_id, "database.sql.gz")))
+        self.assertEqual(os.listdir(os.path.join(self.home, ".rollout-agent-shop", "backups")), [])        # nothing left there
+        with open(os.path.join(self.docroot, "uploads", "photo.txt"), "w", encoding="utf-8") as f:
+            f.write("changed")
+        import sqlite3
+        with sqlite3.connect(self.db) as db:
+            db.execute("INSERT INTO notes (body) VALUES ('after the backup')")
+        self.job("restore", params={"backup_id": backup_id, "safety_backup": False})
+        self.assertEqual(self.live("uploads/photo.txt"), "photo")
+        self.assertEqual(self.notes()[0], ["first; with a semicolon"])
+
+    def test_07_prune_and_cleanup(self):
+        installed = self.call("GET", "/v1/sites/shop")["installed"]
+        self.assertLessEqual(len(installed), 2)                                                # keep_releases 2 of the preset
+        self.job("cleanup-adopt")
+        self.assertFalse(self.call("GET", "/v1/sites/shop")["pre_rollout"])
+
+    def test_08_refused_requests(self):
+        secret = self.config.secret_of("agent_secrets", "shop")
+        client = AgentClient(self.agent_url(), secret)
+        with self.assertRaises(AgentError) as error:
+            client.call("download", {"path": "state.php"})
+        self.assertEqual(error.exception.status, 403)
+        job = self.job("deploy", "1.3.0", params={"backup": False}, expect="failed")          # ../evil.txt in the archive
+        self.assertIn("unsafe path", job["message"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, "evil.txt")))
+        body = b"{}"
+        url = self.agent_url() + "?action=status"
+        ts, nonce = str(int(time.time())), "a" * 32
+        message = "POST\n/%s?action=status\n%s\n%s\n%s" % (self.agent_name, ts, nonce, hashlib.sha256(body).hexdigest())
+        import hmac as hmac_module
+        signature = hmac_module.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+        headers = {"X-Rollout-Timestamp": ts, "X-Rollout-Nonce": nonce, "X-Rollout-Signature": signature}
+        with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers, method="POST"), timeout=10) as first:
+            self.assertEqual(first.status, 200)
+        with self.assertRaises(urllib.error.HTTPError) as replay:
+            urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers, method="POST"), timeout=10)
+        self.assertIn(b"replayed", replay.exception.read())
+
+    def test_09_published_subfolder(self):
+        docroot = os.path.join(self.tmp, "home2", "public_html")
+        os.makedirs(docroot)
+        proc, port = php_server(docroot)
+        type(self).extra_php = [proc]
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "spa", "repo": "o/spa", "source": "source",
+                                        "docroot_target": "dist", "health_url": "http://127.0.0.1:%d/version.txt" % port,
+                                        "health_contains": "version {version}"})
+        agent = self.call("POST", "/v1/sites/spa/agent-file", {"dashboard": "https://dash.example.com"})
+        with open(os.path.join(docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        self.call("POST", "/v1/sites/spa/agent/connect", {"url": "http://127.0.0.1:%d/%s" % (port, agent["filename"])})
+        self.job("deploy", "2.0.0", site="spa")
+        self.job("deploy", "2.1.0", site="spa")
+        self.assertEqual(sorted(n for n in os.listdir(docroot) if not n.startswith(".")), sorted(["index.html", "version.txt", agent["filename"]]))
+        with open(os.path.join(docroot, "index.html"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "spa 2.1.0")                                            # only dist/ is published
+        self.job("rollback", site="spa")
+        with open(os.path.join(docroot, "index.html"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "spa 2.0.0")
+
+    def test_10_removing_the_site_disconnects_the_agent(self):
+        secret = self.config.secret_of("agent_secrets", "spa")
+        url = self.call("GET", "/v1/sites/spa")["hosting"]["url"]
+        self.call("DELETE", "/v1/sites/spa")
+        self.assertEqual(self.config.secret_of("agent_secrets", "spa"), "")
+        with self.assertRaises(AgentError) as error:
+            AgentClient(url, secret).call("status")
+        self.assertEqual(error.exception.code, "bad_signature")
 
 
 if __name__ == "__main__":

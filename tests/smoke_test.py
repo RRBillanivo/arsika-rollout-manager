@@ -9,7 +9,9 @@ the site's own GitHub token (write-only, access check, removal), deploy, rollbac
 sign-out. With openssl (PATH or ROLLOUT_TEST_OPENSSL): a second runner on HTTPS as "another server" - connection test
 with a wrong key pin, without a pin and with a wrong secret, a site on that server (presets, access check, deploy, job
 log, history), site ids unique across servers, "Update runner" (the runner installs a release and restarts, as systemd
-would start it again), a server that is down, removing the server. The dashboard writes a linked .env through the link."""
+would start it again), a server that is down, removing the server. The dashboard writes a linked .env through the link.
+Hosting without a terminal (needs the zip extension for --agent-php-ini, default --php-ini): a hosting site, its agent
+file (password), the agent on a second PHP server, connecting, the plan of database changes, a deployment."""
 import argparse
 import base64
 import http.cookiejar
@@ -116,6 +118,51 @@ def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def hosting_tests(admin, password, tmp, github, agent_php, base, run_job):
+    """A site on a "hosting": a folder served by a second PHP server where only the agent file changes anything."""
+    docroot = tmp / "hosting" / "public_html"
+    docroot.mkdir(parents=True)
+    github.publish_source("o/hosted", "1.0.0", {"index.html": "<h1>hosted 1.0.0</h1>", "version.txt": "version 1.0.0"})
+    port = free_port()
+    server = subprocess.Popen(agent_php + ["-S", "127.0.0.1:%d" % port, "-t", str(docroot)], cwd=str(docroot),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        site = {"preset": "hosting-static", "id": "hosted", "name": "Hosted", "repo": "o/hosted", "source": "source",
+                "deploy_mode": "hosting", "health_url": "http://127.0.0.1:%d/version.txt" % port, "health_contains": "version {version}",
+                "password": password}
+        status, doc = admin.post("sites", site)
+        check("hosting site created, waiting for its agent", status == 201 and doc["data"]["state"] == "unpaired"
+              and doc["data"]["deploy_mode"] == "hosting", json.dumps(doc)[:300])
+        status, doc = admin.post("sites/hosted/agent-file", {})
+        check("the agent file needs the password", status == 422 and "password" in doc["error"]["fields"])
+        status, doc = admin.post("sites/hosted/agent-file", {"password": password})
+        agent = doc.get("data", {})
+        check("agent file for the site, pointing at this dashboard", status == 200 and "const RA_DASHBOARD = '%s';" % base in agent.get("content", "")
+              and agent.get("filename", "").startswith("rollout-agent-"), json.dumps(doc)[:200])
+        (docroot / agent["filename"]).write_text(agent["content"], encoding="utf-8")
+        url = "http://127.0.0.1:%d/%s" % (port, agent["filename"])
+        wait_for(url)
+        with urllib.request.urlopen(url, timeout=10) as response:
+            page = response.read().decode("utf-8")
+        check("the agent page links back to the dashboard", base + "/?connect=hosted&amp;agent=" in page)
+        status, doc = admin.post("sites/hosted/agent/connect", {"url": url, "password": password})
+        check("hosting connected through the dashboard", status == 200 and doc["data"]["hosting"]["connected"]
+              and doc["data"]["state"] == "empty", json.dumps(doc)[:300])
+        status, doc = admin.get("sites/hosted/plan?version=1.0.0")
+        check("plan of database changes", status == 200 and doc["data"]["migrations"] == [], json.dumps(doc)[:200])
+        status, doc = run_job({"type": "deploy", "version": "1.0.0"}, site_id="hosted")
+        check("deploy on the hosting", doc["data"]["status"] == "succeeded" and (docroot / "version.txt").read_text() == "version 1.0.0",
+              doc["data"].get("message", "") + doc["data"]["log"]["text"][-500:])
+        status, doc = admin.get("activity")
+        actions = {a["action"] for a in doc["data"]["actions"]}
+        check("agent file and connection in the activity log", {"agent_file", "agent_connected"} <= actions, str(actions))
+        status, doc = admin.delete("sites/hosted", {"password": password})
+        check("hosting site removed (the agent forgets its secret)", status == 200)
+    finally:
+        server.terminate()
+        server.wait(10)
 
 
 def remote_tests(admin, password, tmp, github, args, logs, run_job):
@@ -238,6 +285,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--php", default="php")
     parser.add_argument("--php-ini", default="")
+    parser.add_argument("--agent-php-ini", default="", help="php.ini with the zip extension for the hosting agent (default: --php-ini)")
     parser.add_argument("--shell", default=shutil.which("bash") or "/bin/bash")
     args = parser.parse_args()
     if (ROOT / "public" / "install").exists():
@@ -397,6 +445,14 @@ def main():
             print("  (skipped: openssl not found)")
         else:
             remote_tests(admin, admin_password, tmp, github, args, logs, run_job)
+
+        print("== hosting without a terminal")
+        agent_php = [args.php] + (["-c", args.agent_php_ini or args.php_ini] if (args.agent_php_ini or args.php_ini) else [])
+        modules = subprocess.run(agent_php + ["-m"], capture_output=True, text=True).stdout.lower().split()
+        if "zip" not in modules:
+            print("  (skipped: the PHP for the agent has no zip extension; pass --agent-php-ini)")
+        else:
+            hosting_tests(admin, admin_password, tmp, github, agent_php, base, run_job)
 
         print("== .env behind a link")
         envdir = tmp / "envlink"
