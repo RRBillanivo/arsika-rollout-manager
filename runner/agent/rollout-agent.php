@@ -21,7 +21,7 @@
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.5.0';
+const RA_VERSION = '1.5.2';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
@@ -1355,7 +1355,8 @@ function ra_laravel_prepare(array &$state, array $p): array
     if (!is_file($release . '/vendor/autoload.php')) {
         throw new RaError(422, 'no_vendor', 'release ' . $version . ' has no vendor/ folder');
     }
-    $front = $release . '/public/index.php';
+    // the live release has its public/ in the website folder (deploy again); any other release has it in its folder
+    $front = $version === ($state['current'] ?? null) ? __DIR__ . '/index.php' : $release . '/public/index.php';
     $original = is_file($front) ? (string)file_get_contents($front) : '';
     if (strpos($original, 'bootstrap/app.php') === false) {
         throw new RaError(422, 'no_front', 'public/index.php of release ' . $version . ' is not the front controller of Laravel');

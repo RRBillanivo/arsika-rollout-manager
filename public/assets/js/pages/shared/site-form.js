@@ -91,7 +91,7 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
         <span class="field__help">${f('preset_help')}</span></label>` : ''}
       ${field('domain', f('domain'), s.domain, { help: f('domain_help'), placeholder: 'example.com' })}
       ${field('name', f('name'), s.name, { placeholder: 'Example' })}
-      ${isNew ? field('id', f('id'), s.id, { help: f('id_help'), placeholder: 'example', mono: true }) : ''}
+      ${isNew ? field('site_id', f('id'), s.id, { help: f('id_help'), placeholder: 'example', mono: true, attrs: 'data-1p-ignore data-lpignore="true" data-form-type="other"' }) : ''}
       <div class="field--full" data-place="server">${field('path', f('path'), s.path, { help: f('path_help'), placeholder: '/var/www/example.com', mono: true, wide: true })}</div>
       <div data-place="server">${select('deploy_mode', f('deploy_mode'), s.deploy_mode === 'compose' ? 'compose' : 'files', [['files', f('deploy_mode_files')], ['compose', f('deploy_mode_compose')]], f('deploy_mode_help'))}</div>
       <div class="form-two field--full" data-origin="github">
@@ -176,7 +176,7 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
 }
 
 const LIST_FIELDS = ['shared', 'backup_paths', 'backup_exclude', 'compose_files', 'backup_volumes', 'adopt_keep', 'upload_exclude'];
-const TEXT_FIELDS = ['id', 'name', 'domain', 'path', 'repo', 'asset_pattern', 'docroot_link', 'docroot_target', 'web_user', 'build', 'activate',
+const TEXT_FIELDS = ['name', 'domain', 'path', 'repo', 'asset_pattern', 'docroot_link', 'docroot_target', 'web_user', 'build', 'activate',
   'health_url', 'health_contains', 'backup_env_file', 'deploy_mode', 'source', 'compose_project', 'backup_db', 'backup_db_service', 'migrations_dir',
   'hosting_app'];
 const SERVER_ONLY = ['path', 'docroot_link', 'web_user', 'build', 'activate', 'services', 'reload_php_fpm', 'compose_files', 'compose_project',
@@ -186,6 +186,7 @@ export function readSiteForm(form) {
   const e = form.elements;
   const data = {};
   TEXT_FIELDS.forEach((name) => { if (e[name]) data[name] = e[name].value.trim(); });
+  if (e.site_id) data.id = e.site_id.value.trim();      // not named "id": browsers took it for a user name and filled it
   LIST_FIELDS.forEach((name) => { if (e[name]) data[name] = e[name].value.split('\n').map((v) => v.trim()).filter(Boolean); });
   data.services = e.services.value.split(',').map((v) => v.trim()).filter(Boolean);
   data.keep_releases = Number(e.keep_releases.value);
@@ -284,8 +285,8 @@ export function attachSiteForm(form, presets, { isNew = false, siteId = '', serv
         } catch (error) { /* the select shows which servers answer */ }
       });
     }
-    let touched = { name: false, id: false, path: false };
-    ['name', 'id', 'path'].forEach((n) => e[n].addEventListener('input', () => { touched[n] = true; }));
+    let touched = { name: false, site_id: false, path: false };
+    ['name', 'site_id', 'path'].forEach((n) => e[n].addEventListener('input', () => { touched[n] = true; }));
     suggestPath = () => {
       const domain = e.domain.value.trim().toLowerCase();
       const root = (roots()[0] || '/www/wwwroot').replace(/\/+$/, '');
@@ -295,7 +296,7 @@ export function attachSiteForm(form, presets, { isNew = false, siteId = '', serv
       const domain = e.domain.value.trim().toLowerCase();
       const first = domain.split('.')[0] || '';
       suggestPath();
-      if (!touched.id) e.id.value = first.replace(/[^a-z0-9-]/g, '').slice(0, 40);
+      if (!touched.site_id) e.site_id.value = first.replace(/[^a-z0-9-]/g, '').slice(0, 40);
       if (!touched.name) e.name.value = first ? first.charAt(0).toUpperCase() + first.slice(1) : '';
     });
     const help = e.path.closest('.field').querySelector('.field__help');

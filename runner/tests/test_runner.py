@@ -1317,6 +1317,10 @@ class UploadTest(UploadMixin, unittest.TestCase):
                 artisan_command(refused)
         self.assertEqual(artisan_command("queue:work --stop-when-empty"), "queue:work --stop-when-empty")
         self.assertEqual(artisan_command('tinker --execute="echo 1;"'), 'tinker --execute="echo 1;"')         # no input needed
+        fatal = "<br />\n<b>Warning</b>:  file_exists(): open_basedir restriction in effect<br />\n<b>Fatal error</b>:  Uncaught Error"
+        self.assertEqual(system.php_error(fatal), "Fatal error")                              # status 200 after the warnings
+        self.assertEqual(system.php_error("PHP Parse error:  syntax error, unexpected"), "Parse error")
+        self.assertIsNone(system.php_error("<h1>Fatal error handling in our docs</h1><p>a fatal error: what to do</p>"))
 
 
 FAKE_LARAVEL_AUTOLOAD = r"""<?php
@@ -1539,7 +1543,7 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
 
     def test_05b_a_newer_runner_with_the_same_agent_keeps_the_agent(self):
         before = self.live(self.agent_name)
-        with mock.patch.object(hosting_module, "__version__", "9.9.9"):                     # the template is still 1.5.0
+        with mock.patch.object(hosting_module, "__version__", "9.9.9"):                     # the template is older than the runner
             job = self.job("artisan", params={"command": "migrate:status"})
         self.assertNotIn("Update the agent file", job["log"]["text"])
         self.assertEqual(self.live(self.agent_name), before)
@@ -1556,17 +1560,17 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertNotIn("Backup", job["log"]["text"])                                        # stopped before anything else
 
     def test_07_the_agent_updates_itself(self):
-        template = os.path.join(self.tmp, "agent-1.5.1.php")
+        template = os.path.join(self.tmp, "agent-1.5.3.php")
         with open(hosting_module.TEMPLATE, encoding="utf-8") as f:
-            text = f.read().replace("const RA_VERSION = '1.5.0';", "const RA_VERSION = '1.5.1';")
+            text = f.read().replace("const RA_VERSION = '1.5.2';", "const RA_VERSION = '1.5.3';")
         with open(template, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         before = self.live(self.agent_name)
         with mock.patch.object(hosting_module, "TEMPLATE", template):                          # a newer agent template
             job = self.job("deploy", "1.2.0")
-        self.assertIn("Update the agent file on the hosting (1.5.0 -> 1.5.1)", job["log"]["text"])
+        self.assertIn("Update the agent file on the hosting (1.5.2 -> 1.5.3)", job["log"]["text"])
         after = self.live(self.agent_name)
-        self.assertIn("const RA_VERSION = '1.5.1';", after)
+        self.assertIn("const RA_VERSION = '1.5.3';", after)
         key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", after).group(1)
         self.assertNotIn(key, before)
         with open(os.path.join(self.home, ".rollout-agent-lara", "state.php"), encoding="utf-8") as f:
@@ -1602,6 +1606,47 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertEqual(self.live(os.path.join(data, "shared", "storage", "app", "public", "photo.txt")), "photo")
         self.assertTrue(os.path.isfile(os.path.join(data, "releases", "_pre_rollout", "artisan")))
         self.assertFalse(os.path.exists(os.path.join(docroot, ".env")))
+
+    def test_10_a_stopped_deployment_is_never_made_live_by_a_switch(self):
+        home = os.path.join(self.tmp, "home4")
+        docroot = os.path.join(home, "public_html")
+        os.makedirs(docroot)
+        proc, port = php_server(docroot)
+        self.extra_php.append(proc)
+        type(self).lara3 = (home, docroot, port)
+        self.call("POST", "/v1/sites", {"preset": "hosting-laravel", "id": "lara3", "source": "upload", "repo": "",
+                                        "health_contains": "app {version}"})
+        self.upload("lara3", "lara3.zip", make_zip(laravel_files("1.0.0")), version="1.0.0")
+        agent = self.call("POST", "/v1/sites/lara3/agent-file", {"dashboard": "https://dash.example.com"})
+        with open(os.path.join(docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        self.call("POST", "/v1/sites/lara3/agent/connect", {"url": "http://127.0.0.1:%d/%s" % (port, agent["filename"])})
+        job = self.job("deploy", "1.0.0", site="lara3", expect="failed")                        # no .env yet
+        self.assertIn("the .env of the site is not set yet", job["message"])
+        releases = {r["version"]: r for r in self.call("GET", "/v1/sites/lara3/releases")["releases"]}
+        self.assertTrue(releases["1.0.0"]["installed"] and releases["1.0.0"]["never_live"])    # the interface offers Deploy
+        job = self.job("rollback", "1.0.0", site="lara3", expect="failed")                     # "Activate" of 1.4/1.5.1
+        self.assertIn("never went live", job["message"])
+        self.assertFalse(os.path.exists(os.path.join(docroot, "index.php")))                   # nothing switched
+        self.call("PUT", "/v1/sites/lara3/env", {"content": "APP_NAME=Three\nAPP_KEY=\nDB_CONNECTION=sqlite\nDB_DATABASE=%s\n"
+                                                             % os.path.join(self.tmp, "lara3.sqlite").replace("\\", "/")})
+        job = self.job("deploy", "1.0.0", site="lara3")
+        self.assertIn("still on the hosting; reusing it", job["log"]["text"])
+        self.assertEqual(self.page(port), "app 1.0.0 env=Three key=set public=web storage=ok")
+
+    def test_11_a_broken_front_controller_fails_the_health_check_and_deploy_again_repairs_it(self):
+        home, docroot, port = self.lara3
+        with open(os.path.join(docroot, "index.php"), "w", encoding="utf-8") as f:             # Laravel's own public/index.php
+            f.write("<?php\nrequire __DIR__.'/../vendor/autoload.php';\n$app = require_once __DIR__.'/../bootstrap/app.php';\n")
+        self.assertFalse(self.call("GET", "/v1/sites/lara3/health")["ok"])
+        status, doc = self.client.post("/v1/sites/lara3/jobs", {"type": "deploy", "version": "1.0.0"})
+        job = self.wait_job(doc["data"], "failed")
+        self.assertIn("Deploy again", job["message"])                                         # explains how
+        job = self.job("deploy", "1.0.0", params={"redeploy": True, "migrations": "auto"}, site="lara3")
+        self.assertIn("Deploy 1.0.0 again (it stays live)", job["log"]["text"])
+        self.assertEqual(job["message"], "deployed 1.0.0 again")
+        self.assertEqual(self.page(port), "app 1.0.0 env=Three key=set public=web storage=ok")
+        self.assertIn("Arsika Rollout Manager", self.live("index.php", docroot))
 
     def test_09_an_old_data_folder_in_the_website_folder_gets_a_hidden_name(self):
         docroot = os.path.join(self.tmp, "home3", "public_html")

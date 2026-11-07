@@ -117,11 +117,13 @@ class Worker(object):
     # ---------- job types ----------
     def job_deploy(self, job, site, log):
         before, after = self.ops(site).deploy(job, site, log)
+        if job["params"].get("redeploy") and before == after:
+            return before, after, "deployed %s again" % after
         return before, after, "deployed %s%s" % (after, " (was %s)" % before if before and before != after else "")
 
     def job_rollback(self, job, site, log):
         before, after = self.ops(site).rollback(job, site, log)
-        return before, after, "rolled back from %s to %s" % (before, after)
+        return before, after, ("rolled back from %s to %s" % (before, after)) if before else "switched the website to %s" % after
 
     def job_adopt(self, job, site, log):
         if self.hosting.is_hosting(site):

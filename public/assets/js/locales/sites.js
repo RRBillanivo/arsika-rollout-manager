@@ -64,6 +64,8 @@ export default {
       delete_upload: 'Hapus versi unggahan', delete_upload_title: 'Hapus versi unggahan {version}?',
       delete_upload_text: 'File versi ini dihapus dari server dasbor. Versi yang sedang aktif atau versi rollback tidak bisa dihapus.',
       upload_deleted: 'Versi {version} dihapus.',
+      redeploy: 'Deploy ulang', redeploy_title: 'Deploy ulang versi {version}?',
+      redeploy_text: 'Versi {version} tetap aktif; persiapannya (Laravel: .env, storage/, public/index.php) dan perubahan database dijalankan sekali lagi, lalu web dicek.',
     },
     upload: {
       badge: 'Upload', title: 'Unggah versi baru',
@@ -319,6 +321,8 @@ export default {
       delete_upload: 'Delete the uploaded version', delete_upload_title: 'Delete the uploaded version {version}?',
       delete_upload_text: 'The file of this version is deleted from the dashboard\'s server. The live version and the rollback version cannot be deleted.',
       upload_deleted: 'Version {version} deleted.',
+      redeploy: 'Deploy again', redeploy_title: 'Deploy version {version} again?',
+      redeploy_text: 'Version {version} stays live; its preparation (Laravel: .env, storage/, public/index.php) and database changes run once more, then the site is checked.',
     },
     upload: {
       badge: 'Upload', title: 'Upload a new version',

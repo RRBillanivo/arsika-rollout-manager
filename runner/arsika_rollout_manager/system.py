@@ -2,6 +2,7 @@
 import glob
 import http.client
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -171,17 +172,29 @@ def http_get(url, timeout=10, local=False):
         return e.code, e.read(1 << 16).decode("utf-8", "replace")
 
 
+# PHP prints a fatal error after its warnings, so the status of the page can still be 200
+PHP_ERROR = re.compile(r"(?:^|<br\s*/?>|\n)\s*(?:<b>)?(?:PHP )?(Fatal error|Parse error)(?:</b>)?:\s", re.I)
+
+
+def php_error(body):
+    """'Fatal error' / 'Parse error' when the page is PHP's own error output, else None."""
+    match = PHP_ERROR.search(body or "")
+    return match.group(1) if match else None
+
+
 def health_check(url, contains, log=None, attempts=10, delay=3.0, local=False):
     """True when url answers 200 (and contains the given text) within the given attempts."""
     last = ""
     for attempt in range(1, attempts + 1):
         try:
             status, body = http_get(url, local=local)
-            if status == 200 and (not contains or contains in body):
+            error = php_error(body)
+            if status == 200 and not error and (not contains or contains in body):
                 if log:
                     log.line("health check OK: %s (attempt %d)" % (url, attempt))
                 return True
-            last = "HTTP %d" % status + ("" if status != 200 else ', text "%s" not found' % contains)
+            last = "HTTP %d" % status + ("" if status != 200 else ", the page shows a PHP %s" % error.lower() if error
+                                         else ', text "%s" not found' % contains)
         except Exception as e:                                    # network errors, timeouts, TLS
             last = "%s: %s" % (type(e).__name__, e)
         if log:
@@ -196,9 +209,10 @@ def quick_health(url, contains, timeout=8, local=False):
     t0 = time.time()
     try:
         status, body = http_get(url, timeout=timeout, local=local)
-        ok = status == 200 and (not contains or contains in body)
+        error = php_error(body)
+        ok = status == 200 and not error and (not contains or contains in body)
         return {"ok": ok, "status": status, "ms": int((time.time() - t0) * 1000), "error": "" if ok else
-                ("HTTP %d" % status if status != 200 else "expected text not found")}
+                ("HTTP %d" % status if status != 200 else "PHP %s on the page" % error.lower() if error else "expected text not found")}
     except Exception as e:
         return {"ok": False, "status": 0, "ms": int((time.time() - t0) * 1000), "error": "%s: %s" % (type(e).__name__, str(e)[:150])}
 

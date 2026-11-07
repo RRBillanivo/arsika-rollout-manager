@@ -3,7 +3,7 @@
 A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux servers**,
 straight from their **GitHub Releases**: a zip attached to the release, or the release's source code.
 
-![version](https://img.shields.io/badge/version-1.5.1-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
+![version](https://img.shields.io/badge/version-1.5.2-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![php](https://img.shields.io/badge/PHP-7.4%E2%80%938.4-777bb4) ![python](https://img.shields.io/badge/Python-3.6%E2%80%933.13-3776ab)
 
 > **Status: early release.** Version 1.1 runs in production on an aaPanel server (adoption of an existing site,

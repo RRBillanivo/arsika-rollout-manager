@@ -3,6 +3,21 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.5.2] — 2026-11-07
+
+### Added
+- **Deploy again** for the live release of a hosting site: its preparation (Laravel: `.env`, `storage/`,
+  `public/index.php`) and database changes run once more, without switching files.
+
+### Fixed
+- A hosting release whose deployment stopped before the switch (e.g. Laravel without a `.env` yet) could be made live
+  with **Activate** (a rollback) without being prepared: a Laravel site then served its original `public/index.php`
+  (open_basedir errors on aaPanel). Such a release now offers **Deploy** instead, a rollback to it is refused, and a
+  rollback of a Laravel site prepares the release first.
+- Health checks fail when the page is PHP's own fatal or parse error output (with warnings before it, its status can
+  still be 200).
+- Browsers no longer fill the site id of "Add site" with the saved user name.
+
 ## [1.5.1] — 2026-11-07
 
 ### Changed

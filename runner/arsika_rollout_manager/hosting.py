@@ -267,7 +267,8 @@ class Hosting(object):
         status = self.status(site) or {}
         releases = status.get("releases") or []
         return sorted([{"version": r["version"], "installed_at": r.get("installed_at") or "", "asset": None, "size_bytes": None,
-                        "sha256": r.get("sha256")} for r in releases], key=lambda r: r["installed_at"], reverse=True)
+                        "sha256": r.get("sha256"), "activated_at": r.get("activated_at")} for r in releases],
+                      key=lambda r: r["installed_at"], reverse=True)
 
     def rollback_target(self, site):
         """The release that was live (and healthy) most recently before the current one, if it is still on the hosting."""
@@ -740,8 +741,12 @@ class Hosting(object):
         laravel = self.is_laravel(site)
         info = self.require_agent(site, client, info, log, LARAVEL_AGENT if laravel else "0")
         current = info.get("current")
-        if version == current:
-            raise DeployError("%s is already live on the hosting" % version)
+        again = bool(job["params"].get("redeploy")) and not adopt
+        if version == current and not again:
+            raise DeployError("%s is already live on the hosting (Deploy again runs its preparation and database changes "
+                              "once more)" % version)
+        if again and version != current:
+            raise DeployError("only the live release can be deployed again; %s is not live" % version)
         if adopt and current:
             raise DeployError("nothing to adopt: the hosting already runs release %s" % current)
         if not adopt and not current and info.get("live"):
@@ -755,7 +760,9 @@ class Hosting(object):
             self.check_php(site, self.fetch_release(site, version, log), info, log)
         if job["params"].get("backup", site.get("backup_before_deploy")) and (current or info.get("live")):
             self.backup(site, current, ("before adopting " if adopt else "before deploying ") + version, log, job["id"])
-        if on_hosting:
+        if again:
+            log.step("Deploy %s again (it stays live): preparation and database changes" % version)
+        elif on_hosting:
             log.step("Release %s is still on the hosting; reusing it" % version)
         else:
             self.upload_release(site, client, version, log, info)
@@ -766,6 +773,14 @@ class Hosting(object):
             self.laravel_migrate(site, client, version, mode, log)
         else:
             self.migrate(site, client, version, mode, log)
+        if again:
+            if laravel:
+                self.laravel_finish(site, client, version, log)
+            self.forget_cache(site)
+            if not self.deployer.healthy(site, version, log):
+                raise DeployError("health check failed for %s" % version)
+            self.store.mark_activated(site["id"], version)
+            return current, version
         switched = self.activate(site, client, version, log)
         previous = switched.get("previous")
         if not self.deployer.healthy(site, version, log):
@@ -787,14 +802,22 @@ class Hosting(object):
 
     def rollback(self, job, site, log):
         client = self.client(site)
+        info = client.call("status", self.status_params(site))
         if self.is_laravel(site):
-            self.require_agent(site, client, client.call("status", self.status_params(site)), log)
-        current = self.current_version(site)
+            info = self.require_agent(site, client, info, log)
+        current = info.get("current")
         target = job["version"] or self.rollback_target(site)
         if not target:
             raise DeployError("no earlier release on the hosting to roll back to")
         if target == current:
             raise DeployError("%s is already the current release" % target)
+        kept = {r["version"]: r for r in info.get("releases") or []}
+        if target in kept and not kept[target].get("activated_at"):
+            # e.g. its deployment stopped before the switch: it was never prepared and its database changes never ran
+            raise DeployError("release %s never went live on the hosting: deploy it instead (Deploy prepares it and runs its "
+                              "database changes)" % target)
+        if self.is_laravel(site):
+            self.laravel_prepare(site, client, target, False, log)    # .env, storage/ and its public/index.php
         self.activate(site, client, target, log)
         if not self.deployer.healthy(site, target, log):
             if current:

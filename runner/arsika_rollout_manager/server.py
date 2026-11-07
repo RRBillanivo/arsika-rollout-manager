@@ -391,9 +391,12 @@ class Api(object):
             except GitHubError as e:
                 remote, error = [], str(e)
         listed = {r["version"] for r in remote}
+        hosting = self.ops(record) is self.hosting
         for r in remote:
             r["installed"] = r["version"] in installed
             r["current"] = r["version"] == current
+            # a release on the hosting that never went live (its deployment stopped): deploy it, do not just switch to it
+            r["never_live"] = hosting and r["installed"] and not r["current"] and not installed[r["version"]].get("activated_at")
         local_only = [{"version": v, "tag": v, "name": v, "published_at": None, "notes": "", "asset": None, "installed": True,
                        "current": v == current, "local_only": True} for v in installed if v not in listed]
         return {"releases": remote + local_only, "error": error, "current": current}
@@ -421,7 +424,8 @@ class Api(object):
         if job_type in ("deploy", "adopt", "delete-release") and not version:
             raise ApiError(422, "validation_failed", "version required", {"version": "Choose a version."})
         params = data.get("params") if isinstance(data.get("params"), dict) else {}
-        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason", "migrations", "command") if k in params}
+        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason", "migrations", "command", "redeploy")
+                  if k in params}
         if params.get("migrations") not in (None, "auto", "manual"):
             raise ApiError(422, "validation_failed", "migrations: auto or manual", {"migrations": "Choose auto or manual."})
         if job_type == "upload":

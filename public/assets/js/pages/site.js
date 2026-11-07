@@ -108,7 +108,11 @@ function releaseItem(site, release) {
   if (site.state === 'classic' || site.state === 'unpaired' || site.state === 'unreachable' || busy) {
     actions = '';
   } else if (release.current) {
-    actions = '';
+    actions = site.deploy_mode === 'hosting'
+      ? `<button type="button" class="btn btn--outline btn--small" data-redeploy="${esc(release.version)}">${icon('refresh')}${v('redeploy')}</button>` : '';
+  } else if (release.installed && release.never_live) {          // its deployment stopped before the switch
+    actions = `<button type="button" class="btn btn--primary btn--small" data-deploy="${esc(release.version)}">${icon('upload-cloud')}${v('deploy')}</button>
+      <button type="button" class="icon-btn icon-btn--danger" data-delete-release="${esc(release.version)}" title="${v('delete')}" aria-label="${v('delete')}">${icon('trash')}</button>`;
   } else if (release.installed) {
     actions = `<button type="button" class="btn btn--outline btn--small" data-activate="${esc(release.version)}">${icon('rollback')}${v('activate')}</button>
       <button type="button" class="icon-btn icon-btn--danger" data-delete-release="${esc(release.version)}" title="${v('delete')}" aria-label="${v('delete')}">${icon('trash')}</button>`;
@@ -386,6 +390,16 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
         submitLabel: v('deploy_submit'),
         onSubmit: job((form) => ({ type: 'deploy', version: d.deploy,
           params: { backup: form.elements.backup ? form.elements.backup.checked : false, migrations: migrationsChoice(form) } })) });
+      return;
+    }
+    if (d.redeploy) {
+      target.disabled = true;
+      const changes = await dbChanges(site, d.redeploy, false);
+      target.disabled = false;
+      await actionDialog({ title: v('redeploy_title', { version: d.redeploy }), message: v('redeploy_text', { version: d.redeploy }),
+        extra: changes + checkbox('backup', v('deploy_backup'), site.settings.backup_before_deploy), submitLabel: v('redeploy'),
+        onSubmit: job((form) => ({ type: 'deploy', version: d.redeploy,
+          params: { redeploy: true, backup: form.elements.backup.checked, migrations: migrationsChoice(form) } })) });
       return;
     }
     if ('agentFile' in d) {

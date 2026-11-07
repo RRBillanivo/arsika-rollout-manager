@@ -38,7 +38,12 @@ export async function render(main, _params, app, isCurrent) {
     } catch (error) {
       const details = form.querySelector('details');
       if (error.fields && Object.keys(error.fields).some((name) => details.querySelector(`[name="${name}"]`))) details.open = true;
-      showErrors(form, localizeFields(error));
+      const shown = localizeFields(error);
+      if (shown.fields && shown.fields.id) {              // the id field is named site_id in the form
+        shown.fields.site_id = shown.fields.id;
+        delete shown.fields.id;
+      }
+      showErrors(form, shown);
     } finally {
       button.disabled = false;
     }
