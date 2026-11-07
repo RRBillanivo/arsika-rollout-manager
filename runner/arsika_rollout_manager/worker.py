@@ -12,11 +12,12 @@ from .deploy import DeployError
 from .github import GitHubError
 from .hosting import Hosting
 from .joblog import JobLog
+from .uploads import UploadError
 from .util import exists, now, remove
 
-JOB_TYPES = ("deploy", "rollback", "adopt", "backup", "restore", "delete-release", "cleanup-adopt")
+JOB_TYPES = ("deploy", "rollback", "adopt", "backup", "restore", "delete-release", "cleanup-adopt", "upload", "artisan")
 RUNNER_SITE = "_runner"                  # jobs of the runner itself ("self-update"), not of a site
-EXPECTED = (DeployError, BackupError, GitHubError, system.CommandError)
+EXPECTED = (DeployError, BackupError, GitHubError, system.CommandError, UploadError)
 
 
 class Worker(object):
@@ -180,3 +181,15 @@ class Worker(object):
     def job_cleanup_adopt(self, job, site, log):
         self.ops(site).delete_pre_rollout(site, log)
         return None, None, "deleted the files of the installation before Arsika Rollout Manager (_pre_rollout)"
+
+    def job_upload(self, job, site, log):
+        """An archive uploaded through the dashboard becomes a version of the site."""
+        version = self.deployer.uploads.process(site, str(job["params"].get("upload_id") or ""), log)
+        return None, version, "version %s uploaded" % version
+
+    def job_artisan(self, job, site, log):
+        if not self.hosting.is_laravel(site):
+            raise DeployError("artisan commands are run for Laravel sites on a hosting")
+        command = str(job["params"].get("command") or "")
+        version = self.hosting.run_artisan(site, command, log)
+        return version, version, "php artisan %s" % command.strip()[:120]

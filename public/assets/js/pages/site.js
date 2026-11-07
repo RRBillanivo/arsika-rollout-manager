@@ -1,12 +1,18 @@
 // Site details: status, quick actions (health check, rollback, backup) and the tabs Versions, History, Backups, Settings.
-import { del, get, post, put } from '../core/api.js';
+// Sites whose versions are uploaded here (zip, rar ...) get an upload box; hosting sites the .env editor, Laravel sites
+// on a hosting a box for artisan commands.
+import { del, get, post, put, sendBytes } from '../core/api.js';
 import { t, tList } from '../core/i18n.js';
-import { attachPasswordToggles, clearErrors, duration, esc, formatBytes, formatDate, formatDateTime, icon, showErrors, toast } from '../core/ui.js';
+import { attachPasswordToggles, clearErrors, duration, esc, formatBytes, formatDate, formatDateTime, formDialog, icon, showErrors, toast } from '../core/ui.js';
 import { actionDialog, checkbox, healthBadge, jobStatusBadge, jobType, localizeFields, passwordField, startJob, stateBadge, versionPill } from './shared/bits.js';
 import { attachSiteForm, readSiteForm, siteFormHtml } from './shared/site-form.js';
 import { serverBadge } from './overview.js';
 
 const TABS = [['versions', 'git-branch'], ['history', 'clock'], ['backups', 'archive'], ['settings', 'settings']];
+const ARCHIVES = '.zip,.rar,.7z,.tar,.tgz,.tbz2,.txz,.gz,.bz2,.xz';
+const uploaded = (site) => (site.settings ? site.settings.source : site.source) === 'upload';
+const envName = (file) => String(file || '.env').replace(/^@shared\//, '');        // Laravel: kept in the agent's data folder
+const laravel = (site) => site.deploy_mode === 'hosting' && site.settings && site.settings.hosting_app === 'laravel';
 
 function header(site) {
   const d = (key, params) => t('sites.detail.' + key, params);
@@ -17,12 +23,14 @@ function header(site) {
       <h1>${esc(site.name)}</h1>
       <p class="site-header__links">
         ${site.domain ? `<a href="https://${esc(site.domain)}" target="_blank" rel="noopener">${icon('globe')}${esc(site.domain)}</a>` : ''}
-        <a href="https://github.com/${esc(site.repo)}" target="_blank" rel="noopener">${icon('github')}${esc(site.repo)}</a>
+        ${site.repo ? `<a href="https://github.com/${esc(site.repo)}" target="_blank" rel="noopener">${icon('github')}${esc(site.repo)}</a>` : ''}
         ${site.path ? `<span class="mono small">${icon('folder')}${esc(site.path)}</span>` : ''}
         ${site.hosting && site.hosting.url ? `<span class="mono small">${icon('external-link')}${esc(site.hosting.url)}</span>` : ''}</p>
       <div class="badge-row">${site.server && !site.server.local ? serverBadge(site.server) : ''} ${stateBadge(site.state)} ${healthBadge(site.health)} ${versionPill(site.current_version, 'current')}
         ${site.deploy_mode === 'compose' ? `<span class="badge badge--failed">${icon('layers')}Docker Compose</span>` : ''}
-        ${site.deploy_mode === 'hosting' ? `<span class="badge badge--server">${icon('upload-cloud')}Hosting</span>` : ''}
+        ${site.deploy_mode === 'hosting' ? `<span class="badge badge--server">${icon('upload-cloud')}Hosting${laravel(site) ? ' · Laravel' : ''}</span>` : ''}
+        ${uploaded(site) ? `<span class="badge badge--admin">${icon('upload')}${t('sites.upload.badge')}</span>` : ''}
+        ${site.hosting && site.hosting.insecure ? `<span class="badge badge--yellow">${icon('alert')}${t('sites.hosting.insecure')}</span>` : ''}
         ${site.disk ? `<span class="small muted">${icon('hard-drive')}${d('disk', { free: formatBytes(site.disk.free), total: formatBytes(site.disk.total) })}</span>` : ''}</div>
     </div>
     <div class="site-header__actions">
@@ -33,15 +41,23 @@ function header(site) {
   </header>
   ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' || site.state === 'unreachable' ? 'red' : 'yellow'}">${icon('info')}<div>${t('sites.state.' + site.state + '_hint')}
     ${site.state === 'unreachable' && site.hosting && site.hosting.error ? `<br><small>${esc(site.hosting.error)}</small>` : ''}</div></div>` : ''}
-  ${site.deploy_mode === 'hosting' && site.state === 'unpaired' ? connectCard() : ''}
+  ${site.deploy_mode === 'hosting' && site.state === 'unpaired' ? connectCard(site) : ''}
   ${busy ? `<div class="box box--blue">${icon('activity')}<div>${t('jobs.in_progress')} ${jobStatusBadge(site.active_job.status)}
     <a href="#/sites/${esc(site.id)}/jobs/${site.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}`;
 }
 
-/** Hosting site that is not connected: get the agent file, upload it, open it (the page waits for the connection). */
-function connectCard() {
+/**
+ * Hosting site that is not connected: what is ready (an uploaded version, the .env of a Laravel site), then the agent
+ * file: download it, put it in the website folder, open it (the page waits for the connection).
+ */
+function connectCard(site) {
   const hs = (key, params) => t('sites.hosting.' + key, params);
+  const check = (ok, text) => `<li class="${ok ? 'text-success' : 'text-warning'}">${icon(ok ? 'check' : 'alert')} ${text}</li>`;
+  const prep = [];
+  if (uploaded(site)) prep.push(check(!!site.latest_version, site.latest_version ? hs('prep_upload_ok', { version: esc(site.latest_version) }) : hs('prep_upload_none')));
+  if (laravel(site)) prep.push(check(!!(site.env && site.env.pending), site.env && site.env.pending ? hs('prep_env_ok') : hs('prep_env_none')));
   return `<section class="card connect-card"><h2 class="card__title">${icon('upload-cloud')}${hs('title')}</h2><p>${hs('lead')}</p>
+    ${prep.length ? `<p><b>${hs('prep_title')}</b></p><ul class="check-list">${prep.join('')}</ul>` : ''}
     <ol class="bullet-list">${tList('sites.hosting.steps').map((x) => `<li>${x}</li>`).join('')}</ol>
     <div class="action-row"><button type="button" class="btn btn--primary" data-agent-file>${icon('download')}${hs('download')}</button>
       <span class="small muted live-note">${icon('refresh')}${hs('waiting')}</span></div></section>`;
@@ -57,15 +73,27 @@ async function dbChanges(site, version, adopt) {
   } catch (error) {
     return `<div class="box box--yellow">${icon('alert')}<div>${esc(error.message)}</div></div>`;
   }
+  const isLaravel = plan.kind === 'laravel';
   if (!plan.migrations.length) return `<p class="small muted">${icon('database')} ${v('db_none')}</p>`;
-  return `<div class="db-changes"><p><b>${icon('database')} ${v('db_title', { n: plan.migrations.length, folder: plan.folder })}</b></p>
+  return `<div class="db-changes"><p><b>${icon('database')} ${v(isLaravel ? 'db_title_laravel' : 'db_title', { n: plan.migrations.length, folder: plan.folder })}</b></p>
+    ${plan.error ? `<p class="small text-warning">${v('db_unknown', { error: esc(plan.error) })}</p>` : ''}
     ${plan.migrations.map((m) => `<details class="release__notes"><summary class="mono">${esc(m.name)}${m.status === 'changed' ? ` · <span class="text-warning">${v('db_changed')}</span>` : ''}</summary>
       <pre>${esc(m.sql)}${m.truncated ? '\n…' : ''}</pre></details>`).join('')}
-    <label class="checkbox"><input type="radio" name="migrations" value="auto" ${adopt ? '' : 'checked'}><span>${v('db_auto')}</span></label>
-    <label class="checkbox"><input type="radio" name="migrations" value="manual" ${adopt ? 'checked' : ''}><span>${v(adopt ? 'db_manual_adopt' : 'db_manual')}</span></label></div>`;
+    <label class="checkbox"><input type="radio" name="migrations" value="auto" ${adopt ? '' : 'checked'}><span>${v(isLaravel ? 'db_auto_laravel' : 'db_auto')}</span></label>
+    <label class="checkbox"><input type="radio" name="migrations" value="manual" ${adopt ? 'checked' : ''}><span>${v(adopt ? 'db_manual_adopt' : (isLaravel ? 'db_manual_laravel' : 'db_manual'))}</span></label></div>`;
 }
 
 const migrationsChoice = (form) => (form.elements.migrations ? form.elements.migrations.value : undefined);
+
+/** absensi#003.rar -> 003, shop-v1.2.0.zip -> 1.2.0, otherwise the date and time (as the runner suggests it). */
+export function suggestVersion(name) {
+  const base = String(name || '').replace(/\.(zip|rar|7z|tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz)$/i, '');
+  const match = base.match(/(?:^|[^0-9A-Za-z])v?(\d+(?:\.\d+)*)$/);
+  if (match) return match[1];
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
 
 // ---------- Versions ----------
 function releaseItem(site, release) {
@@ -74,6 +102,8 @@ function releaseItem(site, release) {
   const flags = [release.current ? `<span class="badge badge--normal">${icon('check')}${v('current')}</span>` : '',
     release.installed && !release.current ? `<span class="badge badge--admin">${icon('hard-drive')}${v('installed')}</span>` : '',
     release.prerelease ? '<span class="badge badge--yellow">pre-release</span>' : ''].join('');
+  const removeUpload = release.uploaded && !release.current && !busy
+    ? `<button type="button" class="icon-btn icon-btn--danger" data-delete-upload="${esc(release.version)}" title="${v('delete_upload')}" aria-label="${v('delete_upload')}">${icon('trash')}</button>` : '';
   let actions = '';
   if (site.state === 'classic' || site.state === 'unpaired' || site.state === 'unreachable' || busy) {
     actions = '';
@@ -87,13 +117,54 @@ function releaseItem(site, release) {
   } else {
     actions = `<span class="small muted">${v('no_asset', { pattern: site.settings.asset_pattern })}</span>`;
   }
+  const when = release.local_only ? v('local_only') : release.uploaded
+    ? v('uploaded', { date: formatDateTime(release.published_at, true), actor: esc(release.actor || '–') })
+    : v('published', { date: formatDate(release.published_at) });
+  const asset = !release.asset ? '' : ' · ' + (release.asset.source ? v('source_code') : esc(release.asset.name) + ' · ' + formatBytes(release.asset.size));
   return `<li class="release${release.current ? ' release--current' : ''}">
     <div class="release__main">
-      <div class="release__title">${versionPill(release.version, release.current ? 'current' : '')}<b>${esc(release.name && release.name !== release.tag ? release.name : '')}</b>${flags}</div>
-      <small class="muted">${release.local_only ? v('local_only') : v('published', { date: formatDate(release.published_at) })}${release.asset ? ' · ' + (release.asset.source ? v('source_code') : esc(release.asset.name) + ' · ' + formatBytes(release.asset.size)) : ''}</small>
+      <div class="release__title">${versionPill(release.version, release.current ? 'current' : '')}<b>${esc(release.name && release.name !== release.tag && !release.uploaded ? release.name : '')}</b>${flags}</div>
+      <small class="muted">${when}${asset}${release.uploaded && release.files ? ' · ' + v('files', { n: release.files }) : ''}${release.php ? ' · PHP ' + esc(release.php) : ''}</small>
+      ${release.uploaded && release.removed_count ? `<details class="release__notes"><summary>${v('removed', { n: release.removed_count })}</summary><pre>${esc((release.removed || []).join('\n'))}${release.removed_count > (release.removed || []).length ? '\n…' : ''}</pre></details>` : ''}
       ${release.notes ? `<details class="release__notes"><summary>${v('notes')}</summary><pre>${esc(release.notes)}</pre></details>` : ''}
     </div>
-    <div class="release__actions">${actions}</div></li>`;
+    <div class="release__actions">${actions}${removeUpload}</div></li>`;
+}
+
+/** Upload a zip, rar, 7z or tar archive as a new version (sent in pieces; the runner unpacks and checks it). */
+function uploadCard(site) {
+  const u = (key, params) => t('sites.upload.' + key, params);
+  return `<section class="card upload-card">
+    <h2 class="card__title">${icon('upload')}${u('title')}</h2><p class="small muted">${u('lead')}</p>
+    <form data-upload-form class="form-two" novalidate>
+      <label class="field field--full"><span class="field__label">${u('file')}</span>
+        <input type="file" name="file" accept="${ARCHIVES}"><span class="field__help">${u('file_help')}</span></label>
+      <label class="field"><span class="field__label">${u('version')}</span>
+        <input type="text" name="version" class="mono" placeholder="1.0.0" autocomplete="off" spellcheck="false"><span class="field__help">${u('version_help')}</span></label>
+      <div class="field field--full"><progress max="100" value="0" hidden></progress><span class="small muted" data-upload-note></span></div>
+      <div class="form-actions field--full"><button type="submit" class="btn btn--primary" ${site.active_job ? 'disabled' : ''}>${icon('upload')}${u('submit')}</button></div>
+    </form></section>`;
+}
+
+/** The .env of a hosting site: on the hosting, or prepared here before the hosting is connected. */
+function envCard(site) {
+  const e = (key, params) => t('sites.env.' + key, params);
+  const env = site.env || {};
+  const status = env.on_hosting ? e('status_hosting') : env.pending ? e('status_dashboard') : e('status_none');
+  return `<section class="card env-card"><div class="card__header"><div><h2 class="card__title">${icon('key')}${e('title', { file: esc(envName(env.file)) })}</h2>
+      <p class="small ${env.on_hosting || env.pending ? 'muted' : 'text-warning'}">${status}</p></div>
+    <button type="button" class="btn btn--outline btn--small" data-edit-env>${icon('edit')}${e('edit')}</button></div>
+    ${laravel(site) ? `<p class="small muted">${e('lead_laravel')}</p>` : ''}</section>`;
+}
+
+/** artisan commands of the live release, run inside PHP on the hosting (the hosting has no terminal). */
+function artisanCard(site) {
+  const a = (key, params) => t('sites.artisan.' + key, params);
+  return `<section class="card artisan-card"><h2 class="card__title">${icon('terminal')}${a('title')}</h2><p class="small muted">${a('lead')}</p>
+    <form data-artisan-form class="artisan-row" novalidate><span class="mono muted">php artisan</span>
+      <input type="text" name="command" class="mono" placeholder="migrate:status" autocomplete="off" spellcheck="false">
+      <button type="submit" class="btn btn--outline btn--small" ${site.active_job || site.state !== 'ready' ? 'disabled' : ''}>${icon('terminal')}${a('run')}</button></form>
+    <p class="small muted">${a('examples')}</p></section>`;
 }
 
 async function versionsTab(container, site, isCurrent, refresh = false) {
@@ -103,7 +174,10 @@ async function versionsTab(container, site, isCurrent, refresh = false) {
   if (!isCurrent()) return;
   const releases = data.releases;
   const withAsset = releases.filter((r) => r.asset);
+  const fromUploads = uploaded(site);
   container.innerHTML = `
+  ${fromUploads ? uploadCard(site) : ''}
+  ${site.deploy_mode === 'hosting' && site.env && (laravel(site) || site.settings.backup_env_file) ? envCard(site) : ''}
   ${site.state === 'classic' ? `<section class="card adopt-card">
     <h2 class="card__title">${icon('package')}${t('sites.adopt.title')}</h2><p>${t(site.deploy_mode === 'hosting' ? 'sites.adopt.text_hosting' : 'sites.adopt.text')}</p>
     <label class="field"><span class="field__label">${t('sites.adopt.version')}</span>
@@ -114,11 +188,12 @@ async function versionsTab(container, site, isCurrent, refresh = false) {
   ${site.pre_rollout ? `<section class="card danger-zone"><div><h2>${icon('folder')}${t('sites.pre_rollout.title')}</h2><p class="muted">${t('sites.pre_rollout.text')}</p></div>
     <button type="button" class="btn btn--danger-outline" data-cleanup ${site.active_job ? 'disabled' : ''}>${icon('trash')}${t('sites.pre_rollout.submit')}</button></section>` : ''}
   <section class="card">
-    <div class="card__header"><h2 class="card__title">${icon('github')}${v('title')}</h2>
-      <button type="button" class="btn btn--ghost btn--small" data-refresh-releases>${icon('refresh')}${v('refresh')}</button></div>
+    <div class="card__header"><h2 class="card__title">${icon(fromUploads ? 'package' : 'github')}${v(fromUploads ? 'title_upload' : 'title')}</h2>
+      <button type="button" class="btn btn--ghost btn--small" data-refresh-releases>${icon('refresh')}${v(fromUploads ? 'refresh_upload' : 'refresh')}</button></div>
     ${data.error ? `<div class="box box--red">${icon('alert')}<div>${v('github_error', { message: data.error })}</div></div>` : ''}
-    ${releases.length ? `<ul class="release-list">${releases.map((r) => releaseItem(site, r)).join('')}</ul>` : `<p class="muted">${v('none')}</p>`}
-  </section>`;
+    ${releases.length ? `<ul class="release-list">${releases.map((r) => releaseItem(site, r)).join('')}</ul>` : `<p class="muted">${v(fromUploads ? 'none_upload' : 'none')}</p>`}
+  </section>
+  ${laravel(site) && site.state === 'ready' ? artisanCard(site) : ''}`;
 }
 
 // ---------- History ----------
@@ -204,7 +279,69 @@ function settingsTab(container, site, app) {
   });
 }
 
+/** Send the chosen archive in pieces, then let the runner turn it into a version (a job with its own log). */
+async function uploadVersion(site, form, app) {
+  const u = (key, params) => t('sites.upload.' + key, params);
+  const file = form.elements.file.files[0];
+  clearErrors(form);
+  if (!file) { showErrors(form, { message: u('choose_file'), fields: { file: u('choose_file') } }); return; }
+  const button = form.querySelector('[type=submit]');
+  const bar = form.querySelector('progress');
+  const note = form.querySelector('[data-upload-note]');
+  button.disabled = true;
+  bar.hidden = false;
+  try {
+    const { data: start } = await post(`sites/${site.id}/uploads`, { name: file.name, size: file.size, version: form.elements.version.value.trim() });
+    let offset = 0;
+    while (offset < file.size) {
+      const piece = file.slice(offset, offset + start.chunk_size);
+      let answer = null;
+      for (let attempt = 0; attempt < 3 && !answer; attempt += 1) {
+        try {
+          answer = (await sendBytes(`sites/${site.id}/uploads/${start.id}?offset=${offset}`, piece)).data;
+        } catch (error) {
+          if (attempt === 2 || error.status === 422 || error.status === 409) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+      }
+      offset = answer.received;
+      bar.value = Math.round((offset / file.size) * 100);
+      note.textContent = u('progress', { done: formatBytes(offset), total: formatBytes(file.size) });
+    }
+    note.textContent = u('processing');
+    const { data: job } = await post(`sites/${site.id}/uploads/${start.id}/finish`, {});
+    toast(u('uploaded', { version: job.version }), 'success');
+    app.go(`/sites/${site.id}/jobs/${job.id}`);
+  } catch (error) {
+    note.textContent = '';
+    bar.hidden = true;
+    showErrors(form, localizeFields(error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/** Open the .env (password), edit it in a wide dialog and save it to the hosting (or keep it here until it connects). */
+async function editEnv(site, app) {
+  const e = (key, params) => t('sites.env.' + key, params);
+  let password = '';
+  const env = await actionDialog({ title: e('open_title'), message: e('open_text'), password: true, submitLabel: e('open'),
+    onSubmit: async (form) => { password = form.elements.password.value; return (await post(`sites/${site.id}/env/read`, { password })).data; } });
+  if (!env) return;
+  const text = env.exists ? env.content : (env.template || '');
+  const where = env.exists ? e(env.where === 'hosting' ? 'where_hosting' : 'where_dashboard') : e(env.template ? 'template' : 'empty');
+  const saved = await formDialog({ title: e('title', { file: envName(env.file) }), wide: true, submitLabel: e('save'),
+    body: `<p class="small muted">${where}</p>${env.laravel ? `<p class="small muted">${e('laravel_hint')}</p>` : ''}
+      <label class="field"><textarea name="content" rows="18" class="mono env-editor" spellcheck="false" autocomplete="off">${esc(text)}</textarea></label>`,
+    onSubmit: async (form) => (await put(`sites/${site.id}/env`, { content: form.elements.content.value, password })).data });
+  if (saved) {
+    toast(e(saved.where === 'hosting' ? 'saved_hosting' : 'saved_dashboard'), 'success', 7000);
+    app.reloadPage();
+  }
+}
+
 export async function render(main, [siteId, tabName], app, isCurrent) {
+  if (main.siteCleanup) main.siteCleanup();          // reloadPage() renders again: the listeners of the last render go first
   const tab = tabName || 'versions';
   main.innerHTML = '<div aria-busy="true"><div class="skeleton skeleton--title"></div><div class="skeleton skeleton--table"></div></div>';
   const { data: site } = await get('sites/' + siteId);
@@ -244,7 +381,7 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
       target.disabled = true;
       const changes = await dbChanges(site, d.deploy, false);
       target.disabled = false;
-      await actionDialog({ title: v('deploy_title', { version: d.deploy }), message: v('deploy_text', { version: d.deploy }),
+      await actionDialog({ title: v('deploy_title', { version: d.deploy }), message: v(uploaded(site) ? 'deploy_text_upload' : 'deploy_text', { version: d.deploy }),
         extra: changes + (site.state === 'ready' ? checkbox('backup', v('deploy_backup'), site.settings.backup_before_deploy) : ''),
         submitLabel: v('deploy_submit'),
         onSubmit: job((form) => ({ type: 'deploy', version: d.deploy,
@@ -265,6 +402,14 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
         setTimeout(() => URL.revokeObjectURL(link.href), 10000);
         toast(hs('downloaded', { name: file.filename }), 'success', 9000);
       }
+      return;
+    }
+    if ('editEnv' in d) { await editEnv(site, app); return; }
+    if (d.deleteUpload) {
+      const done = await actionDialog({ title: v('delete_upload_title', { version: d.deleteUpload }), message: v('delete_upload_text'),
+        password: true, danger: true, submitLabel: t('common.delete'),
+        onSubmit: (form) => del(`sites/${site.id}/uploads/${encodeURIComponent(d.deleteUpload)}`, { password: form.elements.password.value }) });
+      if (done) { toast(v('upload_deleted', { version: d.deleteUpload }), 'success'); await versionsTab(container, site, isCurrent); }
       return;
     }
     if (d.activate || d.rollback) {
@@ -318,7 +463,29 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
       if (done) { toast(t('sites.form.deleted'), 'success'); app.go('/'); }
     }
   };
+  const onSubmit = async (e) => {
+    const form = e.target;
+    if (form.matches('[data-upload-form]')) {
+      e.preventDefault();
+      await uploadVersion(site, form, app);
+    } else if (form.matches('[data-artisan-form]')) {
+      e.preventDefault();
+      const a = (key, params) => t('sites.artisan.' + key, params);
+      const command = form.elements.command.value.trim().replace(/^php\s+artisan\s+/, '');
+      if (!command) { form.elements.command.focus(); return; }
+      await actionDialog({ title: a('confirm_title'), message: a('confirm_text', { command: `<code>php artisan ${esc(command)}</code>` }), password: true,
+        submitLabel: a('run'), onSubmit: job(() => ({ type: 'artisan', params: { command } })) });
+    }
+  };
+  const onChange = (e) => {
+    const input = e.target;
+    if (input.name === 'file' && input.closest('[data-upload-form]') && input.files[0]) {
+      input.form.elements.version.value = suggestVersion(input.files[0].name);
+    }
+  };
   main.addEventListener('click', onClick);
+  main.addEventListener('submit', onSubmit);
+  main.addEventListener('change', onChange);
   let waiting = null;
   if (site.deploy_mode === 'hosting' && site.state === 'unpaired') {       // the agent's "Connect" button finishes elsewhere
     waiting = setInterval(async () => {
@@ -329,5 +496,13 @@ export async function render(main, [siteId, tabName], app, isCurrent) {
       } catch (e) { /* try again */ }
     }, 5000);
   }
-  return () => { main.removeEventListener('click', onClick); if (waiting) clearInterval(waiting); };
+  const cleanup = () => {
+    main.removeEventListener('click', onClick);
+    main.removeEventListener('submit', onSubmit);
+    main.removeEventListener('change', onChange);
+    if (waiting) clearInterval(waiting);
+    if (main.siteCleanup === cleanup) main.siteCleanup = null;
+  };
+  main.siteCleanup = cleanup;
+  return cleanup;
 }

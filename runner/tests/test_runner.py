@@ -18,7 +18,13 @@ restore. HTTPS runner: public key pin (same as openssl computes it), wrong pin, 
 Hosting without a terminal (PHP in PATH or ROLLOUT_TEST_PHP, ini ROLLOUT_TEST_PHP_INI; needs zip and pdo_sqlite): the
 generated agent file served by PHP's built-in server, connecting, adoption of files made by hand, database changes run
 or marked as done by hand, automatic rollback, rollback, backups kept on the runner and restore, a published subfolder,
-signatures, replays and unsafe archives refused."""
+signatures, replays and unsafe archives refused.
+Uploaded versions (no GitHub): a zip in pieces with junk that is removed, a tar.gz, refused uploads, pruning, archives
+unpacked by bsdtar (when there is one). Laravel on a hosting (fake Laravel application that records what the agent asks):
+the .env prepared in the dashboard and sent when the agent connects, only public/ in the website folder, APP_KEY,
+php artisan migrate inside PHP, the plan of migrations, artisan jobs, rollback, editing the .env, composer on the runner
+when vendor/ is missing, the PHP version check, the agent replacing itself, adopting a Laravel website, the hidden data
+folder."""
 import base64
 import hashlib
 import io
@@ -28,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -38,6 +45,7 @@ import urllib.request
 import zipfile
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -47,10 +55,13 @@ from arsika_rollout_manager.client import Client, PinError  # noqa: E402
 from arsika_rollout_manager.compose import ComposeError  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
-from arsika_rollout_manager.hosting import AgentClient, AgentError  # noqa: E402
+from arsika_rollout_manager import hosting as hosting_module  # noqa: E402
+from arsika_rollout_manager.hosting import AgentClient, AgentError, artisan_command, valid_agent_url  # noqa: E402
 from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
 from arsika_rollout_manager import system  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
+from arsika_rollout_manager.uploads import (UploadError, excluded, php_satisfies, suggest_version,  # noqa: E402
+                                            unpack_with_tool)
 from arsika_rollout_manager.util import certificate_pin  # noqa: E402
 from arsika_rollout_manager.worker import Worker  # noqa: E402
 
@@ -59,6 +70,7 @@ OPENSSL = os.environ.get("ROLLOUT_TEST_OPENSSL") or shutil.which("openssl")
 PHP = os.environ.get("ROLLOUT_TEST_PHP") or shutil.which("php")
 PHP_INI = os.environ.get("ROLLOUT_TEST_PHP_INI") or ""
 FAKE_DOCKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_docker.py")
+FAKE_COMPOSER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_composer.py")
 SITE_TOKEN = "github_pat_" + "s" * 40                    # the demo site's own (fake) read-only token
 
 
@@ -1112,6 +1124,496 @@ class HostingTest(unittest.TestCase):
         with self.assertRaises(AgentError) as error:
             AgentClient(url, secret).call("status")
         self.assertEqual(error.exception.code, "bad_signature")
+
+
+def make_tar(files, top=""):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as t:
+        for name, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            info = tarfile.TarInfo(top + name)
+            info.size, info.mode = len(data), 0o644
+            t.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+class LogLines(object):
+    def __init__(self):
+        self.lines = []
+
+    def line(self, text):
+        self.lines.append(text)
+    step = output = error = line
+
+
+class UploadMixin(object):
+    call = RunnerTest.call
+    wait_job = RunnerTest.wait_job
+
+    def upload(self, site, name, data, version=None, chunk=None, expect="succeeded"):
+        """Send an archive like the dashboard does: start, pieces, finish (-> the upload job)."""
+        start = self.call("POST", "/v1/sites/%s/uploads" % site, {"name": name, "size": len(data), "version": version, "actor": "test"})
+        step, offset = chunk or start["chunk_size"], 0
+        while offset < len(data):
+            status, doc = self.client.request("PUT", "/v1/sites/%s/uploads/%s?offset=%d" % (site, start["id"], offset),
+                                              raw=data[offset:offset + step])
+            self.assertEqual(status, 200, doc)
+            offset = doc["data"]["received"]
+        return self.wait_job(self.call("POST", "/v1/sites/%s/uploads/%s/finish" % (site, start["id"]), {"actor": "test"}), expect)
+
+    def runner(self, prefix, **options):
+        cls = type(self)
+        config_path = os.path.join(cls.tmp, "etc", "runner.json")
+        os.makedirs(os.path.dirname(config_path))
+        cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
+                                   github_api="http://127.0.0.1:9", shell=SHELL, port=0, health_attempts=2, health_delay=0.3,
+                                   **options)
+        cls.config.prepare_dirs()
+        store = Store(cls.config.state_path("runner.db"))
+        cls.deployer = Deployer(cls.config, store, Backups(cls.config, store))
+        cls.worker = Worker(cls.config, store, cls.deployer)
+        cls.worker.start()
+        cls.server = serve(Api(cls.config, store, cls.deployer, cls.worker))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.client = Client("http://127.0.0.1:%d" % cls.server.server_address[1], cls.config["secret"])
+
+
+class UploadTest(UploadMixin, unittest.TestCase):
+    """Versions uploaded through the dashboard for a site on this server (no GitHub)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-upload-")
+        cls.www = os.path.join(cls.tmp, "wwwroot")
+        cls.site_dir = os.path.join(cls.www, "up.example.com")
+        os.makedirs(cls.site_dir)
+        cls.web = HTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=os.path.join(cls.site_dir, "public")))
+        threading.Thread(target=cls.web.serve_forever, daemon=True).start()
+        UploadMixin.runner(cls(), "upload", site_roots=[cls.www])
+
+    @classmethod
+    def tearDownClass(cls):
+        stop(cls.server, cls.web)
+        cls.worker.stopping = True
+        cls.worker.wake.set()
+        time.sleep(0.3)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def job(self, job_type, version=None, params=None, expect="succeeded", site="up"):
+        job = self.call("POST", "/v1/sites/%s/jobs" % site, {"type": job_type, "version": version, "params": params or {}, "actor": "test"})
+        return self.wait_job(job, expect)
+
+    def page(self):
+        with open(os.path.join(self.site_dir, "public", "version.txt"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_00_register_without_a_repository(self):
+        status, doc = self.client.post("/v1/sites", {"preset": "static", "id": "nogit", "path": os.path.join(self.www, "x"), "repo": ""})
+        self.assertEqual((status, set(doc["error"]["fields"])), (422, {"repo"}))                 # GitHub sites need one
+        created = self.call("POST", "/v1/sites", {
+            "preset": "static", "id": "up", "path": self.site_dir, "source": "upload", "repo": "", "web_user": "", "keep_releases": 2,
+            "upload_keep": 2, "health_url": "http://127.0.0.1:%d/version.txt" % self.web.server_address[1], "health_contains": "version {version}"})
+        self.assertEqual((created["state"], created["latest_version"], created["source"]), ("empty", None, "upload"))
+        status, doc = self.client.post("/v1/sites/up/jobs", {"type": "deploy", "version": "003"})
+        self.assertEqual((status, doc["error"]["fields"].get("version")), (422, "Upload this version first."))
+
+    def test_01_upload_a_zip_in_pieces(self):
+        files = {"index.html": "<h1>up</h1>", "version.txt": "version 003", ".env": "APP_KEY=local-secret", "node_modules/a/i.js": "x",
+                 ".git/HEAD": "ref", "sub/.DS_Store": "x", "storage/logs/laravel.log": "log", "storage/logs/.gitignore": "*\n",
+                 "bootstrap/cache/packages.php": "<?php", "deploy/run.sh": "#!/bin/sh\necho hi\n", ".env.example": "APP_KEY=\n"}
+        job = self.upload("up", "site#003.zip", make_zip({"site#003/" + k: v for k, v in files.items()}), chunk=700)
+        self.assertEqual(job["to_version"], "003")                                             # from the file name
+        removed = [l for l in job["log"]["text"].splitlines() if "removed (not deployed)" in l][0]
+        self.assertTrue({".env", "node_modules/", ".git/", "sub/.DS_Store"} <= set(removed.split(": ", 2)[-1].split(", ")), removed)
+        releases = self.call("GET", "/v1/sites/up/releases")["releases"]
+        self.assertEqual([(r["version"], r["uploaded"], r["name"]) for r in releases], [("003", True, "site#003.zip")])
+        with zipfile.ZipFile(self.deployer.uploads.archive("up", "003")) as z:
+            names = set(z.namelist())
+            mode = z.getinfo("deploy/run.sh").external_attr >> 16
+        self.assertTrue({"index.html", ".env.example", "storage/logs/.gitignore", "bootstrap/cache/"} <= names, names)
+        self.assertFalse({".env", "node_modules/a/i.js", ".git/HEAD", "sub/.DS_Store", "storage/logs/laravel.log",
+                          "bootstrap/cache/packages.php"} & names)
+        if os.name == "posix":
+            self.assertTrue(mode & 0o111)
+        self.assertEqual(self.call("GET", "/v1/sites/up")["latest_version"], "003")
+
+    def test_02_deploy_uploads(self):
+        job = self.job("deploy", "003")
+        self.assertIn("Take the uploaded version 003", job["log"]["text"])
+        self.assertEqual(self.page(), "version 003")
+        self.upload("up", "site-004.tar.gz", make_tar({"index.html": "<h1>up</h1>", "version.txt": "version 004"}, top="site-004/"))
+        details = self.call("GET", "/v1/sites/up")
+        self.assertEqual((details["latest_version"], details["update_available"]), ("004", True))
+        self.job("deploy", "004")
+        self.assertEqual(self.page(), "version 004")
+        self.job("rollback")
+        self.assertEqual(self.page(), "version 003")
+
+    def test_03_refused_uploads(self):
+        status, doc = self.client.post("/v1/sites/up/uploads", {"name": "notes.txt", "size": 10})
+        self.assertEqual(status, 422)
+        status, doc = self.client.post("/v1/sites/up/uploads", {"name": "again.zip", "size": 10, "version": "003"})
+        self.assertIn("uploaded already", doc["error"]["message"])
+        start = self.call("POST", "/v1/sites/up/uploads", {"name": "half.zip", "size": 100, "version": "half"})
+        self.client.request("PUT", "/v1/sites/up/uploads/%s?offset=0" % start["id"], raw=b"x" * 10)
+        status, doc = self.client.post("/v1/sites/up/uploads/%s/finish" % start["id"])
+        self.assertIn("incomplete", doc["error"]["message"])
+        job = self.upload("up", "evil.zip", make_zip({"../evil.txt": "x"}), version="evil", expect="failed")
+        self.assertIn("unsafe path", job["message"])
+        job = self.upload("up", "junk.zip", b"this is not an archive at all", version="junk", expect="failed")
+        self.assertIn("not an archive", job["message"])
+        self.assertEqual(sorted(v["version"] for v in self.deployer.uploads.versions("up")), ["003", "004"])
+        self.call("POST", "/v1/sites", {"preset": "static", "id": "gh", "path": os.path.join(self.www, "gh"), "repo": "o/gh"})
+        status, doc = self.client.post("/v1/sites/gh/uploads", {"name": "a.zip", "size": 10})
+        self.assertEqual((status, doc["error"]["code"]), (409, "not_upload"))
+        status, doc = self.client.request("DELETE", "/v1/sites/up/uploads/003")                # live
+        self.assertEqual(status, 409)
+
+    def test_04_prune_keeps_the_newest_uploads(self):
+        for version in ("005", "006"):
+            self.upload("up", "site-%s.zip" % version, make_zip({"version.txt": "version " + version}))
+        self.job("deploy", "005")
+        self.job("deploy", "006")
+        self.assertEqual([v["version"] for v in self.deployer.uploads.versions("up")], ["006", "005"])   # upload_keep 2
+
+    def test_05_unpack_with_a_program(self):
+        tool = shutil.which("bsdtar") or (r"C:\Windows\System32\tar.exe" if os.path.isfile(r"C:\Windows\System32\tar.exe") else None)
+        if not tool:
+            self.skipTest("no bsdtar")
+        archive = os.path.join(self.tmp, "tool.tar.gz")
+        with open(archive, "wb") as f:
+            f.write(make_tar({"index.html": "tool", "css/app.css": "body{}"}, top="app/"))
+        dest = os.path.join(self.tmp, "tool-out")
+        os.makedirs(dest)
+        log = LogLines()
+        files, skipped = unpack_with_tool({"bsdtar": tool}, "rar", archive, dest, log)
+        self.assertEqual((files, skipped), (2, 0))
+        with open(os.path.join(dest, "app", "index.html"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "tool")
+        with mock.patch("arsika_rollout_manager.uploads.archive_tools", return_value=[]):
+            with self.assertRaises(UploadError) as error:
+                unpack_with_tool({}, "rar", archive, dest, log)
+        self.assertIn("libarchive-tools", str(error.exception))
+
+    def test_06_helpers(self):
+        self.assertEqual(suggest_version("absensi-finger#003.rar"), "003")
+        self.assertEqual(suggest_version("shop-v1.2.0.tar.gz"), "1.2.0")
+        self.assertRegex(suggest_version("backup.zip"), r"^\d{8}-\d{4}$")
+        self.assertFalse(php_satisfies("^8.2", "8.1.27"))
+        self.assertTrue(php_satisfies("^8.2", "8.3.1"))
+        self.assertTrue(php_satisfies("^7.4|^8.0", "8.1.0"))
+        self.assertFalse(php_satisfies(">=8.3", "8.2.9"))
+        self.assertTrue(excluded("storage/logs/laravel.log", False, ["storage/logs/*"]))
+        self.assertFalse(excluded("storage/logs/.gitignore", False, ["storage/logs/*"]))
+        self.assertTrue(excluded("a/b/.DS_Store", False, ["**/.DS_Store"]))
+        self.assertFalse(excluded("config/.env", False, [".env"]))                              # only the top level
+        for url in ("http://192.168.1.20/rollout-agent-abc123.php", "http://nas.local/site/rollout-agent-abc123.php",
+                    "http://10.0.0.5:8080/a.php", "https://example.com/a.php"):
+            self.assertEqual(valid_agent_url(url), url)
+        self.assertIsNone(valid_agent_url("http://example.com/a.php"))                         # plain http: local networks only
+        self.assertEqual(artisan_command("php artisan migrate:status"), "migrate:status")
+        for refused in ("serve", "tinker", "queue:work", "a; rm -rf /", "migrate\nstatus"):
+            with self.assertRaises(DeployError):
+                artisan_command(refused)
+        self.assertEqual(artisan_command("queue:work --stop-when-empty"), "queue:work --stop-when-empty")
+        self.assertEqual(artisan_command('tinker --execute="echo 1;"'), 'tinker --execute="echo 1;"')         # no input needed
+
+
+FAKE_LARAVEL_AUTOLOAD = r"""<?php
+// Test double of a Laravel application (vendor/autoload.php): the page and artisan show what the agent set up.
+namespace Illuminate\Http {
+    class Request { public static function capture() { return new self(); } }
+}
+namespace Symfony\Component\Console\Output {
+    class BufferedOutput {
+        private $text = '';
+        public function write($message, $newline = false) { $this->text .= $message . ($newline ? "\n" : ''); }
+        public function writeln($message) { $this->write($message, true); }
+        public function fetch() { $text = $this->text; $this->text = ''; return $text; }
+    }
+}
+namespace FakeLaravel {
+    class Application {
+        public $base; public $env; public $storage; public $public;
+        public function __construct($base) { $this->base = $base; $this->env = $base; $this->storage = $base . '/storage'; $this->public = $base . '/public'; }
+        public function useEnvironmentPath($path) { $this->env = $path; return $this; }
+        public function useStoragePath($path) { $this->storage = $path; return $this; }
+        public function usePublicPath($path) { $this->public = $path; return $this; }
+        public function values() {
+            $values = [];
+            foreach (@file($this->env . '/.env', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+                if (strpos($line, '=') !== false && $line[0] !== '#') { list($k, $v) = explode('=', $line, 2); $values[trim($k)] = trim($v); }
+            }
+            return $values;
+        }
+        public function make($abstract) { return new ConsoleKernel($this); }
+        public function handleRequest($request) {
+            $env = $this->values();
+            header('Content-Type: text/plain');
+            echo 'app ' . trim((string)@file_get_contents($this->base . '/VERSION')) . ' env=' . ($env['APP_NAME'] ?? '-')
+                . ' key=' . (($env['APP_KEY'] ?? '') !== '' ? 'set' : 'empty')
+                . ' public=' . (realpath($this->public) === realpath(dirname($_SERVER['SCRIPT_FILENAME'])) ? 'web' : 'other')
+                . ' storage=' . (is_dir($this->storage . '/framework/views') ? 'ok' : 'missing');
+        }
+    }
+    class ConsoleKernel {
+        private $app;
+        public function __construct($app) { $this->app = $app; }
+        public function call($command, array $parameters = [], $output = null) {
+            @file_put_contents($this->app->storage . '/logs/artisan.log', $command . "\n", FILE_APPEND);
+            $name = strtok($command, ' ');
+            if ($name === 'fail') { $output->writeln('boom'); return 1; }
+            if ($name === 'explode') { throw new \RuntimeException('kaput'); }
+            if ($name === 'migrate' || $name === 'migrate:status') {
+                $env = $this->app->values();
+                $pdo = new \PDO('sqlite:' . $env['DB_DATABASE']);
+                $pdo->exec('CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, migration TEXT, batch INTEGER)');
+                $done = $pdo->query('SELECT migration FROM migrations')->fetchAll(\PDO::FETCH_COLUMN);
+                foreach (glob($this->app->base . '/database/migrations/*.php') as $file) {
+                    $migration = basename($file, '.php');
+                    if ($name === 'migrate' && !in_array($migration, $done, true)) {
+                        $pdo->prepare('INSERT INTO migrations (migration, batch) VALUES (?, 1)')->execute([$migration]);
+                        $output->writeln('Migrated: ' . $migration);
+                    } elseif ($name === 'migrate:status') {
+                        $output->writeln((in_array($migration, $done, true) ? 'Ran ' : 'Pending ') . $migration);
+                    }
+                }
+                return 0;
+            }
+            $output->writeln('ran ' . $command);
+            return 0;
+        }
+    }
+}
+"""
+
+
+def laravel_files(version, migrations=1, vendor=True, php=">=7.4", junk=True):
+    files = {
+        "artisan": "#!/usr/bin/env php\n<?php // fake artisan\n", "VERSION": version, "composer.json": json.dumps({"require": {"php": php}}),
+        "bootstrap/app.php": "<?php\nreturn new FakeLaravel\\Application(dirname(__DIR__));\n", "bootstrap/cache/.gitignore": "*\n",
+        "public/index.php": "<?php\nrequire __DIR__.'/../vendor/autoload.php';\n$app = require_once __DIR__.'/../bootstrap/app.php';\n"
+                            "$app->handleRequest(Illuminate\\Http\\Request::capture());\n",
+        "public/.htaccess": "# the front controller of laravel\n", "public/robots.txt": "robots " + version, "public/css/app.css": "body{}",
+        "storage/app/public/.gitignore": "*\n", "storage/framework/views/.gitignore": "*\n", "storage/logs/.gitignore": "*\n",
+        ".env.example": "APP_NAME=Fake\nAPP_ENV=local\nAPP_KEY=\nAPP_DEBUG=true\nAPP_URL=http://localhost\nDB_CONNECTION=sqlite\n",
+        "database/migrations/2026_01_01_000000_create_notes.php": "<?php // notes\n",
+    }
+    if migrations > 1:
+        files["database/migrations/2026_02_01_000000_add_title.php"] = "<?php // title\n"
+    if vendor:
+        files["vendor/autoload.php"] = FAKE_LARAVEL_AUTOLOAD
+    if junk:
+        files.update({".env": "APP_NAME=Local\nDB_PASSWORD=local-secret\n", "storage/logs/laravel.log": "local log",
+                      "node_modules/x/index.js": "x", "bootstrap/cache/packages.php": "<?php return [];"})
+    return files
+
+
+@unittest.skipUnless(PHP, "PHP is needed to run the hosting agent")
+class LaravelHostingTest(UploadMixin, unittest.TestCase):
+    """A Laravel site on a "hosting" (a folder served by PHP's built-in server), installed from uploaded versions."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-laravel-")
+        cls.home = os.path.join(cls.tmp, "home")
+        cls.docroot = os.path.join(cls.home, "public_html")
+        os.makedirs(cls.docroot)
+        cls.db = os.path.join(cls.tmp, "lara.sqlite").replace("\\", "/")
+        autoload = os.path.join(cls.tmp, "fake-autoload.php")
+        with open(autoload, "w", encoding="utf-8", newline="\n") as f:
+            f.write(FAKE_LARAVEL_AUTOLOAD)
+        os.environ["FAKE_COMPOSER_AUTOLOAD"] = autoload
+        cls.php, cls.port = php_server(cls.docroot)
+        cls.extra_php = []
+        UploadMixin.runner(cls(), "laravel", site_roots=[cls.tmp], composer_command=[sys.executable, FAKE_COMPOSER])
+
+    @classmethod
+    def tearDownClass(cls):
+        stop(cls.server)
+        cls.worker.stopping = True
+        cls.worker.wake.set()
+        for proc in [cls.php] + cls.extra_php:
+            proc.terminate()
+            proc.wait(10)
+        time.sleep(0.3)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def job(self, job_type, version=None, params=None, expect="succeeded", site="lara"):
+        job = self.call("POST", "/v1/sites/%s/jobs" % site, {"type": job_type, "version": version, "params": params or {}, "actor": "test"})
+        return self.wait_job(job, expect)
+
+    def live(self, name, docroot=None):
+        with open(os.path.join(docroot or self.docroot, name), encoding="utf-8") as f:
+            return f.read()
+
+    def page(self, port=None):
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % (port or self.port), timeout=10) as response:
+            return response.read().decode("utf-8")
+
+    def agent_url(self):
+        return "http://127.0.0.1:%d/%s" % (self.port, self.agent_name)
+
+    def shared(self, *parts):
+        return os.path.join(self.home, ".rollout-agent-lara", "shared", *parts)
+
+    def migrations(self):
+        import sqlite3
+        with sqlite3.connect(self.db) as db:
+            return [r[0] for r in db.execute("SELECT migration FROM migrations ORDER BY id")]
+
+    def test_00_register_upload_and_prepare_the_env(self):
+        created = self.call("POST", "/v1/sites", {"preset": "hosting-laravel", "id": "lara", "source": "upload", "repo": "",
+                                                  "health_contains": "app {version}"})
+        settings = created["settings"]
+        self.assertEqual((settings["docroot_target"], settings["hosting_app"], settings["health_url"]), ("public", "laravel", "{site_url}/"))
+        self.assertIsNone(created["health"])                                                    # no address before connecting
+        job = self.upload("lara", "lara#1.0.0.zip", make_zip({"lara/" + k: v for k, v in laravel_files("1.0.0").items()}))
+        self.assertEqual(job["to_version"], "1.0.0")
+        env = self.call("GET", "/v1/sites/lara/env")
+        self.assertEqual((env["exists"], env["where"], env["laravel"]), (False, "dashboard", True))
+        self.assertIn("APP_ENV=production", env["template"])
+        self.assertIn("APP_DEBUG=false", env["template"])
+        self.assertRegex(env["template"], r"APP_KEY=base64:\S{40,}")
+        saved = self.call("PUT", "/v1/sites/lara/env", {"content": "APP_NAME=Lara\nAPP_KEY=\nDB_CONNECTION=sqlite\nDB_DATABASE=%s\n" % self.db})
+        self.assertEqual(saved["where"], "dashboard")
+        self.assertTrue(self.call("GET", "/v1/sites/lara")["env"]["pending"])
+
+    def test_01_connect_sends_the_env(self):
+        agent = self.call("POST", "/v1/sites/lara/agent-file", {"dashboard": "https://dash.example.com"})
+        type(self).agent_name = agent["filename"]
+        with open(os.path.join(self.docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        with urllib.request.urlopen(self.agent_url(), timeout=10) as response:
+            page = response.read().decode("utf-8")
+        self.assertIn('id="ra-dash"', page)                                                     # the address can be changed
+        self.assertIn('value="https://dash.example.com"', page)
+        self.call("POST", "/v1/sites/lara/agent/connect", {"url": self.agent_url()})
+        self.assertIn("APP_NAME=Lara", self.live(self.shared(".env")))
+        details = self.call("GET", "/v1/sites/lara")
+        self.assertEqual((details["env"]["pending"], details["env"]["on_hosting"], details["state"]), (False, True, "empty"))
+
+    def test_02_deploy(self):
+        job = self.job("deploy", "1.0.0")
+        log = job["log"]["text"]
+        self.assertIn("APP_KEY was empty", log)
+        self.assertIn("$ php artisan migrate --force", log)
+        self.assertIn("Migrated: 2026_01_01_000000_create_notes", log)
+        names = set(os.listdir(self.docroot))
+        self.assertTrue({"index.php", "robots.txt", "css", ".htaccess", self.agent_name} <= names, names)
+        self.assertFalse({"vendor", "app", "artisan", ".env", "bootstrap", "VERSION", "composer.json", "database"} & names, names)
+        self.assertEqual(self.page(), "app 1.0.0 env=Lara key=set public=web storage=ok")
+        self.assertIn("Arsika Rollout Manager", self.live("index.php"))
+        self.assertRegex(self.live(self.shared(".env")), r"APP_KEY=base64:\S{40,}")
+        self.assertEqual(self.migrations(), ["2026_01_01_000000_create_notes"])
+        self.assertTrue(self.call("GET", "/v1/sites/lara")["health"]["ok"])                    # {site_url}/
+
+    def test_03_plan_and_update(self):
+        self.upload("lara", "lara-1.1.0.zip", make_zip(laravel_files("1.1.0", migrations=2)))
+        plan = self.call("GET", "/v1/sites/lara/plan?version=1.1.0")
+        self.assertEqual((plan["kind"], [m["name"] for m in plan["migrations"]]), ("laravel", ["2026_02_01_000000_add_title.php"]))
+        self.job("deploy", "1.1.0")
+        self.assertTrue(self.page().startswith("app 1.1.0 env=Lara"))
+        self.assertEqual(self.call("GET", "/v1/sites/lara/plan?version=1.1.0")["migrations"], [])
+
+    def test_04_artisan_jobs(self):
+        job = self.job("artisan", params={"command": "php artisan migrate:status"})
+        self.assertIn("Ran 2026_02_01_000000_add_title", job["log"]["text"])
+        status, doc = self.client.post("/v1/sites/lara/jobs", {"type": "artisan", "params": {"command": "serve"}})
+        self.assertEqual(status, 422)
+        job = self.job("artisan", params={"command": "fail"}, expect="failed")
+        self.assertIn("boom", job["log"]["text"])
+        self.assertIn("exit code 1", job["message"])
+        job = self.job("artisan", params={"command": "explode"}, expect="failed")
+        self.assertIn("kaput", job["message"])
+        self.assertIn("migrate:status --no-interaction", self.live(self.shared("storage", "logs", "artisan.log")))
+
+    def test_05_rollback_and_edit_the_env(self):
+        self.job("rollback")
+        self.assertTrue(self.page().startswith("app 1.0.0 env=Lara"))
+        env = self.call("GET", "/v1/sites/lara/env")
+        self.assertEqual((env["exists"], env["where"]), (True, "hosting"))
+        self.call("PUT", "/v1/sites/lara/env", {"content": env["content"].replace("APP_NAME=Lara", "APP_NAME=Lara2")})
+        self.assertIn("env=Lara2", self.page())                                                # no deployment needed
+        self.assertEqual(len(os.listdir(os.path.join(self.home, ".rollout-agent-lara", "env-previous"))), 1)
+
+    def test_06_vendor_from_composer_and_the_php_check(self):
+        job = self.upload("lara", "lara-1.2.0.zip", make_zip(laravel_files("1.2.0", vendor=False)))
+        self.assertIn("Install the PHP dependencies with composer", job["log"]["text"])
+        with zipfile.ZipFile(self.deployer.uploads.archive("lara", "1.2.0")) as z:
+            self.assertIn("vendor/autoload.php", z.namelist())
+            self.assertIn("--no-dev", z.read("vendor/composer-arguments.txt").decode())
+        self.upload("lara", "lara-9.0.0.zip", make_zip(laravel_files("9.0.0", php=">=99.0")))
+        job = self.job("deploy", "9.0.0", expect="failed")
+        self.assertIn("needs PHP >=99.0", job["message"])
+        self.assertNotIn("Backup", job["log"]["text"])                                        # stopped before anything else
+
+    def test_07_the_agent_updates_itself(self):
+        template = os.path.join(self.tmp, "agent-1.5.1.php")
+        with open(hosting_module.TEMPLATE, encoding="utf-8") as f:
+            text = f.read().replace("const RA_VERSION = '1.5.0';", "const RA_VERSION = '1.5.1';")
+        with open(template, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        before = self.live(self.agent_name)
+        with mock.patch.object(hosting_module, "__version__", "1.5.1"), mock.patch.object(hosting_module, "TEMPLATE", template):
+            job = self.job("deploy", "1.2.0")
+        self.assertIn("Update the agent file on the hosting (1.5.0 -> 1.5.1)", job["log"]["text"])
+        after = self.live(self.agent_name)
+        self.assertIn("const RA_VERSION = '1.5.1';", after)
+        key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", after).group(1)
+        self.assertNotIn(key, before)
+        with open(os.path.join(self.home, ".rollout-agent-lara", "state.php"), encoding="utf-8") as f:
+            state = json.loads(f.read().split("\n", 1)[1])
+        self.assertEqual(state["pairing_hash"], hashlib.sha256(key.encode()).hexdigest())     # the new key connects nobody
+        self.assertTrue(self.page().startswith("app 1.2.0 env=Lara2"))
+
+    def test_08_adopt_a_laravel_website_in_the_folder(self):
+        home = os.path.join(self.tmp, "home2")
+        docroot = os.path.join(home, "public_html")
+        db = os.path.join(self.tmp, "old.sqlite").replace("\\", "/")
+        for name, text in (("artisan", "<?php // old"), ("index.php", "<?php echo 'old site';"), ("public/index.php", "<?php // old"),
+                           (".env", "APP_NAME=Old\nAPP_KEY=base64:b2xkb2xkb2xkb2xkb2xkb2xkb2xkb2xkb2xkb2xkb2s=\nDB_CONNECTION=sqlite\nDB_DATABASE=%s\n" % db),
+                           ("storage/app/public/photo.txt", "photo"), ("storage/framework/views/.keep", "")):
+            os.makedirs(os.path.dirname(os.path.join(docroot, name)), exist_ok=True)
+            with open(os.path.join(docroot, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        proc, port = php_server(docroot)
+        self.extra_php.append(proc)
+        self.call("POST", "/v1/sites", {"preset": "hosting-laravel", "id": "lara2", "source": "upload", "repo": "",
+                                        "health_url": "http://127.0.0.1:%d/" % port, "health_contains": "app {version}"})
+        self.upload("lara2", "lara.zip", make_zip(laravel_files("1.0.0")), version="1.0.0")
+        agent = self.call("POST", "/v1/sites/lara2/agent-file", {"dashboard": "https://dash.example.com"})
+        with open(os.path.join(docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        self.assertEqual(self.call("POST", "/v1/sites/lara2/agent/connect",
+                                   {"url": "http://127.0.0.1:%d/%s" % (port, agent["filename"])})["state"], "classic")
+        job = self.job("adopt", "1.0.0", site="lara2")
+        self.assertIn(".env taken over from the website folder", job["log"]["text"])
+        self.assertIn("database migrations not run", job["log"]["text"])                       # the running site has them
+        self.assertEqual(self.page(port), "app 1.0.0 env=Old key=set public=web storage=ok")
+        data = os.path.join(home, ".rollout-agent-lara2")
+        self.assertEqual(self.live(os.path.join(data, "shared", "storage", "app", "public", "photo.txt")), "photo")
+        self.assertTrue(os.path.isfile(os.path.join(data, "releases", "_pre_rollout", "artisan")))
+        self.assertFalse(os.path.exists(os.path.join(docroot, ".env")))
+
+    def test_09_an_old_data_folder_in_the_website_folder_gets_a_hidden_name(self):
+        docroot = os.path.join(self.tmp, "home3", "public_html")
+        old = os.path.join(docroot, ".rollout-agent-shop3")
+        os.makedirs(os.path.join(old, "releases"))
+        with open(os.path.join(old, "state.php"), "w", encoding="utf-8") as f:
+            f.write("<?php exit; ?>\n{}")
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "shop3", "source": "upload", "repo": ""})
+        agent = self.call("POST", "/v1/sites/shop3/agent-file", {"dashboard": "https://dash.example.com"})
+        with open(os.path.join(docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        proc, port = php_server(docroot)
+        self.extra_php.append(proc)
+        key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", agent["content"]).group(1)
+        AgentClient("http://127.0.0.1:%d/%s" % (port, agent["filename"]), key).call("hello")
+        hidden = [n for n in os.listdir(docroot) if n.startswith(".rollout-agent-shop3")]
+        self.assertEqual(len(hidden), 1)
+        self.assertRegex(hidden[0], r"^\.rollout-agent-shop3-[0-9a-f]{16}$")                    # not guessable on nginx
+        self.assertTrue(os.path.isdir(os.path.join(docroot, hidden[0], "releases")))
 
 
 if __name__ == "__main__":

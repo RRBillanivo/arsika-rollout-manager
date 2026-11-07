@@ -14,6 +14,8 @@ export default {
       job_delete_release: 'Hapus versi dari server', job_cleanup_adopt: 'Hapus _pre_rollout', backup_deleted: 'Hapus backup',
       server_added: 'Tambah server', server_updated: 'Ubah server', server_removed: 'Hapus server dari dasbor', runner_update: 'Update runner server', agent_file: 'Unduh file agen hosting', agent_connected: 'Hubungkan hosting',
       github_token_changed: 'Ubah token GitHub',
+      version_uploaded: 'Unggah versi', upload_deleted: 'Hapus versi unggahan', env_viewed: 'Buka .env situs', env_saved: 'Simpan .env situs',
+      job_artisan: 'Perintah artisan',
     },
   },
   en: {
@@ -30,6 +32,8 @@ export default {
       job_delete_release: 'Version deleted from the server', job_cleanup_adopt: '_pre_rollout deleted', backup_deleted: 'Backup deleted',
       server_added: 'Server added', server_updated: 'Server changed', server_removed: 'Server removed from the dashboard', runner_update: 'Runner of a server updated', agent_file: 'Hosting agent file downloaded', agent_connected: 'Hosting connected',
       github_token_changed: 'GitHub token changed',
+      version_uploaded: 'Version uploaded', upload_deleted: 'Uploaded version deleted', env_viewed: 'Site .env opened', env_saved: 'Site .env saved',
+      job_artisan: 'Artisan command',
     },
   },
 };

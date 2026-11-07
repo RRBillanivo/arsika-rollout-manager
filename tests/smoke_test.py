@@ -11,7 +11,10 @@ with a wrong key pin, without a pin and with a wrong secret, a site on that serv
 log, history), site ids unique across servers, "Update runner" (the runner installs a release and restarts, as systemd
 would start it again), a server that is down, removing the server. The dashboard writes a linked .env through the link.
 Hosting without a terminal (needs the zip extension for --agent-php-ini, default --php-ini): a hosting site, its agent
-file (password), the agent on a second PHP server, connecting, the plan of database changes, a deployment."""
+file (password), the agent on a second PHP server, connecting, the plan of database changes, a deployment. A Laravel site
+on a hosting whose versions are uploaded through the dashboard: the upload in pieces (CSRF), the .env prepared before
+connecting (password), connecting, the plan of migrations, a deployment with php artisan migrate, an artisan job
+(password), the activity log."""
 import argparse
 import base64
 import http.cookiejar
@@ -35,7 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runner"))
 sys.path.insert(0, str(ROOT / "runner" / "tests"))
 from arsika_rollout_manager.util import certificate_pin  # noqa: E402
-from test_runner import AGENT_UPDATE_SCRIPT, FakeGitHub, release_files  # noqa: E402
+from test_runner import AGENT_UPDATE_SCRIPT, FakeGitHub, laravel_files, make_zip, release_files  # noqa: E402
 
 OPENSSL = os.environ.get("ROLLOUT_TEST_OPENSSL") or shutil.which("openssl")
 
@@ -160,6 +163,95 @@ def hosting_tests(admin, password, tmp, github, agent_php, base, run_job):
         check("agent file and connection in the activity log", {"agent_file", "agent_connected"} <= actions, str(actions))
         status, doc = admin.delete("sites/hosted", {"password": password})
         check("hosting site removed (the agent forgets its secret)", status == 200)
+    finally:
+        server.terminate()
+        server.wait(10)
+
+
+def laravel_tests(admin, password, tmp, agent_php, run_job):
+    """A Laravel site (a fake Laravel application) on a "hosting", its versions uploaded through the dashboard."""
+    docroot = tmp / "laravel" / "public_html"
+    docroot.mkdir(parents=True)
+    db = (tmp / "laravel.sqlite").as_posix()
+    port = free_port()
+    server = subprocess.Popen(agent_php + ["-S", "127.0.0.1:%d" % port, "-t", str(docroot)], cwd=str(docroot),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def finished(job_id):
+        for _ in range(240):
+            status, doc = admin.get("sites/absen/jobs/%d" % job_id)
+            if doc["data"]["status"] in ("succeeded", "failed"):
+                return doc["data"]
+            time.sleep(0.25)
+        return doc["data"]
+
+    try:
+        status, doc = admin.post("sites", {"preset": "hosting-laravel", "id": "absen", "name": "Absen", "source": "upload", "repo": "",
+                                           "health_contains": "app {version}", "password": password})
+        check("Laravel hosting site without a repository (its versions are uploaded)", status == 201
+              and doc["data"]["settings"]["hosting_app"] == "laravel" and doc["data"]["settings"]["source"] == "upload", json.dumps(doc)[:300])
+        archive = make_zip({"absen/" + k: v for k, v in laravel_files("1.0.0").items()})
+        status, doc = admin.post("sites/absen/uploads", {"name": "absen#1.0.0.zip", "size": len(archive)})
+        start = doc.get("data") or {}
+        check("upload started: version from the file name, pieces of at most 1 MB", status == 201 and start.get("version") == "1.0.0"
+              and 0 < start.get("chunk_size", 0) <= 1 << 20, json.dumps(doc)[:300])
+        status, _, raw = admin.raw("/api/v1/sites/absen/uploads/%s?offset=0" % start["id"], archive[:100],
+                                   {"Accept": "application/json", "Content-Type": "application/octet-stream"}, "POST")
+        check("a piece without the CSRF token is refused", status == 403)
+        offset = 0
+        while offset < len(archive):
+            status, _, raw = admin.raw("/api/v1/sites/absen/uploads/%s?offset=%d" % (start["id"], offset), archive[offset:offset + 1500],
+                                       {"Accept": "application/json", "Content-Type": "application/octet-stream", "X-CSRF-Token": admin.token}, "POST")
+            if status != 200:
+                break
+            offset = json.loads(raw)["data"]["received"]
+        check("the archive arrived in pieces", offset == len(archive), raw[:300])
+        status, doc = admin.post("sites/absen/uploads/%s/finish" % start["id"])
+        job = finished(doc["data"]["id"]) if status == 201 else {}
+        check("the upload job stored version 1.0.0 (local .env removed)", job.get("status") == "succeeded" and ".env" in job["log"]["text"],
+              json.dumps(doc)[:300] + str(job.get("message")))
+        status, doc = admin.get("sites/absen/releases")
+        check("uploaded versions are listed like releases", status == 200 and [r["version"] for r in doc["data"]["releases"]] == ["1.0.0"]
+              and doc["data"]["releases"][0]["uploaded"], json.dumps(doc)[:300])
+        status, doc = admin.post("sites/absen/env/read", {})
+        check("reading the .env needs the password", status == 422 and "password" in doc["error"]["fields"])
+        status, doc = admin.post("sites/absen/env/read", {"password": password})
+        check(".env template from .env.example (production, new APP_KEY)", status == 200 and not doc["data"]["exists"]
+              and "APP_ENV=production" in doc["data"]["template"] and "APP_KEY=base64:" in doc["data"]["template"], json.dumps(doc)[:300])
+        content = "APP_NAME=Absen\nAPP_KEY=\nDB_CONNECTION=sqlite\nDB_DATABASE=%s\n" % db
+        status, doc = admin.put("sites/absen/env", {"content": content, "password": password})
+        check(".env prepared in the dashboard before connecting", status == 200 and doc["data"]["where"] == "dashboard", json.dumps(doc)[:300])
+        status, doc = admin.post("sites/absen/agent-file", {"password": password})
+        agent = doc["data"]
+        (docroot / agent["filename"]).write_text(agent["content"], encoding="utf-8")
+        url = "http://127.0.0.1:%d/%s" % (port, agent["filename"])
+        wait_for(url)
+        with urllib.request.urlopen(url, timeout=10) as response:
+            page = response.read().decode("utf-8")
+        check("the agent page has the address of the dashboard filled in", 'id="ra-dash"' in page)
+        status, doc = admin.post("sites/absen/agent/connect", {"url": url, "password": password})
+        check("connected: the prepared .env went to the hosting", status == 200 and doc["data"]["env"]["on_hosting"]
+              and not doc["data"]["env"]["pending"] and doc["data"]["state"] == "empty", json.dumps(doc)[:300])
+        status, doc = admin.get("sites/absen/plan?version=1.0.0")
+        check("plan: the Laravel migrations of the release", status == 200 and doc["data"]["kind"] == "laravel"
+              and [m["name"] for m in doc["data"]["migrations"]] == ["2026_01_01_000000_create_notes.php"], json.dumps(doc)[:300])
+        status, doc = run_job({"type": "deploy", "version": "1.0.0", "params": {"migrations": "auto"}}, site_id="absen")
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=10) as response:
+            served = response.read().decode("utf-8")
+        check("deploy: php artisan migrate inside PHP, only public/ in the website folder", doc["data"]["status"] == "succeeded"
+              and "php artisan migrate --force" in doc["data"]["log"]["text"] and served == "app 1.0.0 env=Absen key=set public=web storage=ok"
+              and not (docroot / "vendor").exists() and not (docroot / ".env").exists(), doc["data"].get("message", "") + served)
+        status, doc = admin.post("sites/absen/jobs", {"type": "artisan", "params": {"command": "migrate:status"}})
+        check("an artisan command needs the password", status == 422 and "password" in doc["error"]["fields"])
+        status, doc = run_job({"type": "artisan", "params": {"command": "migrate:status"}, "password": password}, site_id="absen")
+        check("artisan job through the dashboard", doc["data"]["status"] == "succeeded" and "Ran 2026_01_01_000000_create_notes" in doc["data"]["log"]["text"],
+              doc["data"].get("message", ""))
+        status, doc = admin.get("activity")
+        actions = {a["action"] for a in doc["data"]["actions"]}
+        check("upload, .env and artisan in the activity log", {"version_uploaded", "env_viewed", "env_saved", "job_artisan"} <= actions, str(actions))
+        check("the .env content is not in the activity log", "DB_DATABASE" not in json.dumps(doc["data"]))
+        status, doc = admin.delete("sites/absen", {"password": password})
+        check("Laravel hosting site removed", status == 200)
     finally:
         server.terminate()
         server.wait(10)
@@ -453,6 +545,8 @@ def main():
             print("  (skipped: the PHP for the agent has no zip extension; pass --agent-php-ini)")
         else:
             hosting_tests(admin, admin_password, tmp, github, agent_php, base, run_job)
+            print("== Laravel on a hosting, uploaded versions")
+            laravel_tests(admin, admin_password, tmp, agent_php, run_job)
 
         print("== .env behind a link")
         envdir = tmp / "envlink"

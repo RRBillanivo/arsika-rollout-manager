@@ -59,6 +59,12 @@ final class RunnerClient
         return $this->request('DELETE', $path);
     }
 
+    /** PUT bytes as they are (a piece of an uploaded archive), not JSON. */
+    public function putBytes(string $path, string $bytes)
+    {
+        return $this->request('PUT', $path, null, $bytes);
+    }
+
     public function configured(): bool
     {
         return $this->secret !== '';
@@ -75,9 +81,9 @@ final class RunnerClient
         }
     }
 
-    public function request(string $method, string $path, ?array $data = null)
+    public function request(string $method, string $path, ?array $data = null, ?string $bytes = null)
     {
-        $curl = $this->handle($method, $path, $data);
+        $curl = $this->handle($method, $path, $data, $bytes);
         $raw = curl_exec($curl);
         $status = (int)curl_getinfo($curl, CURLINFO_HTTP_CODE);
         $errno = curl_errno($curl);
@@ -141,7 +147,7 @@ final class RunnerClient
     }
 
     /** @return resource|object a prepared curl handle */
-    public function handle(string $method, string $path, ?array $data = null)
+    public function handle(string $method, string $path, ?array $data = null, ?string $bytes = null)
     {
         if ($this->secret === '') {
             throw new HttpException(503, 'runner_not_configured', $this->server === '' ? trans('runner.not_configured')
@@ -150,7 +156,8 @@ final class RunnerClient
         if (!function_exists('curl_init')) {
             throw new HttpException(503, 'runner_unavailable', trans('runner.curl_missing'));
         }
-        $body = $data === null || $method === 'GET' ? '' : (string)json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $body = $bytes !== null ? $bytes
+            : ($data === null || $method === 'GET' ? '' : (string)json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
         $target = rtrim((string)parse_url($this->url, PHP_URL_PATH), '/') . $path;
         $timestamp = time();
         $nonce = bin2hex(random_bytes(16));
@@ -161,7 +168,8 @@ final class RunnerClient
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT => $this->server === '' ? 3 : 5,
             CURLOPT_TIMEOUT => $this->timeout,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Rollout-Timestamp: ' . $timestamp, 'X-Rollout-Nonce: ' . $nonce,
+            CURLOPT_HTTPHEADER => ['Content-Type: ' . ($bytes !== null ? 'application/octet-stream' : 'application/json'),
+                                   'X-Rollout-Timestamp: ' . $timestamp, 'X-Rollout-Nonce: ' . $nonce,
                                    'X-Rollout-Signature: ' . $signature, 'Expect:'],
             CURLOPT_POSTFIELDS => $body,
             CURLOPT_PROXY => '',

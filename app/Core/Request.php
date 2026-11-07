@@ -128,6 +128,12 @@ final class Request
         return $list;
     }
 
+    /** The body as sent (a piece of an uploaded archive). */
+    public function body(): string
+    {
+        return $this->rawBody;
+    }
+
     /** true when the body was larger than post_max_size (PHP then drops all fields and files). */
     public function exceedsPostLimit(): bool
     {

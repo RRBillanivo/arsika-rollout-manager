@@ -48,8 +48,18 @@ not in a public issue.
 - Hosting agents: a generated PHP file per site answers only requests signed with that site's secret (timestamp ±5
   minutes, one-time nonce, lockout after repeated invalid requests); the key written into the file works once, to
   connect; the agent works only inside its website and data folders, refuses unsafe archives, never runs shell
-  commands, and keeps its secret outside the web root when the hosting allows it. Backups are moved off the hosting.
-  See [HOSTING.md](HOSTING.md#security).
+  commands, and keeps its secret outside the web root when the hosting allows it (inside it: a random folder name and
+  an `.htaccess` that denies access). Backups are moved off the hosting. Laravel applications live outside the website
+  folder. The runner may replace the agent with the agent of its own version (`self-update`, signed like every
+  request); the key in the new file is marked as used. Plain `http://` agent addresses are accepted only for local
+  networks. See [HOSTING.md](HOSTING.md#security).
+- Uploaded archives are unpacked into an empty folder on the runner's server: absolute paths, `..`, links and special
+  files are refused or dropped, the size and the number of files are limited, and the local `.env` and similar files
+  are removed before a version is stored. composer (Laravel without `vendor/`) runs with `--no-scripts --no-plugins`,
+  so no code of the project or its packages runs on the server.
+- artisan commands and the `.env` of hosting sites need the password; the activity log records the command name and
+  that the `.env` was opened or saved, never its content. The `.env` kept by the runner before a hosting connects is a
+  root-only file (0600) and is deleted once it is on the hosting.
 - Self-update: the runner installs only releases of `update_repo` (the official repository unless changed in
   `runner.json`), checks the asset's SHA-256 when GitHub provides it, and is asked to do so only by a signed request;
   the dashboard asks for the password first.

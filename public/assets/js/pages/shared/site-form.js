@@ -1,7 +1,8 @@
 // Site settings form, used by "Add site" and the Settings tab of a site. First choice: where the site runs, on a full
-// server (VPS/VM with the runner) or on a hosting with only a file manager (PHP agent). With a preset, only the basics
-// need filling in; the folder layout, deployment steps, Docker Compose, health check and backups are under "Advanced".
-// Every site has its own read-only GitHub token: write-only here, kept by the runner, never shown again.
+// server (VPS/VM with the runner) or on a hosting where one may only drop files (PHP agent). With a preset, only the
+// basics need filling in; the folder layout, deployment steps, Docker Compose, health check and backups are under
+// "Advanced". Versions come from GitHub releases (each site has its own read-only token: write-only here, kept by the
+// runner, never shown again) or from archives uploaded in the dashboard (zip, rar ...).
 import { get, post } from '../../core/api.js';
 import { t, tList } from '../../core/i18n.js';
 import { esc, icon } from '../../core/ui.js';
@@ -76,14 +77,17 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
       ${field('name', f('name'), s.name, { placeholder: 'Example' })}
       ${isNew ? field('id', f('id'), s.id, { help: f('id_help'), placeholder: 'example', mono: true }) : ''}
       <div class="field--full" data-place="server">${field('path', f('path'), s.path, { help: f('path_help'), placeholder: '/var/www/example.com', mono: true, wide: true })}</div>
+      ${select('source', f('source'), s.source || 'asset', [['asset', f('source_asset')], ['source', f('source_source')], ['upload', f('source_upload')]], f('source_help'))}
+      <div data-place="server">${select('deploy_mode', f('deploy_mode'), s.deploy_mode === 'compose' ? 'compose' : 'files', [['files', f('deploy_mode_files')], ['compose', f('deploy_mode_compose')]], f('deploy_mode_help'))}</div>
+      <div class="form-two field--full" data-github>
       <label class="field field--full"><span class="field__label">${f('repo')}</span>
         <span class="field__combo"><input type="text" name="repo" class="mono" value="${esc(s.repo || '')}" placeholder="owner/repository" autocomplete="off" spellcheck="false">
         <button type="button" class="btn btn--outline btn--small" data-check-repo>${icon('github')}${f('check_repo')}</button></span>
         <span class="field__help">${f('repo_help')}</span><span class="field__help" data-repo-result></span></label>
       ${tokenField(isNew, token)}
-      <div data-place="server">${select('deploy_mode', f('deploy_mode'), s.deploy_mode === 'compose' ? 'compose' : 'files', [['files', f('deploy_mode_files')], ['compose', f('deploy_mode_compose')]], f('deploy_mode_help'))}</div>
-      ${select('source', f('source'), s.source || 'asset', [['asset', f('source_asset')], ['source', f('source_source')]], f('source_help'))}
       <div class="field--full" data-show-source="asset">${field('asset_pattern', f('asset_pattern'), s.asset_pattern || '*.zip', { help: f('asset_pattern_help'), mono: true, wide: true })}</div>
+      </div>
+      <div class="box box--blue field--full" data-show-source="upload">${icon('upload')}<div>${f('source_upload_note')}</div></div>
     </div>
   </fieldset>
   <details class="tech-section" ${isNew ? '' : 'open'}>
@@ -93,7 +97,8 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
       <div class="form-two">
         <div data-place="server">${field('docroot_link', f('docroot_link'), s.docroot_link, { help: f('docroot_link_help'), mono: true })}</div>
         <div data-place="server">${field('docroot_target', f('docroot_target'), s.docroot_target, { help: f('docroot_target_help'), mono: true })}</div>
-        <div class="field--full" data-place="hosting">${field('hosting_target', f('hosting_target'), s.docroot_target || '.', { help: f('hosting_target_help'), mono: true, wide: true })}</div>
+        <div data-place="hosting">${select('hosting_app', f('hosting_app'), s.hosting_app || '', [['', f('hosting_app_plain')], ['laravel', f('hosting_app_laravel')]], f('hosting_app_help'))}</div>
+        <div data-place="hosting">${field('hosting_target', f('hosting_target'), s.docroot_target || '.', { help: f('hosting_target_help'), mono: true })}</div>
         ${area('shared', f('shared'), s.shared, f('shared_help'))}
         <div data-place="server">${field('web_user', f('web_user'), s.web_user, { mono: true })}</div>
         ${field('keep_releases', f('keep_releases'), s.keep_releases, { type: 'number', attrs: 'min="2" max="20"' })}
@@ -104,6 +109,13 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
       <legend>${icon('database')}${f('migrations')}</legend>
       <div class="form-two">
         ${field('migrations_dir', f('migrations_dir'), s.migrations_dir || 'database/migrations', { help: f('migrations_dir_help'), mono: true, wide: true })}
+      </div>
+    </fieldset>
+    <fieldset class="section" data-show-source="upload">
+      <legend>${icon('upload')}${f('upload')}</legend>
+      <div class="form-two">
+        ${area('upload_exclude', f('upload_exclude'), s.upload_exclude, f('upload_exclude_help'))}
+        ${field('upload_keep', f('upload_keep'), s.upload_keep || 5, { type: 'number', attrs: 'min="1" max="50"' })}
       </div>
     </fieldset>
     <fieldset class="section" data-place="server">
@@ -147,9 +159,10 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
   </details>`;
 }
 
-const LIST_FIELDS = ['shared', 'backup_paths', 'backup_exclude', 'compose_files', 'backup_volumes', 'adopt_keep'];
+const LIST_FIELDS = ['shared', 'backup_paths', 'backup_exclude', 'compose_files', 'backup_volumes', 'adopt_keep', 'upload_exclude'];
 const TEXT_FIELDS = ['id', 'name', 'domain', 'path', 'repo', 'asset_pattern', 'docroot_link', 'docroot_target', 'web_user', 'build', 'activate',
-  'health_url', 'health_contains', 'backup_env_file', 'deploy_mode', 'source', 'compose_project', 'backup_db', 'backup_db_service', 'migrations_dir'];
+  'health_url', 'health_contains', 'backup_env_file', 'deploy_mode', 'source', 'compose_project', 'backup_db', 'backup_db_service', 'migrations_dir',
+  'hosting_app'];
 const SERVER_ONLY = ['path', 'docroot_link', 'web_user', 'build', 'activate', 'services', 'reload_php_fpm', 'compose_files', 'compose_project',
   'compose_build', 'backup_db_service', 'backup_volumes', 'health_local'];
 
@@ -161,6 +174,7 @@ export function readSiteForm(form) {
   data.services = e.services.value.split(',').map((v) => v.trim()).filter(Boolean);
   data.keep_releases = Number(e.keep_releases.value);
   data.backup_keep = Number(e.backup_keep.value);
+  data.upload_keep = Number(e.upload_keep.value) || 5;
   data.reload_php_fpm = e.reload_php_fpm.checked;
   data.backup_before_deploy = e.backup_before_deploy.checked;
   data.compose_build = e.compose_build.checked;
@@ -174,7 +188,9 @@ export function readSiteForm(form) {
   } else {
     delete data.adopt_keep;
     delete data.migrations_dir;
+    delete data.hosting_app;
   }
+  if (data.source === 'upload' && !data.repo) delete data.repo;
   const token = e.github_token.value.trim();
   if (token) data.github_token = token;
   else if (e.remove_github_token && e.remove_github_token.checked) data.remove_github_token = true;
@@ -188,6 +204,7 @@ function syncSections(form) {
   form.querySelectorAll('[data-place]').forEach((el) => { el.hidden = el.dataset.place !== place; });
   form.querySelectorAll('[data-show-mode]').forEach((el) => { el.hidden = place !== 'server' || el.dataset.showMode !== e.deploy_mode.value; });
   form.querySelectorAll('[data-show-source]').forEach((el) => { el.hidden = el.dataset.showSource !== e.source.value; });
+  form.querySelectorAll('[data-github]').forEach((el) => { el.hidden = e.source.value === 'upload'; });
 }
 
 /**

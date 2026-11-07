@@ -13,6 +13,7 @@ One server hosts the **dashboard** and its own runner. Every other server only r
 | Database | MySQL 5.7+ / MariaDB 10.3+ for the dashboard (the sites may use any database) |
 | Python | 3.6 or newer (`/usr/bin/python3`; on aaPanel its own Python is used when there is no other) |
 | Domain | a sub-domain for the dashboard, e.g. `rollout.example.com`, served over HTTPS |
+| Optional | `libarchive-tools` (bsdtar) to unpack uploaded **rar** and **7z** files (zip and tar.gz need nothing); `composer` (and PHP CLI) for Laravel sites on a hosting whose releases come without `vendor/` |
 
 The installer recognises aaPanel (`/www/server/panel`) and picks the matching defaults:
 

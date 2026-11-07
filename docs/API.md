@@ -23,11 +23,16 @@ POST/PUT/DELETE (token from `GET /app`); `X-Locale: id|en` for the message langu
 | POST 🔒 | `/sites` | register on `server` (default `local`); `github_token` optional: the site's read-only token |
 | GET / PUT 🔒 / DELETE 🔒 | `/sites/{site}` | details with `server` (`github_token_set`, `github_token_hint`; never the token) / settings (`github_token` replaces the token, `remove_github_token: true` removes it) / unregister (files kept, token deleted) |
 | GET | `/sites/{site}/releases?refresh=1` · `/sites/{site}/health` | GitHub releases with installed/current flags · health now |
-| POST | `/sites/{site}/jobs` | `{type, version, params}`; 🔒 for `adopt`, `restore`, `delete-release`, `cleanup-adopt` |
+| POST | `/sites/{site}/jobs` | `{type, version, params}`; 🔒 for `adopt`, `restore`, `delete-release`, `cleanup-adopt`, `artisan` |
 | GET | `/sites/{site}/jobs/{job}?offset=` | the job with its log from byte `offset` |
 | POST 🔒 | `/sites/{site}/agent-file` | hosting site: a new agent file `{filename, content}` with a new one-time key (the button of the file opens `APP_URL`) |
 | POST 🔒 | `/sites/{site}/agent/connect` | `{url}`: connect the uploaded agent file |
-| GET | `/sites/{site}/plan?version=` | hosting site: the database changes of a release (`migrations`: name, SQL, `pending` or `changed`) |
+| GET | `/sites/{site}/plan?version=` | hosting site: the database changes of a release (`kind` `sql` or `laravel`; `migrations`: name, content, `pending` or `changed`) |
+| POST | `/sites/{site}/uploads` | `{name, size, version?}` → `{id, version, chunk_size}`: start uploading an archive (release source `upload`) |
+| POST | `/sites/{site}/uploads/{id}?offset=` | body: the bytes of one piece (`Content-Type: application/octet-stream`, with `X-CSRF-Token`) → `{received}` |
+| POST | `/sites/{site}/uploads/{id}/finish` | the upload job (unpack, clean, store) |
+| DELETE 🔒 | `/sites/{site}/uploads/{version}` | an uploaded version that is not live and not the rollback version |
+| POST 🔒 · PUT 🔒 | `/sites/{site}/env/read` · `/sites/{site}/env` | hosting site: the `.env` (`{exists, content, where, file, template?}`) · save `{content}` (to the hosting, or kept until it connects) |
 | GET / DELETE 🔒 | `/sites/{site}/backups` · `/sites/{site}/backups/{backup}` | |
 | GET | `/jobs?site=&limit=` · `/jobs/{job}?offset=` | history of a site · a job of this server's runner |
 | GET | `/settings` | this server's runner (`github_tokens`: number of sites with their own token), versions |
@@ -42,7 +47,8 @@ adoption).
 
 Job types: `deploy` (`version`, `params.backup`), `rollback` (`version` optional: the previous release),
 `adopt` (`version`, `params.backup`), `backup` (`params.reason`), `restore` (`params.backup_id`, `params.safety_backup`),
-`delete-release` (`version`), `cleanup-adopt`.
+`delete-release` (`version`), `cleanup-adopt`, `artisan` (`params.command`: an artisan command line for a Laravel
+site on a hosting), `upload` (started by `/uploads/{id}/finish`).
 
 ## Runner API (`/v1`, used by the dashboard and `python3 -m arsika_rollout_manager`)
 
@@ -67,6 +73,10 @@ X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD "\n" PATH_WITH_QUERY "\n" TI
 | GET | `/v1/jobs?site=&limit=`, `/v1/jobs/{id}?offset=` |
 | POST | `/v1/runner/update` `{version, actor}`: install the runner of that release (`update_repo`); restarts when the job has ended (409 `busy` while any job is queued or running) |
 | POST | `/v1/sites/{site}/agent-file` `{dashboard}`, `/v1/sites/{site}/agent/connect` `{url}` · GET `/v1/sites/{site}/plan?version=` |
+| POST | `/v1/sites/{site}/uploads` `{name, size, version, actor}` → `{id, version, chunk_size}` |
+| PUT | `/v1/sites/{site}/uploads/{id}?offset=` raw body (one piece, up to 8 MB) → `{received, size}` |
+| POST · DELETE | `/v1/sites/{site}/uploads/{id}/finish` `{actor}` (→ the `upload` job) · `/v1/sites/{site}/uploads/{version}` |
+| GET · PUT | `/v1/sites/{site}/env` · `{content}`: the `.env` of a hosting site (a copy kept by the runner until the agent connects) |
 
 ## Hosting agent (`https://<site>/rollout-agent-….php`, used by the runner)
 
@@ -74,5 +84,7 @@ X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD "\n" PATH_WITH_QUERY "\n" TI
 `X-Rollout-Signature` over `POST`, the path with the query, timestamp, nonce and the body's SHA-256) with the site's
 secret; `hello` and `pair` also with the file's one-time key until it is used. Actions: `hello`, `pair`, `status`,
 `upload` (raw body, `name`, `offset`), `finish-upload`, `extract` (in steps), `migrate`, `activate`, `delete-release`,
-`backup` (in steps), `download`, `clear`, `restore-files`, `restore-db`, `forget`. A `GET` shows the page for the
-browser.
+`backup` (in steps), `download`, `clear`, `restore-files`, `restore-db`, `forget`; from 1.5.0 `self-update` (`code`:
+the agent of the runner's version), `env-read` / `env-write` (`file`, `content`), `laravel-prepare`, `laravel-finish`,
+`laravel-migrations`, `artisan` (`version`, `command`). Paths starting with `@shared/` are in the agent's data folder.
+A `GET` shows the page for the browser.

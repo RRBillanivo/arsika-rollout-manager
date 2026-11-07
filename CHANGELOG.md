@@ -3,6 +3,46 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.5.0] — 2026-11-07
+
+### Added
+- **Versions uploaded in the dashboard** (release source "Upload"): a zip, rar, 7z or tar.gz of the project is sent in
+  pieces (1 MB through the dashboard), unpacked and checked on the runner's server (unsafe paths, links, size and
+  number of files), a single top folder is stripped and what must not go live is removed (`upload_exclude`: the local
+  `.env`, `.git/`, `node_modules/`, logs, compiled views, caches …). The version name comes from the file name
+  (`absensi#003.rar` → `003`). Uploaded versions are deployed, rolled back and pruned like releases (`upload_keep`), for
+  every kind of site; no GitHub repository needed. rar and 7z need bsdtar (`libarchive-tools`), 7-Zip or unrar on the
+  runner's server.
+- **Laravel on a hosting** (preset "Hosting: Laravel"): only `public/` goes into the website folder; the application of
+  every release, the `.env` and `storage/` stay in the agent's data folder (outside the website folder when possible),
+  so nothing of the application can be opened in a browser, whatever the web server. The agent writes a
+  `public/index.php` that points at them, runs **`php artisan migrate --force` inside PHP** before the switch (pending
+  migrations shown first, from the database's `migrations` table), generates an empty `APP_KEY`, creates the public
+  storage link when links are allowed and clears compiled views. `vendor/` missing (a GitHub repository) → the runner
+  runs `composer install --no-dev --no-scripts --no-plugins` on its server. A release whose `composer.json` needs a
+  newer PHP than the hosting has stops before anything changes. Adopting a Laravel website that was uploaded by hand
+  takes over its `.env` and `storage/`.
+- **Artisan commands** for Laravel hosting sites (password): run inside PHP on the live release, output in the job log;
+  commands that wait for input or keep running are refused (`tinker` works with `--execute`).
+- **The .env of a hosting site in the dashboard** (password to open and to save; the content never goes into the
+  activity log): prepared before the hosting is connected (a template from the release's `.env.example` with
+  production values and a new `APP_KEY`) and sent when it connects, or edited on the hosting later (the last five
+  versions are kept there).
+- **Connect and deploy at once:** the agent page has the address of the dashboard filled in (it can be changed), and
+  the confirmation in the dashboard can deploy the newest version right away.
+- Hosting agents **update themselves** from 1.5.0 on (the runner replaces the file with its own version when needed;
+  agents of 1.4.0 are replaced once by hand). Plain `http://` agent addresses are accepted on local networks (a VM;
+  marked "No HTTPS"). Health checks may use `{site_url}` (the address of the agent file's folder); a domain may be an
+  IPv4 address.
+
+### Changed
+- The data folder of an agent inside the website folder gets a random name (`.rollout-agent-<site>-<random>`), because
+  nginx does not read `.htaccess`; an existing one is renamed.
+
+### Fixed
+- The site page added its click handlers again after reloading itself (after connecting or saving), so one click
+  could open two dialogs.
+
 ## [1.4.0] — 2026-11-06
 
 ### Added

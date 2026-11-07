@@ -23,6 +23,11 @@ A site on a **hosting without a terminal** (`deploy_mode` `hosting`) belongs to 
 dashboard's server), but its files live on the hosting: the runner drives a generated PHP agent there with signed
 requests (upload in pieces, unpack, migrate, swap, back up, in short steps). See [HOSTING.md](HOSTING.md).
 
+Versions of a site with the release source **upload** come from the dashboard instead of GitHub: the archive goes in
+pieces through the dashboard to the runner (`state_dir/uploads/<site>/incoming/`), an `upload` job unpacks, checks,
+cleans and packs it again (`uploads.py`), and the result (`state_dir/uploads/<site>/<version>.zip`) is installed exactly
+like the zip asset of a release.
+
 ## Site layout
 
 ```

@@ -2,23 +2,26 @@
 /*
  * Arsika Rollout Manager: hosting agent (https://github.com/RRBillanivo/arsika-rollout-manager, MIT license).
  *
- * The dashboard generates this file for one site. Upload it into the folder of the website on the hosting (usually
- * public_html), open it in the browser and click "Connect". From then on the runner of the dashboard installs the
- * site's GitHub releases here without a terminal: it uploads the release in pieces, this file unpacks it next to the
- * live files, runs the database changes of the release, swaps the files and keeps the previous version for a rollback.
+ * The dashboard generates this file for one site. Put it into the folder of the website (a file manager, FTP: the
+ * hosting, or a virtual machine where you may only drop files), open it in the browser and click "Connect". From then
+ * on the runner of the dashboard installs the site's versions here without a terminal: it uploads the release in
+ * pieces, this file unpacks it next to the live files, runs the database changes of the release (Laravel: php artisan
+ * migrate, inside PHP), swaps the files and keeps the previous version for a rollback.
  *
  *   <website folder>/                  live files of the current version + this file
- *   ../.rollout-agent-<site>/          (or .rollout-agent-<site>/ inside the website folder when the parent is not
- *       state.php                      writable) releases, uploads, backups in progress; state.php holds the secret
- *       releases/<version>/            a release that is not live (the previous one, for a rollback)
+ *   ../.rollout-agent-<site>/          (or .rollout-agent-<site>-<random>/ inside the website folder when the parent
+ *       state.php                      cannot be used) releases, uploads, backups in progress; state.php holds the secret
+ *       releases/<version>/            a release that is not live (the previous one, for a rollback); Laravel: the
+ *                                      application of every release, only its public/ goes into the website folder
  *       releases/_pre_rollout/         the files that were live before the first installation
+ *       shared/                        Laravel: .env and storage/ of the site
  *
  * Every request except the page shown in the browser must be signed with the site's secret (HMAC-SHA256 over method,
  * path, timestamp, a one-time nonce and the body). The key written into this file only works once, to connect.
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.4.0';
+const RA_VERSION = '1.5.0';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
@@ -83,6 +86,10 @@ function ra_exists(string $path): bool
     return file_exists($path) || is_link($path);
 }
 
+/**
+ * The data folder: above the website folder when it can be used there; otherwise inside the website folder with a
+ * random name (nginx does not read .htaccess, so the name must not be guessable) and an .htaccess that denies access.
+ */
 function ra_data(): string
 {
     static $dir = null;
@@ -90,27 +97,31 @@ function ra_data(): string
         return $dir;
     }
     $name = '.rollout-agent-' . RA_SITE;
-    $inside = __DIR__ . '/' . $name;
     $outside = dirname(__DIR__) . '/' . $name;
-    if (@is_dir($inside)) {
-        return $dir = $inside;
+    $hidden = glob(__DIR__ . '/' . $name . '-*', GLOB_ONLYDIR) ?: [];
+    if ($hidden) {
+        return $dir = $hidden[0];
+    }
+    $random = __DIR__ . '/' . $name . '-' . bin2hex(random_bytes(8));
+    if (@is_dir(__DIR__ . '/' . $name)) {                          // agent 1.4.0 used a name that can be guessed
+        return $dir = @rename(__DIR__ . '/' . $name, $random) ? $random : __DIR__ . '/' . $name;
     }
     if (@is_dir($outside) || ra_outside_usable($outside)) {
         return $dir = $outside;
     }
-    if (!@mkdir($inside, 0700, true) && !is_dir($inside)) {
-        throw new RaError(500, 'data_dir', 'cannot create ' . $inside);
+    if (!@mkdir($random, 0711, true) && !is_dir($random)) {
+        throw new RaError(500, 'data_dir', 'cannot create a data folder in ' . __DIR__);
     }
     $deny = "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order allow,deny\n    Deny from all\n</IfModule>\n";
-    @file_put_contents($inside . '/.htaccess', $deny);
-    @file_put_contents($inside . '/index.html', '');
-    return $dir = $inside;
+    @file_put_contents($random . '/.htaccess', $deny);
+    @file_put_contents($random . '/index.html', '');
+    return $dir = $random;
 }
 
 /** The folder above the website is used when it is writable and on the same file system (renames must work). */
 function ra_outside_usable(string $outside): bool
 {
-    if (!@is_writable(dirname($outside)) || !@mkdir($outside, 0700)) {
+    if (!@is_writable(dirname($outside)) || !@mkdir($outside, 0711)) {
         return false;
     }
     $probe = $outside . '/probe-' . bin2hex(random_bytes(4));
@@ -127,10 +138,67 @@ function ra_outside_usable(string $outside): bool
 function ra_dir(string $sub): string
 {
     $dir = ra_data() . '/' . $sub;
-    if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+    if (!is_dir($dir) && !@mkdir($dir, $sub === 'shared' ? 0711 : 0700, true) && !is_dir($dir)) {
         throw new RaError(500, 'data_dir', 'cannot create ' . $dir);
     }
     return $dir;
+}
+
+/** A path of the site: "@shared/..." is in the data folder (Laravel: .env, storage/), anything else in the website folder. */
+function ra_path(string $rel): string
+{
+    $rel = ra_rel($rel);
+    if (strncmp($rel, '@shared/', 8) === 0) {
+        return ra_dir('shared') . '/' . ra_rel(substr($rel, 8));
+    }
+    return __DIR__ . '/' . $rel;
+}
+
+/** For reading: before a Laravel website is adopted, its .env and storage/ are still in the website folder. */
+function ra_existing_path(string $rel): string
+{
+    $path = ra_path($rel);
+    if (!ra_exists($path) && strncmp(ra_rel($rel), '@shared/', 8) === 0 && ra_exists(__DIR__ . '/' . substr(ra_rel($rel), 8))) {
+        return __DIR__ . '/' . substr(ra_rel($rel), 8);
+    }
+    return $path;
+}
+
+/** Replace a file in one step (a reader never sees half of it). */
+function ra_write_file(string $path, string $content, int $mode = 0644): void
+{
+    if (!is_dir(dirname($path)) && !@mkdir(dirname($path), 0755, true) && !is_dir(dirname($path))) {
+        throw new RaError(500, 'write', 'cannot create ' . dirname($path));
+    }
+    $tmp = dirname($path) . '/.rollout-tmp-' . bin2hex(random_bytes(4));
+    if (@file_put_contents($tmp, $content, LOCK_EX) === false) {
+        throw new RaError(500, 'write', 'cannot write ' . $path);
+    }
+    @chmod($tmp, $mode);
+    if (!@rename($tmp, $path)) {
+        @unlink($tmp);
+        throw new RaError(500, 'write', 'cannot replace ' . $path);
+    }
+}
+
+function ra_disabled(string $function): bool
+{
+    return !function_exists($function) || in_array($function, array_map('trim', explode(',', (string)ini_get('disable_functions'))), true);
+}
+
+/** An address of this machine or of a local network (a virtual machine without a certificate). */
+function ra_local_host(string $host): bool
+{
+    $host = strtolower(trim($host, '[]'));
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        return !filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+    return $host === 'localhost' || strpos($host, '.') === false || (bool)preg_match('/\.(local|lan|internal|home\.arpa|localdomain)$/', $host);
+}
+
+function ra_clip(string $text, int $limit = 65536): string
+{
+    return strlen($text) > $limit ? "…\n" . substr($text, -$limit) : $text;
 }
 
 function ra_load(): array
@@ -294,6 +362,8 @@ function ra_info(array $state): array
         'pdo' => array_values($pdo), 'max_execution_time' => (int)ini_get('max_execution_time'),
         'memory_limit' => (string)ini_get('memory_limit'), 'post_max_size' => ra_bytes((string)ini_get('post_max_size')),
         'disk_free' => function_exists('disk_free_space') ? @disk_free_space(__DIR__) : null,
+        'dashboard' => RA_DASHBOARD, 'web_server' => substr((string)($_SERVER['SERVER_SOFTWARE'] ?? ''), 0, 80),
+        'symlink' => !ra_disabled('symlink'),
     ];
 }
 
@@ -363,6 +433,7 @@ function ra_status(array &$state, array $p): array
         'pre_rollout' => is_dir(ra_data() . '/releases/' . RA_PRE) && ra_list(ra_data() . '/releases/' . RA_PRE) !== [],
         'live' => count(ra_live(ra_protected($p['protect'] ?? []), $shared, null)), 'journal' => !empty($state['journal']),
         'migrations' => $state['migrations'] ?? (object)[],
+        'env' => !empty($p['env_file']) && is_file(ra_path((string)$p['env_file'])),
     ];
 }
 
@@ -587,6 +658,10 @@ function ra_activate(array &$state, array $p): array
     $from = $current !== null ? $current : (count($live) ? RA_PRE : null);
     $fromRoot = $from === null ? null : ($from === RA_PRE ? $releases . '/' . RA_PRE : $releases . '/' . $from . ($sub === '' ? '' : '/' . $sub));
     $moves = [];
+    $storage = ra_data() . '/shared/storage';
+    if (!empty($p['laravel']) && !is_dir($storage) && is_dir(__DIR__ . '/storage') && !is_link(__DIR__ . '/storage')) {
+        $moves[] = ['move', __DIR__ . '/storage', $storage];          // the data of the adopted Laravel website stays with it
+    }
     $incoming = ra_list($root);                                     // top-level names that go live
     foreach ($shared as $path) {                                    // data that stays: into the new tree before the swap
         if (ra_exists(__DIR__ . '/' . $path)) {
@@ -733,7 +808,7 @@ function ra_db(string $envFile, string $engine): ?array
     if ($engine === 'none' || $envFile === '') {
         return null;
     }
-    $path = __DIR__ . '/' . ra_rel($envFile, 'environment file');
+    $path = ra_existing_path($envFile);
     if (!is_file($path)) {
         throw new RaError(422, 'no_env', 'the file ' . $envFile . ' with the database settings is not on the hosting');
     }
@@ -947,14 +1022,14 @@ function ra_files_list(array $paths, array $exclude): array
 {
     $files = [];
     foreach ($paths as $path) {
-        $full = __DIR__ . '/' . $path;
+        $full = ra_existing_path($path);
         if (is_file($full)) {
             $files[] = $path;
         } elseif (is_dir($full)) {
             $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($full, FilesystemIterator::SKIP_DOTS));
             foreach ($iterator as $item) {
                 if ($item->isFile()) {
-                    $files[] = substr(str_replace('\\', '/', $item->getPathname()), strlen(__DIR__) + 1);
+                    $files[] = $path . '/' . substr(str_replace('\\', '/', $item->getPathname()), strlen(str_replace('\\', '/', $full)) + 1);
                 }
             }
         }
@@ -980,7 +1055,7 @@ function ra_backup(array &$state, array $p): array
         $dir = ra_dir('backups') . '/' . $id . '-' . bin2hex(random_bytes(8));      // not guessable inside a public folder
         @mkdir($dir, 0700, true);
         $db = ra_db((string)($p['env_file'] ?? ''), (string)($p['engine'] ?? 'auto'));
-        $paths = array_values(array_filter(ra_rel_list($p['paths'] ?? []), function ($path) { return ra_exists(__DIR__ . '/' . $path); }));
+        $paths = array_values(array_filter(ra_rel_list($p['paths'] ?? []), function ($path) { return ra_exists(ra_existing_path($path)); }));
         $job = ['id' => $id, 'dir' => $dir, 'db' => $db !== null && $db[0] !== 'pgsql', 'db_skipped' => $db !== null && $db[0] === 'pgsql',
                 'files' => ra_files_list($paths, ra_rel_list($p['exclude'] ?? [])), 'f' => 0, 'paths' => $paths, 'stage' => 'db'];
         $state['backup'] = $job;
@@ -1006,7 +1081,7 @@ function ra_backup(array &$state, array $p): array
                 break;
             }
             $file = $job['files'][$job['f']];
-            $zip->addFile(__DIR__ . '/' . $file, $file);
+            $zip->addFile(ra_existing_path($file), $file);
             $job['f']++;
         }
         $zip->close();
@@ -1088,13 +1163,14 @@ function ra_restore_files(array &$state, array $p): array
     $zip->close();
     $replaced = 'replaced/' . gmdate('Ymd-His');
     foreach (ra_rel_list($p['paths'] ?? []) as $path) {
-        if (ra_exists(__DIR__ . '/' . $path)) {
+        $live = ra_path($path);
+        if (ra_exists($live)) {
             @mkdir(dirname(ra_data() . '/' . $replaced . '/' . $path), 0700, true);
-            rename(__DIR__ . '/' . $path, ra_data() . '/' . $replaced . '/' . $path);
+            rename($live, ra_data() . '/' . $replaced . '/' . $path);
         }
         if (ra_exists($staging . '/' . $path)) {
-            @mkdir(dirname(__DIR__ . '/' . $path), 0755, true);
-            rename($staging . '/' . $path, __DIR__ . '/' . $path);
+            @mkdir(dirname($live), 0755, true);
+            rename($staging . '/' . $path, $live);
         }
     }
     ra_delete($staging);
@@ -1145,6 +1221,313 @@ function ra_restore_db(array &$state, array $p): array
     return ['done' => true];
 }
 
+// ------------------------------------------------------------------ the agent itself and the .env of the site
+
+/** The runner replaces this file with the agent of its own version (same site, same name; its key is marked as used). */
+function ra_self_update(array &$state, array $p): array
+{
+    $code = (string)($p['code'] ?? '');
+    if (strncmp($code, '<?php', 5) !== 0 || strpos($code, "const RA_SITE = '" . RA_SITE . "';") === false
+        || !preg_match("/const RA_PAIRING_KEY = '([0-9a-f]{64})';/", $code, $key) || !preg_match("/const RA_VERSION = '([0-9A-Za-z.+-]{1,32})';/", $code, $version)) {
+        throw new RaError(422, 'bad_agent', 'this is not an agent file of the site ' . RA_SITE);
+    }
+    $tmp = __DIR__ . '/.rollout-update-' . bin2hex(random_bytes(4)) . '.php';
+    if (@file_put_contents($tmp, $code, LOCK_EX) === false) {
+        throw new RaError(500, 'self_update', 'cannot write the new agent next to ' . ra_self());
+    }
+    @chmod($tmp, @fileperms(__FILE__) & 0777 ?: 0644);
+    if (!@rename($tmp, __FILE__)) {
+        // Windows keeps a running script open: write it in place instead (the same size check as an upload)
+        $written = @file_put_contents(__FILE__, $code, LOCK_EX);
+        @unlink($tmp);
+        clearstatcache(true, __FILE__);
+        if ($written !== strlen($code) || filesize(__FILE__) !== strlen($code)) {
+            throw new RaError(500, 'self_update', 'cannot replace ' . ra_self());
+        }
+    }
+    $state['pairing_hash'] = hash('sha256', $key[1]);               // the key of the new file never connects anyone
+    if (function_exists('opcache_invalidate')) {
+        @opcache_invalidate(__FILE__, true);
+    }
+    return ['agent' => $version[1]];
+}
+
+function ra_env_read(array &$state, array $p): array
+{
+    $path = ra_path((string)($p['file'] ?? '.env'));
+    if (!is_file($path)) {
+        return ['exists' => false, 'content' => ''];
+    }
+    return ['exists' => true, 'content' => (string)file_get_contents($path, false, null, 0, 262144), 'size' => filesize($path)];
+}
+
+/** Write the .env; the previous one is kept in the data folder (the last five). */
+function ra_env_write(array &$state, array $p): array
+{
+    $path = ra_path((string)($p['file'] ?? '.env'));
+    $content = (string)($p['content'] ?? '');
+    if (strlen($content) > 262144 || strpos($content, "\0") !== false) {
+        throw new RaError(422, 'bad_env', 'not a valid .env file');
+    }
+    if (is_file($path)) {
+        $keep = ra_dir('env-previous');
+        @copy($path, $keep . '/' . basename($path) . '.' . gmdate('Ymd-His'));
+        $old = glob($keep . '/*') ?: [];
+        sort($old);
+        foreach (array_slice($old, 0, max(0, count($old) - 5)) as $file) {
+            @unlink($file);
+        }
+    }
+    ra_write_file($path, $content, 0600);
+    return ['written' => true, 'size' => strlen($content)];
+}
+
+// ------------------------------------------------------------------ Laravel (only public/ in the website folder)
+
+/** -> [release folder (the application), shared folder (.env), storage folder] */
+function ra_laravel_paths(string $version): array
+{
+    $release = ra_data() . '/releases/' . ra_version($version);
+    $shared = ra_dir('shared');
+    if (is_dir($shared . '/storage')) {
+        $storage = $shared . '/storage';
+    } elseif (is_dir(__DIR__ . '/storage') && !is_link(__DIR__ . '/storage') && is_file(__DIR__ . '/artisan')) {
+        $storage = __DIR__ . '/storage';                             // an adopted website: its storage/ moves when it switches
+    } else {
+        $storage = $release . '/storage';
+    }
+    return [$release, $shared, $storage];
+}
+
+function ra_laravel_skeleton(string $storage): void
+{
+    foreach (['app/public', 'framework/cache/data', 'framework/sessions', 'framework/views', 'logs'] as $sub) {
+        if (!is_dir($storage . '/' . $sub)) {
+            @mkdir($storage . '/' . $sub, 0755, true);
+        }
+    }
+}
+
+/** public/index.php of a release: the application, .env and storage/ are outside the website folder. */
+function ra_laravel_front(string $release, string $shared, string $version): string
+{
+    $template = <<<'PHP'
+<?php
+// Written by Arsika Rollout Manager for release %VERSION%: the application, its .env and storage/ live outside the
+// website folder (in the data folder of the site's agent).
+define('LARAVEL_START', microtime(true));
+$rolloutApp = %APP%;
+$rolloutShared = %SHARED%;
+$rolloutStorage = is_dir($rolloutShared . '/storage') ? $rolloutShared . '/storage' : $rolloutApp . '/storage';
+if (file_exists($maintenance = $rolloutStorage . '/framework/maintenance.php')) {
+    require $maintenance;
+}
+require $rolloutApp . '/vendor/autoload.php';
+$app = require_once $rolloutApp . '/bootstrap/app.php';
+$app->useEnvironmentPath($rolloutShared);
+$app->useStoragePath($rolloutStorage);
+if (method_exists($app, 'usePublicPath')) {
+    $app->usePublicPath(__DIR__);
+} else {
+    $app->instance('path.public', __DIR__);
+}
+if (method_exists($app, 'handleRequest')) {
+    $app->handleRequest(Illuminate\Http\Request::capture());
+} else {
+    $kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
+    $response = $kernel->handle($request = Illuminate\Http\Request::capture())->send();
+    $kernel->terminate($request, $response);
+}
+
+PHP;
+    return strtr($template, ['%VERSION%' => preg_replace('/[^0-9A-Za-z._+-]/', '', $version), '%APP%' => var_export($release, true),
+                             '%SHARED%' => var_export($shared, true)]);
+}
+
+/** Before the database changes and the switch: .env (APP_KEY), storage/ and public/index.php of the release. */
+function ra_laravel_prepare(array &$state, array $p): array
+{
+    $version = ra_version((string)($p['version'] ?? ''));
+    list($release, $shared) = ra_laravel_paths($version);
+    if (!is_file($release . '/artisan') || !is_file($release . '/bootstrap/app.php')) {
+        throw new RaError(422, 'not_laravel', 'release ' . $version . ' is not a Laravel application (artisan and bootstrap/app.php are missing)');
+    }
+    if (!is_file($release . '/vendor/autoload.php')) {
+        throw new RaError(422, 'no_vendor', 'release ' . $version . ' has no vendor/ folder');
+    }
+    $front = $release . '/public/index.php';
+    $original = is_file($front) ? (string)file_get_contents($front) : '';
+    if (strpos($original, 'bootstrap/app.php') === false) {
+        throw new RaError(422, 'no_front', 'public/index.php of release ' . $version . ' is not the front controller of Laravel');
+    }
+    $result = ['data_outside' => strpos(ra_data(), __DIR__ . '/') !== 0];
+    $env = $shared . '/.env';
+    if (!is_file($env)) {
+        if (!empty($p['adopt']) && is_file(__DIR__ . '/.env') && is_file(__DIR__ . '/artisan') && @copy(__DIR__ . '/.env', $env)) {
+            @chmod($env, 0600);
+            $result['env'] = 'copied';
+        } else {
+            throw new RaError(422, 'no_env', 'the .env of the site is not set yet: fill it in the dashboard (site page, .env) and deploy again');
+        }
+    }
+    $values = ra_env($env);
+    $text = (string)file_get_contents($env);
+    if (trim((string)($values['APP_KEY'] ?? '')) === '') {
+        $key = 'APP_KEY=base64:' . base64_encode(random_bytes(32));
+        $text = preg_match('/^APP_KEY=.*$/m', $text) ? (string)preg_replace('/^APP_KEY=.*$/m', $key, $text, 1) : $key . "\n" . $text;
+        ra_write_file($env, $text, 0600);
+        $result['app_key'] = 'generated';
+    }
+    if (strtolower((string)($values['DB_CONNECTION'] ?? '')) === 'sqlite' && trim((string)($values['DB_DATABASE'] ?? '')) === '') {
+        $file = $shared . '/database.sqlite';                       // not inside a release: it would be replaced
+        if (!is_file($file)) {
+            @touch($file);
+        }
+        $line = 'DB_DATABASE=' . $file;
+        $text = preg_match('/^#?\s*DB_DATABASE=.*$/m', $text) ? (string)preg_replace('/^#?\s*DB_DATABASE=.*$/m', $line, $text, 1) : $text . "\n" . $line . "\n";
+        ra_write_file($env, $text, 0600);
+        $result['sqlite'] = $file;
+    }
+    if (is_dir($shared . '/storage')) {
+        $result['storage'] = 'shared';
+    } elseif (!empty($p['adopt']) && is_dir(__DIR__ . '/storage') && !is_link(__DIR__ . '/storage') && is_file(__DIR__ . '/artisan')) {
+        $result['storage'] = 'website';
+    } elseif (is_dir($release . '/storage') && @rename($release . '/storage', $shared . '/storage')) {
+        $result['storage'] = 'seeded';
+    } else {
+        $result['storage'] = 'created';
+    }
+    if ($result['storage'] !== 'website') {
+        ra_laravel_skeleton($shared . '/storage');
+    }
+    if (!is_dir($release . '/bootstrap/cache')) {
+        @mkdir($release . '/bootstrap/cache', 0755, true);
+    }
+    ra_write_file($front, ra_laravel_front($release, $shared, $version));
+    return $result;
+}
+
+/** After a switch: storage/ complete, the public storage link (when links are allowed), compiled views cleared. */
+function ra_laravel_finish(array &$state, array $p): array
+{
+    $shared = ra_dir('shared');
+    $result = ['storage_link' => 'exists', 'views_cleared' => 0];
+    ra_laravel_skeleton($shared . '/storage');
+    $link = __DIR__ . '/storage';
+    if (!ra_exists($link) && ($p['link'] ?? true)) {
+        $target = $shared . '/storage/app/public';
+        if (ra_disabled('symlink')) {
+            $result['storage_link'] = 'symlink() is disabled';
+        } elseif (@symlink($target, $link)) {
+            foreach ([ra_data(), $shared] as $dir) {
+                @chmod($dir, 0711);                                  // the web server follows the link
+            }
+            $result['storage_link'] = 'created';
+        } else {
+            $result['storage_link'] = 'symlink() failed';
+        }
+    }
+    foreach (glob($shared . '/storage/framework/views/*.php') ?: [] as $file) {
+        if (@unlink($file)) {
+            $result['views_cleared']++;
+        }
+    }
+    return $result;
+}
+
+/** Migrations that the database has run already (Laravel's migrations table). */
+function ra_laravel_migrations(array &$state, array $p): array
+{
+    $db = ra_db((string)($p['env_file'] ?? '@shared/.env'), 'auto');
+    if ($db === null) {
+        throw new RaError(422, 'no_database', 'no database settings in the .env');
+    }
+    $pdo = ra_pdo($db);
+    try {
+        $rows = $pdo->query('SELECT migration FROM migrations')->fetchAll(PDO::FETCH_COLUMN);
+    } catch (PDOException $e) {
+        return ['applied' => [], 'table' => false];
+    }
+    return ['applied' => array_values(array_map('strval', $rows)), 'table' => true];
+}
+
+/** A fatal error or an exit() inside the application still answers with JSON (and the output so far). */
+function ra_artisan_guard(): void
+{
+    if (!empty($GLOBALS['ra_artisan_done'])) {
+        return;
+    }
+    $error = error_get_last();
+    $fatal = $error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true);
+    $output = '';
+    while (ob_get_level() > 0) {
+        $output = (string)ob_get_clean() . $output;
+    }
+    if (!headers_sent()) {
+        ra_send(500, ['ok' => false, 'error' => [
+            'code' => $fatal ? 'php_fatal' : 'exited',
+            'message' => $fatal ? 'PHP error in the application: ' . $error['message'] . ' (' . basename((string)$error['file']) . ':' . $error['line'] . ')'
+                : 'the command ended the PHP request early (exit)',
+            'output' => ra_clip($output)]]);
+    }
+}
+
+/** Run an artisan command of a release inside this PHP request: no terminal, no shell. */
+function ra_artisan(array &$state, array $p): array
+{
+    $version = ra_version((string)($p['version'] ?? ($state['current'] ?? '')));
+    $command = trim((string)($p['command'] ?? ''));
+    if ($command === '' || strlen($command) > 1000 || preg_match('/[\r\n\0]/', $command)) {
+        throw new RaError(422, 'bad_command', 'invalid artisan command');
+    }
+    list($release, $shared, $storage) = ra_laravel_paths($version);
+    if (!is_file($release . '/artisan') || !is_file($release . '/vendor/autoload.php')) {
+        throw new RaError(422, 'not_laravel', 'release ' . $version . ' is not a Laravel application with vendor/ on the hosting');
+    }
+    if (!is_file($shared . '/.env')) {
+        throw new RaError(422, 'no_env', 'the .env of the site is not set yet: fill it in the dashboard');
+    }
+    @set_time_limit(max(30, min(3600, (int)($p['timeout'] ?? 300))));
+    ra_save($state);                                                 // the application may end the request itself
+    $GLOBALS['ra_artisan_done'] = false;
+    register_shutdown_function('ra_artisan_guard');
+    $_ENV['APP_RUNNING_IN_CONSOLE'] = $_SERVER['APP_RUNNING_IN_CONSOLE'] = 'true';
+    putenv('APP_RUNNING_IN_CONSOLE=true');
+    $cwd = getcwd();
+    @chdir($release);
+    ob_start();
+    try {
+        require_once $release . '/vendor/autoload.php';
+        $app = require $release . '/bootstrap/app.php';
+        $app->useEnvironmentPath($shared);
+        $app->useStoragePath($storage);
+        if (method_exists($app, 'usePublicPath')) {
+            $app->usePublicPath(__DIR__);
+        } else {
+            $app->instance('path.public', __DIR__);
+        }
+        $kernel = $app->make('Illuminate\Contracts\Console\Kernel');
+        $buffer = new \Symfony\Component\Console\Output\BufferedOutput();
+        $line = $command . (preg_match('/(^|\s)(--no-interaction|-n)(\s|$)/', $command) ? '' : ' --no-interaction');
+        $status = (int)$kernel->call($line, [], $buffer);
+        $text = $buffer->fetch();
+    } catch (Throwable $error) {
+        $GLOBALS['ra_artisan_done'] = true;
+        $stray = (string)ob_get_clean();
+        throw new RaError(422, 'artisan_failed', 'php artisan ' . strtok($command, ' ') . ': ' . get_class($error) . ': ' . substr($error->getMessage(), 0, 500)
+            . ($stray !== '' ? "\n" . ra_clip($stray, 4000) : ''));
+    } finally {
+        if ($cwd !== false) {
+            @chdir($cwd);
+        }
+    }
+    $GLOBALS['ra_artisan_done'] = true;
+    $stray = (string)ob_get_clean();
+    restore_error_handler();
+    restore_exception_handler();
+    return ['status' => $status, 'output' => ra_clip($stray . $text)];
+}
+
 // ------------------------------------------------------------------ the page in the browser
 
 function ra_page(): void
@@ -1169,32 +1552,47 @@ function ra_page(): void
             $body = '<p class="ok">Terhubung. Situs ini di-update oleh Arsika Rollout Manager.<br><small>Connected: this website is updated by Arsika Rollout Manager.</small></p>';
         } else {
             $https = strncmp(ra_url(), 'https://', 8) === 0;
-            $checks = [
-                ['PHP ' . PHP_VERSION, version_compare(PHP_VERSION, '7.4', '>='), 'PHP 7.4+'],
-                ['ZipArchive', class_exists('ZipArchive'), 'ekstensi zip / zip extension'],
-                ['zlib', function_exists('gzopen'), 'backup database'],
-                ['PDO: ' . (class_exists('PDO') ? implode(', ', PDO::getAvailableDrivers()) : '–'), class_exists('PDO'), 'database'],
-                ['Folder bisa ditulis / writable', $info !== null && $info['writable'], ''],
-                ['HTTPS', $https, $https ? '' : 'buka lewat https:// / open it over https://'],
+            $lan = !$https && ra_local_host((string)parse_url(ra_url(), PHP_URL_HOST));
+            $checks = [                                                // [what, ok | warn | bad, note]
+                ['PHP ' . PHP_VERSION, version_compare(PHP_VERSION, '7.4', '>=') ? 'ok' : 'bad', 'PHP 7.4+'],
+                ['ZipArchive', class_exists('ZipArchive') ? 'ok' : 'bad', 'ekstensi zip / zip extension'],
+                ['zlib', function_exists('gzopen') ? 'ok' : 'bad', 'backup database'],
+                ['PDO: ' . (class_exists('PDO') ? implode(', ', PDO::getAvailableDrivers()) : '–'), class_exists('PDO') ? 'ok' : 'bad', 'database'],
+                ['Folder bisa ditulis / writable', $info !== null && $info['writable'] ? 'ok' : 'bad', ''],
+                ['HTTPS', $https ? 'ok' : ($lan ? 'warn' : 'bad'), $https ? '' : ($lan ? 'http di jaringan lokal: boleh / plain http on a local network: allowed'
+                    : 'buka lewat https:// / open it over https://')],
             ];
-            $ready = $checks[0][1] && $checks[1][1] && $checks[4][1];
+            $ready = $checks[0][1] === 'ok' && $checks[1][1] === 'ok' && $checks[4][1] === 'ok';
             $rows = '';
             foreach ($checks as $check) {
-                $rows .= '<tr><td>' . $e($check[0]) . '</td><td class="' . ($check[1] ? 'ok' : 'bad') . '">' . ($check[1] ? '✓' : '✗') . '</td><td><small>' . $e($check[2]) . '</small></td></tr>';
+                $rows .= '<tr><td>' . $e($check[0]) . '</td><td class="' . $check[1] . '">' . ['ok' => '✓', 'warn' => '!', 'bad' => '✗'][$check[1]]
+                    . '</td><td><small>' . $e($check[2]) . '</small></td></tr>';
             }
-            // a query (not a #fragment) survives a sign-in in front of the dashboard, e.g. Cloudflare Access
+            // a query (not a #fragment) survives a sign-in in front of the dashboard, e.g. Cloudflare Access; only the
+            // dashboard that knows this file's key can connect it, so the address may be changed safely
             $link = rtrim(RA_DASHBOARD, '/') . '/?connect=' . rawurlencode(RA_SITE) . '&agent=' . rawurlencode(ra_url());
-            $body = '<p>File agen untuk situs <b>' . $e(RA_SITE) . '</b>. Klik tombol di bawah, lalu konfirmasi di dasbor.<br><small>Agent file of the site '
-                . $e(RA_SITE) . ': click the button, then confirm in the dashboard.</small></p><table>' . $rows . '</table>'
-                . ($ready ? '<p><a class="button" href="' . $e($link) . '">Hubungkan ke dasbor / Connect to the dashboard</a></p>'
-                    : '<p class="bad">Hosting ini belum memenuhi syarat di atas. / This hosting does not meet the requirements above.</p>')
-                . '<p><small>Dasbor / dashboard: ' . $e(RA_DASHBOARD) . '</small></p>';
+            $json = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES;
+            $form = '<form id="ra-connect"><label for="ra-dash">Alamat cicd (dasbor) / Address of the dashboard</label>'
+                . '<input id="ra-dash" type="text" inputmode="url" required value="' . $e(RA_DASHBOARD) . '" placeholder="https://cicd.example.com">'
+                . '<p><button class="button" type="submit">Hubungkan ke dasbor / Connect to the dashboard</button></p>'
+                . '<p><small>Sudah terisi dari dasbor; ubah hanya kalau dasbor dibuka lewat alamat lain (mis. alamat jaringan lokal).<br>'
+                . 'Filled in by the dashboard; change it only when you open the dashboard at another address.</small></p></form>'
+                . '<script>document.getElementById("ra-connect").addEventListener("submit",function(e){e.preventDefault();'
+                . 'var d=document.getElementById("ra-dash").value.trim().replace(/\/+$/,"");if(!/^https?:\/\//i.test(d)){d="https://"+d;}'
+                . 'location.href=d+"/?connect="+encodeURIComponent(' . json_encode(RA_SITE, $json) . ')+"&agent="+encodeURIComponent('
+                . json_encode(ra_url(), $json) . ');});</script>'
+                . '<noscript><p><a class="button" href="' . $e($link) . '">Hubungkan ke dasbor / Connect to the dashboard</a></p></noscript>';
+            $body = '<p>File agen untuk situs <b>' . $e(RA_SITE) . '</b>. Periksa alamat dasbor, klik Hubungkan, lalu konfirmasi di dasbor.<br><small>Agent file of the site '
+                . $e(RA_SITE) . ': check the address of the dashboard, click Connect, then confirm in the dashboard.</small></p><table>' . $rows . '</table>'
+                . ($ready ? $form : '<p class="bad">Tempat ini belum memenuhi syarat di atas. / This place does not meet the requirements above.</p>');
         }
     }
     echo '<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         . '<title>Arsika Rollout Manager</title><style>body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#1f2937}'
-        . 'h1{font-size:1.3rem}table{border-collapse:collapse;width:100%}td{border-bottom:1px solid #e5e7eb;padding:8px 6px}.ok{color:#047857}.bad{color:#b91c1c}'
-        . '.button{display:inline-block;background:#4f46e5;color:#fff;padding:10px 18px;border-radius:999px;text-decoration:none;font-weight:600}</style></head>'
+        . 'h1{font-size:1.3rem}table{border-collapse:collapse;width:100%;margin-bottom:18px}td{border-bottom:1px solid #e5e7eb;padding:8px 6px}'
+        . '.ok{color:#047857}.warn{color:#b45309}.bad{color:#b91c1c}label{display:block;font-weight:600;margin-bottom:6px}'
+        . 'input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;font:inherit}'
+        . '.button{display:inline-block;background:#4f46e5;color:#fff;padding:10px 18px;border:0;border-radius:999px;text-decoration:none;font:inherit;font-weight:600;cursor:pointer}</style></head>'
         . '<body><h1>Arsika Rollout Manager · agent ' . RA_VERSION . '</h1>' . $body . '</body></html>';
 }
 
@@ -1233,6 +1631,9 @@ try {
         'activate' => 'ra_activate', 'delete-release' => 'ra_delete_release', 'migrate' => 'ra_migrate',
         'backup' => 'ra_backup', 'download' => 'ra_download', 'clear' => 'ra_clear',
         'restore-files' => 'ra_restore_files', 'restore-db' => 'ra_restore_db',
+        'self-update' => 'ra_self_update', 'env-read' => 'ra_env_read', 'env-write' => 'ra_env_write',
+        'laravel-prepare' => 'ra_laravel_prepare', 'laravel-finish' => 'ra_laravel_finish',
+        'laravel-migrations' => 'ra_laravel_migrations', 'artisan' => 'ra_artisan',
     ];
     if (!isset($handlers[$action])) {
         throw new RaError(404, 'unknown_action', 'unknown action: ' . $action);

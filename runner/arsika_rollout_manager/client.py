@@ -40,15 +40,16 @@ class Client(object):
             raise PinError("the runner's certificate does not match the pin (it has %s)" % found)
         return conn
 
-    def request(self, method, path, data=None):
-        body = json.dumps(data).encode("utf-8") if data is not None else b""
+    def request(self, method, path, data=None, raw=None):
+        """-> (status, document). ``raw``: bytes sent as they are (a piece of an uploaded archive) instead of JSON."""
+        body = raw if raw is not None else (json.dumps(data).encode("utf-8") if data is not None else b"")
         target = urlsplit(self.url).path.rstrip("/") + path
         ts = int(time.time())
         nonce = secrets.token_hex(16)
         message = "%s\n%s\n%d\n%s\n%s" % (method, target, ts, nonce, hashlib.sha256(body).hexdigest())
         signature = hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest()
         headers = {"X-Rollout-Timestamp": str(ts), "X-Rollout-Nonce": nonce, "X-Rollout-Signature": signature,
-                   "Content-Type": "application/json", "Accept": "application/json"}
+                   "Content-Type": "application/octet-stream" if raw is not None else "application/json", "Accept": "application/json"}
         conn = self.connection()
         try:
             conn.request(method, target, body=body if method != "GET" else None, headers=headers)

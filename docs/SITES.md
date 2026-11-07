@@ -7,7 +7,9 @@
 - Every version is a **GitHub release** (tag `vX.Y.Z` or `X.Y.Z`) and the runner takes either
   - a **zip asset** of the release that contains the application at its root (e.g.
     `git archive --format=zip -o app_vX.Y.Z.zip vX.Y.Z`), or
-  - the release's **source code** (GitHub's archive of the tag; no asset needed).
+  - the release's **source code** (GitHub's archive of the tag; no asset needed),
+- or every version is an archive **uploaded in the dashboard** (release source *Upload*: zip, rar, 7z, tar.gz; see
+  [Uploaded versions](#uploaded-versions)).
 - Data that must survive updates lives in paths that can be shared between versions (`.env`, `storage/`, uploads …)
   or, for Docker Compose, in named volumes.
 - Database changes of a new version stay compatible with the previous version (only add tables and columns), so a
@@ -28,6 +30,7 @@ than one) and the kind of site:
 | Docker Compose: images | compose | source code | `.env` | – | images pulled from a registry; `https://{domain}/` |
 | Hosting: static site or built files | hosting | asset | – | release folder `.` or e.g. `dist` | no database |
 | Hosting: PHP website | hosting | asset | `.env` | release folder `.` | database changes from `database/migrations/*.sql` |
+| Hosting: Laravel | hosting | asset (or upload) | `.env`, `storage/` outside the website folder | release folder `public` | `php artisan migrate` inside PHP; `{site_url}/` |
 | Arsika Rollout Manager (this dashboard) | files | asset `arsika-rollout-manager-v*.zip` | `.env`, `storage/` | `public` → `current/public` | `preset:rollout-manager` (see [below](#arsika-rollout-manager-itself)); `http://{domain}/api/v1/app` checked on this server |
 
 Then fill in the domain (a folder in the server's site folder is suggested), the repository (`owner/name`) and, for a
@@ -48,8 +51,29 @@ Settings under **Advanced**:
 | systemd services | Restarted after every switch |
 | Reload PHP-FPM | Needed for PHP sites (OPcache) |
 | Docker Compose | Compose files, project name, build or pull (see below) |
-| Health check | Address that must answer 200 (and contain the text); `{domain}` and `{version}` are replaced. **Check through this server**: the web server of the site's server is asked directly (127.0.0.1 with the address's host name; a redirect to the same host, e.g. to https, is followed there too), for sites behind Cloudflare Access, a CDN or a firewall |
+| Release source | Zip asset, source code archive, or **Upload** (versions uploaded in the dashboard; no repository needed) |
+| Removed from uploaded files / uploaded versions kept | Paths or patterns (`*`, `**/name`, folders end with `/`) removed from every upload before it is stored; the newest uploads kept on the runner's server (never the live or the rollback version) |
+| Kind of application (hosting) | Plain files, or Laravel (see [HOSTING.md](HOSTING.md#laravel)) |
+| Health check | Address that must answer 200 (and contain the text); `{domain}`, `{version}` and `{site_url}` (hosting: the address of the agent file's folder) are replaced. **Check through this server**: the web server of the site's server is asked directly (127.0.0.1 with the address's host name; a redirect to the same host, e.g. to https, is followed there too), for sites behind Cloudflare Access, a CDN or a firewall |
 | Backups | Database, environment file, paths, exclusions, volumes, number kept (see below) |
+
+## Uploaded versions
+
+For projects without GitHub releases (or without GitHub): choose the release source **Upload**. The site page then has
+**Upload a new version**: choose a zip, rar, 7z or tar.gz of the project; the version name is taken from the file name
+(`absensi#003.rar` → `003`, `shop-v1.2.0.zip` → `1.2.0`) and can be changed. The file is sent in pieces, then a job on
+the runner's server
+
+1. unpacks it (zip and tar by Python; rar and 7z with bsdtar from `libarchive-tools`, 7-Zip or unrar, whichever is
+   installed) and refuses absolute paths, `..`, links and archives that unpack to more than 12 GB or 300,000 files;
+2. takes the content of a single top folder (`absensi-finger#003/…`) as the release;
+3. removes what must not go live: the list **Removed from uploaded files** (by default the local `.env`, `.git/`,
+   `node_modules/`, editor folders, `.DS_Store`, logs and caches of `storage/`, `bootstrap/cache/*.php`, `public/hot`);
+   `.gitignore` files stay, so the folders of the project remain;
+4. for a Laravel site on a hosting without `vendor/`: `composer install` on the runner's server (see HOSTING.md);
+5. stores it as a zip: the version appears under **Uploaded versions** and is deployed like a release.
+
+The newest uploads are kept (5 by default); the live and the rollback version are never removed.
 
 ## First installation
 

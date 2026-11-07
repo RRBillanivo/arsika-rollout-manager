@@ -81,6 +81,31 @@ export async function request(path, { method = 'GET', data = null, retry = true 
   return body;
 }
 
+/** POST bytes as they are (a piece of an uploaded file); answers like request(). */
+export async function sendBytes(path, bytes, retry = true) {
+  let res;
+  try {
+    res = await fetch(BASE + path, { method: 'POST', credentials: 'same-origin', body: bytes,
+      headers: { Accept: 'application/json', 'X-Locale': lang(), 'X-CSRF-Token': csrfToken, 'Content-Type': 'application/octet-stream' } });
+  } catch (e) {
+    throw new ApiError(t('common.api.offline'));
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch (e) {
+    /* not JSON */
+  }
+  if (!body) throw new ApiError(httpMessage(res.status), { status: res.status });
+  inspect(res.status, body);
+  if (isCsrfError(res.status, body) && retry) {
+    await refreshToken();
+    return sendBytes(path, bytes, false);
+  }
+  if (!res.ok) throw toError(res.status, body);
+  return body;
+}
+
 export const get = (path) => request(path);
 export const post = (path, data = {}) => request(path, { method: 'POST', data });
 export const put = (path, data = {}) => request(path, { method: 'PUT', data });

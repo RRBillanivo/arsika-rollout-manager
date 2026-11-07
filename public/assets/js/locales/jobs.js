@@ -4,6 +4,7 @@ export default {
     types: {
       deploy: 'Deploy', rollback: 'Rollback', adopt: 'Adopsi', backup: 'Backup', restore: 'Pulihkan backup',
       'delete-release': 'Hapus versi', 'cleanup-adopt': 'Hapus _pre_rollout', 'self-update': 'Update runner',
+      upload: 'Unggah versi', artisan: 'Artisan',
     },
     status: { queued: 'Menunggu', running: 'Berjalan', succeeded: 'Berhasil', failed: 'Gagal' },
     page: {
@@ -18,6 +19,7 @@ export default {
     types: {
       deploy: 'Deploy', rollback: 'Rollback', adopt: 'Adoption', backup: 'Backup', restore: 'Restore backup',
       'delete-release': 'Delete version', 'cleanup-adopt': 'Delete _pre_rollout', 'self-update': 'Update runner',
+      upload: 'Upload version', artisan: 'Artisan',
     },
     status: { queued: 'Queued', running: 'Running', succeeded: 'Succeeded', failed: 'Failed' },
     page: {

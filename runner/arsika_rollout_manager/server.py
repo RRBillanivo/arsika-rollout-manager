@@ -27,12 +27,15 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__, system
 from .deploy import DeployError
 from .github import GitHub, GitHubError
+from .hosting import artisan_command
 from .joblog import read_log
-from .sites import expand, layout, preset, presets_info, release_pattern, validate
+from .sites import expand, layout, preset, presets_info, release_pattern, site_url, validate
+from .uploads import CHUNK, UploadError
 from .util import VERSION, exists, now, version_key
 from .worker import JOB_TYPES, RUNNER_SITE
 
 MAX_BODY = 1 << 20
+UPLOAD_BODY = CHUNK + 4096                # a piece of an uploaded archive (PUT /v1/sites/<site>/uploads/<id>)
 WINDOW = 120
 TOKEN = re.compile(r"^[A-Za-z0-9_]{20,255}$")
 TOKEN_ERROR = "This does not look like a GitHub token."
@@ -117,7 +120,14 @@ class Api(object):
         ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent-file$", "agent_file"),
         ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent/connect$", "agent_connect"),
         ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/plan$", "plan"),
+        ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/uploads$", "upload_start"),
+        ("PUT", r"/v1/sites/(?P<site>[a-z0-9-]+)/uploads/(?P<upload>[0-9a-f]{16})$", "upload_chunk"),
+        ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/uploads/(?P<upload>[0-9a-f]{16})/finish$", "upload_finish"),
+        ("DELETE", r"/v1/sites/(?P<site>[a-z0-9-]+)/uploads/(?P<version>[0-9A-Za-z._+-]+)$", "upload_delete"),
+        ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/env$", "env_read"),
+        ("PUT", r"/v1/sites/(?P<site>[a-z0-9-]+)/env$", "env_write"),
     ]
+    RAW = ("upload_chunk",)                                          # the body is data, not JSON
 
     def __init__(self, config, store, deployer, worker):
         self.config = config
@@ -170,6 +180,8 @@ class Api(object):
             for route_method, pattern, name in self.ROUTES:
                 match = re.match(pattern, parts.path)
                 if match and route_method == method:
+                    if name in self.RAW:
+                        return 200, {"data": getattr(self, name)(query=query, data={}, raw=body, **match.groupdict())}
                     data = json.loads(body.decode("utf-8")) if body else {}
                     if not isinstance(data, dict):
                         raise ApiError(400, "bad_request", "JSON object expected")
@@ -177,7 +189,7 @@ class Api(object):
             raise ApiError(404, "not_found", "unknown endpoint " + method + " " + parts.path)
         except ApiError as e:
             return e.status, {"error": {"code": e.code, "message": str(e), "fields": e.fields}}
-        except (DeployError, GitHubError) as e:
+        except (DeployError, GitHubError, UploadError) as e:
             return 422, {"error": {"code": "failed", "message": str(e), "fields": {}}}
         except ValueError as e:
             return 400, {"error": {"code": "bad_request", "message": str(e), "fields": {}}}
@@ -206,8 +218,8 @@ class Api(object):
         return site
 
     def site_health(self, site, refresh=False):
-        if not site.get("health_url"):
-            return None
+        if not site.get("health_url") or ("{site_url}" in site["health_url"] and not site_url(site)):
+            return None                         # a hosting site that is not connected yet has no address
         version = self.ops(site).current_version(site) or ""
         cached = self.health_cache.get(site["id"])
         if cached and not refresh and time.time() - cached[0] < 30 and cached[2] == version:
@@ -226,7 +238,11 @@ class Api(object):
         current = ops.current_version(site)
         installed = ops.installed(site) if ops is not self.deployer or os.path.isdir(layout(site)["releases"]) else []
         latest, latest_error = None, ""
-        if with_latest and site.get("repo"):
+        uploaded = site.get("source") == "upload"
+        if uploaded:
+            versions = self.deployer.uploads.versions(site["id"])
+            latest = versions[0]["version"] if versions else None      # the newest upload
+        elif with_latest and site.get("repo"):
             try:
                 releases = [r for r in self.site_github(site).releases(site["repo"], release_pattern(site)) if not r["prerelease"]]
                 latest = releases[0]["version"] if releases else None
@@ -238,7 +254,8 @@ class Api(object):
             "id": site["id"], "name": site["name"], "domain": site["domain"], "repo": site["repo"], "path": site["path"],
             "deploy_mode": site.get("deploy_mode", "files"), "state": ops.state(site), "current_version": current, "installed": [r["version"] for r in installed],
             "latest_version": latest, "latest_error": latest_error,
-            "update_available": bool(latest and current and latest != current and version_key(latest) > version_key(current)),
+            "update_available": bool(latest and current and latest != current and (uploaded or version_key(latest) > version_key(current))),
+            "source": site.get("source", "asset"), "hosting_app": site.get("hosting_app", ""),
             "rollback_version": ops.rollback_target(site),
             "health": self.site_health(site) if with_health else None,
             "services": system.service_states(site.get("services", [])),
@@ -297,6 +314,9 @@ class Api(object):
             details["pre_rollout"] = self.hosting.pre_rollout(record)
             details["disk"] = None
             details["hosting"] = self.hosting.details(record)
+            status = self.hosting.status(record) or {}
+            details["env"] = {"file": self.hosting.env_file(record), "pending": self.hosting.pending_env(record) is not None,
+                              "on_hosting": bool(status.get("env"))}
             return details
         details["releases_installed"] = self.deployer.installed(record)
         details["pre_rollout"] = exists(lay["pre_rollout"])
@@ -353,6 +373,7 @@ class Api(object):
         record = self.store.site(site)
         if self.hosting is not None and self.hosting.is_hosting(record):
             self.hosting.disconnect(record)
+        self.deployer.uploads.remove_site(site)
         self.store.delete_site(site)
         self.config.set_site_token(site, "")
         return {"deleted": site, "files_kept": True}
@@ -361,11 +382,14 @@ class Api(object):
         record = self.get_site(site)
         installed = {r["version"]: r for r in self.ops(record).installed(record)}
         current = self.ops(record).current_version(record)
-        try:
-            remote = self.site_github(record).releases(record["repo"], release_pattern(record), refresh=query.get("refresh") == "1")
-            error = ""
-        except GitHubError as e:
-            remote, error = [], str(e)
+        if record.get("source") == "upload":
+            remote, error = [self.upload_release(u) for u in self.deployer.uploads.versions(site)], ""
+        else:
+            try:
+                remote = self.site_github(record).releases(record["repo"], release_pattern(record), refresh=query.get("refresh") == "1")
+                error = ""
+            except GitHubError as e:
+                remote, error = [], str(e)
         listed = {r["version"] for r in remote}
         for r in remote:
             r["installed"] = r["version"] in installed
@@ -373,6 +397,15 @@ class Api(object):
         local_only = [{"version": v, "tag": v, "name": v, "published_at": None, "notes": "", "asset": None, "installed": True,
                        "current": v == current, "local_only": True} for v in installed if v not in listed]
         return {"releases": remote + local_only, "error": error, "current": current}
+
+    @staticmethod
+    def upload_release(info):
+        """An uploaded version, in the shape of a GitHub release for the dashboard."""
+        return {"version": info["version"], "tag": info["version"], "name": info.get("name") or info["version"],
+                "published_at": info.get("uploaded_at"), "prerelease": False, "draft": False, "notes": "", "html_url": "",
+                "asset": {"name": info.get("name"), "size": info.get("size")}, "assets": [info.get("name")], "uploaded": True,
+                "actor": info.get("actor"), "files": info.get("files"), "removed_count": info.get("removed_count", 0),
+                "removed": (info.get("removed") or [])[:20], "php": info.get("php") or "", "sha256": info.get("sha256")}
 
     def health(self, site, query, data):
         return self.site_health(self.get_site(site), refresh=True)
@@ -388,9 +421,21 @@ class Api(object):
         if job_type in ("deploy", "adopt", "delete-release") and not version:
             raise ApiError(422, "validation_failed", "version required", {"version": "Choose a version."})
         params = data.get("params") if isinstance(data.get("params"), dict) else {}
-        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason", "migrations") if k in params}
+        params = {k: params[k] for k in ("backup", "backup_id", "safety_backup", "reason", "migrations", "command") if k in params}
         if params.get("migrations") not in (None, "auto", "manual"):
             raise ApiError(422, "validation_failed", "migrations: auto or manual", {"migrations": "Choose auto or manual."})
+        if job_type == "upload":
+            raise ApiError(422, "validation_failed", "versions are uploaded with the upload endpoints", {"type": "Use the upload."})
+        if job_type == "artisan":
+            if self.hosting is None or not self.hosting.is_laravel(record):
+                raise ApiError(409, "not_laravel", "artisan commands are run for Laravel sites on a hosting")
+            try:
+                params["command"] = artisan_command(params.get("command"))
+            except DeployError as e:
+                raise ApiError(422, "validation_failed", str(e), {"command": str(e)})
+        if record.get("source") == "upload" and job_type in ("deploy", "adopt") and not self.deployer.uploads.get(site, version) \
+                and version not in {r["version"] for r in self.ops(record).installed(record)}:
+            raise ApiError(422, "validation_failed", "version %s is not uploaded" % version, {"version": "Upload this version first."})
         if self.store.active_job(site):
             raise ApiError(409, "busy", "a job of this site is already queued or running")
         if job_type == "restore" and not self.store.backup(site, str(params.get("backup_id", ""))):
@@ -449,6 +494,56 @@ class Api(object):
     def plan(self, site, query, data):
         return self.hosting.plan(self.hosting_site(site), str(query.get("version") or ""))
 
+    # ---------- uploaded versions ----------
+    def upload_site(self, site):
+        record = self.get_site(site)
+        if record.get("source") != "upload":
+            raise ApiError(409, "not_upload", "site %s takes its versions from GitHub releases (release source)" % site)
+        return record
+
+    def upload_start(self, site, query, data):
+        record = self.upload_site(site)
+        return self.deployer.uploads.start(record, data.get("name"), data.get("size"), data.get("version"),
+                                           str(data.get("actor") or "")[:80] or None)
+
+    def upload_chunk(self, site, upload, query, data, raw):
+        self.upload_site(site)
+        try:
+            offset = int(query.get("offset", "0"))
+        except ValueError:
+            raise ApiError(400, "bad_request", "offset must be a number")
+        return self.deployer.uploads.append(site, upload, offset, raw)
+
+    def upload_finish(self, site, upload, query, data):
+        """The upload is complete: a job unpacks, cleans and stores it as a version (see uploads.py)."""
+        self.upload_site(site)
+        meta = self.deployer.uploads.incoming(site, upload)
+        if self.store.active_job(site):
+            raise ApiError(409, "busy", "a job of this site is queued or running; finish the upload when it has ended")
+        self.deployer.uploads.finish(site, upload)
+        actor = str(data.get("actor") or meta.get("actor") or "")[:80] or None
+        return self.store.job(self.worker.submit(site, "upload", meta["version"], {"upload_id": upload}, actor))
+
+    def upload_delete(self, site, version, query, data):
+        record = self.upload_site(site)
+        ops = self.ops(record)
+        if version in (ops.current_version(record), ops.rollback_target(record)):
+            raise ApiError(409, "in_use", "version %s is live or the rollback version; it stays" % version)
+        if self.store.active_job(site):
+            raise ApiError(409, "busy", "a job of this site is queued or running")
+        self.deployer.uploads.delete(site, version)
+        return {"deleted": version}
+
+    # ---------- the .env of a hosting site ----------
+    def env_read(self, site, query, data):
+        return self.hosting.env_read(self.hosting_site(site))
+
+    def env_write(self, site, query, data):
+        record = self.hosting_site(site)
+        result = self.hosting.env_write(record, data.get("content"))
+        self.hosting.forget_cache(record)
+        return result
+
     def jobs(self, query, data):
         return self.store.jobs(query.get("site") or None, min(200, int(query.get("limit", 50) or 50)))
 
@@ -474,7 +569,7 @@ def make_handler(api):
 
         def _serve(self, method):
             length = int(self.headers.get("Content-Length") or 0)
-            if length > MAX_BODY:
+            if length > (UPLOAD_BODY if method == "PUT" and "/uploads/" in self.path else MAX_BODY):
                 status, doc = 413, {"error": {"code": "too_large", "message": "request too large", "fields": {}}}
             else:
                 body = self.rfile.read(length) if length else b""

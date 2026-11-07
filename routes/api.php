@@ -20,6 +20,8 @@ return static function (Router $router): void {
     $router->pattern('backup', '[0-9A-Za-z][0-9A-Za-z._+-]{0,100}');
     $router->pattern('job', '\d{1,10}');
     $router->pattern('server', '(?:local|\d{1,10})');
+    $router->pattern('upload', '[0-9a-f]{16}');
+    $router->pattern('version', '[0-9A-Za-z][0-9A-Za-z._+-]{0,63}');
 
     $router->group(['prefix' => '/api/v1', 'middleware' => ['csrf']], static function (Router $router): void {
         $router->get('/app', [AppController::class, 'show']);
@@ -46,6 +48,12 @@ return static function (Router $router): void {
             $router->post('/sites/{site}/agent-file', [SiteController::class, 'agentFile']);
             $router->post('/sites/{site}/agent/connect', [SiteController::class, 'connectAgent']);
             $router->get('/sites/{site}/plan', [SiteController::class, 'plan']);
+            $router->post('/sites/{site}/uploads', [SiteController::class, 'uploadStart']);
+            $router->post('/sites/{site}/uploads/{upload}', [SiteController::class, 'uploadChunk']);
+            $router->post('/sites/{site}/uploads/{upload}/finish', [SiteController::class, 'uploadFinish']);
+            $router->delete('/sites/{site}/uploads/{version}', [SiteController::class, 'destroyUpload']);
+            $router->post('/sites/{site}/env/read', [SiteController::class, 'readEnv']);
+            $router->put('/sites/{site}/env', [SiteController::class, 'saveEnv']);
 
             $router->get('/jobs', [JobController::class, 'index']);
             $router->get('/jobs/{job}', [JobController::class, 'show']);

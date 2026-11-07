@@ -1,7 +1,8 @@
 """Site settings: validation, defaults and presets.
 
 A site is a web application on this server that is installed from a GitHub release: a zip asset of the release
-(source "asset") or the release's source code archive (source "source"):
+(source "asset") or the release's source code archive (source "source"), or from an archive uploaded through the
+dashboard (source "upload", see uploads.py):
 
     <path>/releases/<version>/    one folder per installed release
     <path>/shared/                files kept between releases (.env, storage/ ...), linked into every release
@@ -20,6 +21,13 @@ import re
 from .util import REPO, SERVICE, SITE_ID, USER
 
 SOURCE_ARCHIVE = ":source"                 # release pattern meaning: the release's source code archive (zipball)
+
+# what an uploaded archive must not bring live: the local environment, version control, editors, logs and caches
+UPLOAD_EXCLUDE = [".env", ".env.backup", ".env.production", ".git/", ".svn/", ".hg/", "node_modules/", ".idea/", ".vscode/",
+                  ".fleet/", ".phpunit.result.cache", ".phpunit.cache/", "**/.DS_Store", "**/Thumbs.db", "**/desktop.ini",
+                  "__MACOSX/", "storage/logs/*", "storage/framework/views/*", "storage/framework/sessions/*",
+                  "storage/framework/cache/data/*", "storage/framework/testing/*", "storage/pail/", "bootstrap/cache/*.php",
+                  "public/hot", "public/storage"]
 
 DEFAULTS = {
     "name": "",
@@ -55,6 +63,9 @@ DEFAULTS = {
     "backup_volumes": [],
     "agent_url": "",
     "migrations_dir": "database/migrations",
+    "hosting_app": "",
+    "upload_exclude": UPLOAD_EXCLUDE,
+    "upload_keep": 5,
 }
 
 HOSTING = {
@@ -64,7 +75,7 @@ HOSTING = {
     "docroot_target": ".",
     "reload_php_fpm": False,
     "keep_releases": 2,
-    "health_url": "https://{domain}/",
+    "health_url": "{site_url}/",
     "adopt_keep": [".well-known", "cgi-bin", ".user.ini"],
 }
 
@@ -125,6 +136,10 @@ PRESETS = {
                            backup_db="none"),
     "hosting-php": dict(HOSTING, label="Hosting: PHP website (.env and database)", shared=[".env"], backup_env_file=".env",
                         backup_paths=[".env"]),
+    # the website folder gets only public/; the application, its .env and storage/ live in the agent's data folder
+    "hosting-laravel": dict(HOSTING, label="Hosting: Laravel (php artisan migrate without a terminal, composer on this server)",
+                            hosting_app="laravel", docroot_target="public", shared=[], backup_env_file="@shared/.env",
+                            backup_paths=["@shared/.env", "@shared/storage/app"], backup_exclude=[]),
     "rollout-manager": {
         "label": "Arsika Rollout Manager (this dashboard: updates itself and the runner of this server)",
         "repo": "RRBillanivo/arsika-rollout-manager",
@@ -145,10 +160,14 @@ PRESETS = {
 
 RELATIVE = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9_.@+-][A-Za-z0-9_./@+-]{0,199}$")
 DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
-LIST_FIELDS = ("shared", "services", "backup_paths", "backup_exclude", "adopt_keep", "compose_files", "backup_volumes")
+IPV4 = re.compile(r"^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$")
+PATTERN = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9_.@+*?!\[\] /-]{1,200}$")
+LIST_FIELDS = ("shared", "services", "backup_paths", "backup_exclude", "adopt_keep", "compose_files", "backup_volumes",
+               "upload_exclude")
 BOOL_FIELDS = ("reload_php_fpm", "backup_before_deploy", "compose_build", "health_local")
 HOOK_FIELDS = ("build", "activate")
-CHOICES = {"deploy_mode": ("files", "compose", "hosting"), "source": ("asset", "source"), "backup_db": ("auto", "mysql", "postgres", "none")}
+CHOICES = {"deploy_mode": ("files", "compose", "hosting"), "source": ("asset", "source", "upload"),
+           "backup_db": ("auto", "mysql", "postgres", "none")}
 PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 CONTAINER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -192,8 +211,8 @@ def validate(data, site_roots, existing=None):
             errors["id"] = "Use 1-40 lowercase letters, digits and hyphens (e.g. example)."
     site["name"] = str(site["name"]).strip()[:80] or site.get("id", "")
     site["domain"] = str(site["domain"]).strip().lower()
-    if site["domain"] and not DOMAIN.match(site["domain"]):
-        errors["domain"] = "Not a valid domain name."
+    if site["domain"] and not DOMAIN.match(site["domain"]) and not IPV4.match(site["domain"]):
+        errors["domain"] = "Not a valid domain name (or IPv4 address)."
 
     hosting = str(site.get("deploy_mode") or "") == "hosting"
     path = os.path.normpath(str(site["path"]).strip()) if str(site["path"]).strip() else ""
@@ -212,7 +231,8 @@ def validate(data, site_roots, existing=None):
         site["repo"] = site["repo"][len("https://github.com/"):].strip("/")
     if site["repo"].endswith(".git"):
         site["repo"] = site["repo"][:-4]
-    if not REPO.match(site["repo"]):
+    uploaded = str(site.get("source") or "").strip().lower() == "upload"
+    if not REPO.match(site["repo"]) and not (uploaded and not site["repo"]):
         errors["repo"] = "GitHub repository as owner/name, e.g. RRBillanivo/Anemia_Web."
     site["asset_pattern"] = str(site["asset_pattern"]).strip() or "*.zip"
     if len(site["asset_pattern"]) > 100 or "/" in site["asset_pattern"]:
@@ -227,6 +247,9 @@ def validate(data, site_roots, existing=None):
         bad = [p for p in site[key] if not RELATIVE.match(p)]
         if bad:
             errors[key] = "Relative paths only (no leading / and no ..): " + ", ".join(bad[:3])
+    bad = [p for p in site["upload_exclude"] if not PATTERN.match(p)]
+    if bad:
+        errors["upload_exclude"] = "Relative paths or patterns (*, ?, **/name) without a leading / and without ..: " + ", ".join(bad[:3])
     bad = [s for s in site["services"] if not SERVICE.match(s)]
     if bad:
         errors["services"] = "systemd unit names only: " + ", ".join(bad[:3])
@@ -246,7 +269,7 @@ def validate(data, site_roots, existing=None):
             errors[key] = "Unknown preset " + site[key][7:] + "."
     for key in BOOL_FIELDS:
         site[key] = site[key] in (True, 1, "1", "true", "on", "yes")
-    for key, low, high in (("keep_releases", 2, 20), ("backup_keep", 1, 50)):
+    for key, low, high in (("keep_releases", 2, 20), ("backup_keep", 1, 50), ("upload_keep", 1, 50)):
         try:
             site[key] = int(site[key])
             if not low <= site[key] <= high:
@@ -255,8 +278,8 @@ def validate(data, site_roots, existing=None):
             errors[key] = "Number between %d and %d." % (low, high)
 
     site["health_url"] = str(site["health_url"]).strip()
-    if site["health_url"] and not re.match(r"^https?://[^\s]+$", site["health_url"]):
-        errors["health_url"] = "Address starting with https:// (may contain {domain})."
+    if site["health_url"] and not re.match(r"^(https?://|\{site_url\})[^\s]*$", site["health_url"]):
+        errors["health_url"] = "Address starting with https:// or {site_url} (may contain {domain})."
     site["health_contains"] = str(site["health_contains"])[:200]
     site["backup_env_file"] = str(site["backup_env_file"]).strip()
     if site["backup_env_file"] and not RELATIVE.match(site["backup_env_file"]):
@@ -284,14 +307,28 @@ def validate(data, site_roots, existing=None):
     if not RELATIVE.match(site["migrations_dir"]):
         errors["migrations_dir"] = "Folder inside the release, e.g. database/migrations."
     site["agent_url"] = str(site["agent_url"] or "").strip()
+    site["hosting_app"] = str(site.get("hosting_app") or "").strip().lower()
+    if site["hosting_app"] not in ("", "laravel"):
+        errors["hosting_app"] = "Empty (plain files) or laravel."
     if site["deploy_mode"] == "hosting":
         site["reload_php_fpm"], site["services"], site["build"], site["activate"] = False, [], "", ""
+        if site["hosting_app"] == "laravel" and site["docroot_target"] == ".":
+            site["docroot_target"] = "public"                        # only public/ goes into the website folder
+    else:
+        site["hosting_app"] = ""
     return site, errors
 
 
+def site_url(site):
+    """Address of the website folder of a hosting site: the address of its agent file without the file name."""
+    url = str(site.get("agent_url") or "")
+    return url.rsplit("/", 1)[0] if "/" in url else ""
+
+
 def expand(site, text, version=""):
-    """Replace {domain}, {version} and {site} in health check settings."""
-    return str(text).replace("{domain}", site.get("domain", "")).replace("{version}", version).replace("{site}", site.get("id", ""))
+    """Replace {domain}, {version}, {site} and {site_url} in health check settings."""
+    return (str(text).replace("{site_url}", site_url(site)).replace("{domain}", site.get("domain", ""))
+            .replace("{version}", version).replace("{site}", site.get("id", "")))
 
 
 def layout(site):

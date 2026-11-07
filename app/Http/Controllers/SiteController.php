@@ -7,21 +7,25 @@ use App\Core\Request;
 use App\Core\Response;
 use App\Services\RunnerClient;
 use App\Services\Servers;
+use App\Support\Str;
 
 /**
- * Registered sites, their GitHub releases, jobs (deploy, rollback, adopt, backup, restore, cleanup) and backups.
+ * Registered sites, their versions (GitHub releases or archives uploaded here), jobs (deploy, rollback, adopt, backup,
+ * restore, cleanup, artisan) and backups, and the .env of hosting sites.
  * Each site lives on one server; its requests go to the runner of that server. The runners do the work; this
  * controller adds authentication, password confirmation and the audit trail.
  */
 final class SiteController extends Controller
 {
     /** Job types that change data or files irreversibly: the password is asked again. */
-    const CONFIRMED_JOBS = ['adopt', 'restore', 'delete-release', 'cleanup-adopt'];
+    const CONFIRMED_JOBS = ['adopt', 'restore', 'delete-release', 'cleanup-adopt', 'artisan'];
+    /** Largest piece of an upload sent through this dashboard (below the web server's and PHP's body limits). */
+    const UPLOAD_CHUNK = 1048576;
     const SITE_FIELDS = ['id', 'preset', 'name', 'domain', 'path', 'repo', 'asset_pattern', 'web_user', 'keep_releases', 'shared',
         'docroot_link', 'docroot_target', 'build', 'activate', 'services', 'reload_php_fpm', 'health_url', 'health_contains', 'health_local',
         'backup_before_deploy', 'backup_env_file', 'backup_paths', 'backup_exclude', 'backup_keep', 'adopt_keep',
         'deploy_mode', 'source', 'compose_files', 'compose_project', 'compose_build', 'backup_db', 'backup_db_service', 'backup_volumes',
-        'migrations_dir'];
+        'migrations_dir', 'hosting_app', 'upload_exclude', 'upload_keep'];
 
     /** @var Servers */
     private $servers;
@@ -150,9 +154,78 @@ final class SiteController extends Controller
             'type' => $type, 'version' => $request->string('version', 64) ?: null,
             'params' => is_array($params) ? $params : [], 'actor' => (string)$user['username'],
         ]);
+        $command = $type === 'artisan' && is_array($params) ? strtok(trim((string)($params['command'] ?? '')), ' ') : '';
         $this->audit($request, 'job_' . str_replace('-', '_', $type), 'site:' . $site,
-            trim('#' . $job['id'] . ' ' . ($job['version'] ?? '') . (isset($params['backup_id']) ? ' ' . $params['backup_id'] : '')));
+            trim('#' . $job['id'] . ' ' . ($job['version'] ?? '') . (isset($params['backup_id']) ? ' ' . $params['backup_id'] : '')
+                . ($command ? ' ' . $command : '')));
         return Response::json($job, 201);
+    }
+
+    /**
+     * POST /api/v1/sites/{site}/uploads {name, size, version} — start uploading an archive as a version of a site whose
+     * versions are uploaded (release source "upload"). -> {id, version, chunk_size}
+     */
+    public function uploadStart(Request $request, string $site): Response
+    {
+        $user = $this->user($request);
+        $started = (array)$this->servers->clientForSite($site)->post('/v1/sites/' . $site . '/uploads', [
+            'name' => $request->string('name', 200), 'size' => (int)$request->input('size', 0),
+            'version' => $request->string('version', 64), 'actor' => (string)$user['username'],
+        ]);
+        $limit = Str::toBytes((string)ini_get('post_max_size'));
+        $started['chunk_size'] = max(65536, min((int)($started['chunk_size'] ?? self::UPLOAD_CHUNK), self::UPLOAD_CHUNK,
+            $limit > 0 ? $limit - 65536 : self::UPLOAD_CHUNK));
+        return Response::json($started, 201);
+    }
+
+    /** POST /api/v1/sites/{site}/uploads/{upload}?offset= (body: the bytes of the piece) */
+    public function uploadChunk(Request $request, string $site, string $upload): Response
+    {
+        $this->user($request);
+        $offset = max(0, (int)$request->query('offset', 0));
+        return Response::json($this->servers->clientForSite($site)->putBytes('/v1/sites/' . $site . '/uploads/' . $upload . '?offset=' . $offset,
+            $request->body()));
+    }
+
+    /** POST /api/v1/sites/{site}/uploads/{upload}/finish — the runner unpacks, cleans and stores the version (a job). */
+    public function uploadFinish(Request $request, string $site, string $upload): Response
+    {
+        $user = $this->user($request);
+        $job = (array)$this->servers->clientForSite($site)->post('/v1/sites/' . $site . '/uploads/' . $upload . '/finish',
+            ['actor' => (string)$user['username']]);
+        $this->audit($request, 'version_uploaded', 'site:' . $site, '#' . ($job['id'] ?? '') . ' ' . ($job['version'] ?? ''));
+        return Response::json($job, 201);
+    }
+
+    /** DELETE /api/v1/sites/{site}/uploads/{version} {password} — an uploaded version that is not live. */
+    public function destroyUpload(Request $request, string $site, string $version): Response
+    {
+        $this->confirmPassword($request);
+        $result = $this->servers->clientForSite($site)->delete('/v1/sites/' . $site . '/uploads/' . rawurlencode($version));
+        $this->audit($request, 'upload_deleted', 'site:' . $site, $version);
+        return Response::json($result);
+    }
+
+    /**
+     * POST /api/v1/sites/{site}/env/read {password} — the .env of a hosting site (from the hosting, or the copy prepared
+     * here before it is connected), with a template from the release's .env.example when there is none.
+     */
+    public function readEnv(Request $request, string $site): Response
+    {
+        $this->confirmPassword($request);
+        $env = $this->servers->clientForSite($site)->get('/v1/sites/' . $site . '/env');
+        $this->audit($request, 'env_viewed', 'site:' . $site, (string)($env['file'] ?? ''));
+        return Response::json($env);
+    }
+
+    /** PUT /api/v1/sites/{site}/env {content, password} */
+    public function saveEnv(Request $request, string $site): Response
+    {
+        $this->confirmPassword($request);
+        $content = (string)$request->input('content', '');
+        $result = $this->servers->clientForSite($site)->put('/v1/sites/' . $site . '/env', ['content' => $content]);
+        $this->audit($request, 'env_saved', 'site:' . $site, (string)($result['where'] ?? ''));
+        return Response::json($result);
     }
 
     /**

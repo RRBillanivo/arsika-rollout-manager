@@ -2,7 +2,8 @@
 
 Order of a deployment (any failure before step 6 leaves the site untouched):
   1. backup of the database, shared files and volumes (if enabled)
-  2. download the release asset (or the release's source code) from GitHub and verify its size / SHA-256
+  2. download the release asset (or the release's source code) from GitHub and verify its size / SHA-256, or take
+     the version uploaded through the dashboard
   3. extract into releases/<version>/ and link the shared files; Docker Compose sites: build or pull the images
   4. build hook (e.g. Python environment, database migrations, self-test)
   5. mark the release complete (.rollout-release.json)
@@ -21,6 +22,7 @@ from . import system
 from .compose import DEFAULT_FILES, OVERRIDE, Compose, ComposeError
 from .github import GitHub
 from .sites import expand, layout, release_pattern
+from .uploads import Uploads
 from .util import (POSIX, chown_tree, ensure_dir, exists, human_size, link_target, lock_file, make_link, remove,
                    sha256_file, switch_link, version_key, VERSION)
 
@@ -56,6 +58,7 @@ class Deployer(object):
         self.store = store
         self.backups = backups
         self.compose = getattr(backups, "compose", None) or Compose(config)
+        self.uploads = Uploads(config)
 
     def github(self, site):
         """GitHub client with the site's own read-only token (none for a public repository)."""
@@ -148,9 +151,32 @@ class Deployer(object):
             log.line("removing an incomplete releases/%s from an earlier attempt" % version)
             remove(target)
 
-        log.step("Find release %s in %s" % (version, site["repo"]))
         if self.is_compose(site):
             self.compose.require()                                   # before anything is downloaded
+        if site.get("source") == "upload":
+            asset_name, size, digest = self.extract_upload(site, version, target, log)
+        else:
+            asset_name, size, digest = self.download_release(site, version, target, log, job_id)
+
+        self.link_shared(site, target, log)
+        if site.get("web_user") and chown_tree(target, site["web_user"]):
+            log.line("release files given to " + site["web_user"])
+        if self.is_compose(site):
+            self.keep_project(site, self.compose.project(site), log)
+            self.compose.prepare(site, version, target, log, system.run, self.config["hook_timeout_seconds"])
+        system.run_hook(site, "build", site.get("build", ""), target, self.variables(site, version), log,
+                        self.config["shell"], self.config["hook_timeout_seconds"])
+        info = {"version": version, "installed_at": system_now(), "asset": asset_name, "size_bytes": size, "sha256": digest,
+                "job_id": job_id}
+        with open(os.path.join(target, MARKER), "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+        self.store.save_release(site["id"], version, asset_name, size, digest)
+        log.line("release %s is ready" % version)
+        return target
+
+    def download_release(self, site, version, target, log, job_id):
+        """The release from GitHub, extracted into ``target``. -> (asset name, size, sha256)"""
+        log.step("Find release %s in %s" % (version, site["repo"]))
         github = self.github(site)
         release = github.release(site["repo"], version, release_pattern(site))
         asset = release["asset"]
@@ -164,30 +190,32 @@ class Deployer(object):
             log.step("Download %s (%s)" % (asset["name"], human_size(asset["size"])))
         try:
             size, digest = self.fetch(github, asset, archive, log)
-            log.step("Extract into releases/" + version)
-            ensure_dir(lay["releases"])
-            ensure_dir(target)
-            count = self.extract(archive, target)
-            log.line("%d files extracted" % count)
+            self.extract_into(archive, target, version, log)
         finally:
             if exists(archive):
                 os.unlink(archive)
+        return asset["name"], size, digest
 
-        self.link_shared(site, target, log)
-        if site.get("web_user") and chown_tree(target, site["web_user"]):
-            log.line("release files given to " + site["web_user"])
-        if self.is_compose(site):
-            self.keep_project(site, self.compose.project(site), log)
-            self.compose.prepare(site, version, target, log, system.run, self.config["hook_timeout_seconds"])
-        system.run_hook(site, "build", site.get("build", ""), target, self.variables(site, version), log,
-                        self.config["shell"], self.config["hook_timeout_seconds"])
-        info = {"version": version, "installed_at": system_now(), "asset": asset["name"], "size_bytes": size, "sha256": digest,
-                "job_id": job_id}
-        with open(os.path.join(target, MARKER), "w", encoding="utf-8") as f:
-            json.dump(info, f, indent=2)
-        self.store.save_release(site["id"], version, asset["name"], size, digest)
-        log.line("release %s is ready" % version)
-        return target
+    def extract_upload(self, site, version, target, log):
+        """A version uploaded through the dashboard (kept on this server), extracted into ``target``."""
+        info = self.uploads.get(site["id"], version)
+        if not info:
+            raise DeployError("version %s is not among the uploads of this site: upload it in the dashboard" % version)
+        archive = self.uploads.archive(site["id"], version)
+        log.step("Take the uploaded version %s (%s, uploaded %s by %s)" % (version, info.get("name"), info.get("uploaded_at"),
+                                                                         info.get("actor") or "?"))
+        digest = sha256_file(archive)
+        if digest != info.get("sha256"):
+            raise DeployError("the stored upload of %s is damaged (checksum mismatch): upload it again" % version)
+        log.line("SHA-256 verified: " + digest)
+        self.extract_into(archive, target, version, log)
+        return info.get("name") or version + ".zip", os.path.getsize(archive), digest
+
+    def extract_into(self, archive, target, version, log):
+        log.step("Extract into releases/" + version)
+        ensure_dir(os.path.dirname(target))
+        ensure_dir(target)
+        log.line("%d files extracted" % self.extract(archive, target))
 
     @staticmethod
     def fetch(github, asset, archive, log):
@@ -529,6 +557,8 @@ class Deployer(object):
             remove(path)
             self.store.forget_release(site["id"], release["version"])
             log.line("old release removed: " + release["version"])
+        if site.get("source") == "upload":
+            self.uploads.prune(site, protected, log)
 
     def remove_images(self, release_dir, log):
         """Docker Compose sites: the images built for a release are removed with it (an image still in use stays)."""

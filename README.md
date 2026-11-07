@@ -3,7 +3,7 @@
 A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux servers**,
 straight from their **GitHub Releases**: a zip attached to the release, or the release's source code.
 
-![version](https://img.shields.io/badge/version-1.4.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
+![version](https://img.shields.io/badge/version-1.5.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![php](https://img.shields.io/badge/PHP-7.4%E2%80%938.4-777bb4) ![python](https://img.shields.io/badge/Python-3.6%E2%80%933.13-3776ab)
 
 > **Status: early release.** Version 1.1 runs in production on an aaPanel server (adoption of an existing site,
@@ -16,7 +16,7 @@ straight from their **GitHub Releases**: a zip attached to the release, or the r
 Updating a web application by hand usually means: back up the data, upload a zip or pull the code, rebuild, restart
 and hope nothing breaks. Arsika Rollout Manager does this for you:
 
-1. You publish a release of your application on GitHub.
+1. You publish a release of your application on GitHub, or upload a zip / rar of it in the dashboard.
 2. The dashboard shows that a new version is available.
 3. One click backs up the database and the data, installs the new version next to the running one (and builds its
    Docker images, when it runs with Docker Compose), switches over and checks that the site answers.
@@ -25,7 +25,8 @@ and hope nothing breaks. Arsika Rollout Manager does this for you:
 
 One dashboard manages many sites on **this server and on other servers** (in the local network, over a VPN or over the
 internet): each other server runs only the small runner service. Websites on a **hosting with only a file manager**
-(no terminal, no SSH) are updated through one PHP file that the dashboard generates.
+(no terminal, no SSH), or on a virtual machine where you may only drop files, are updated through one PHP file that the
+dashboard generates; Laravel applications included (migrations, `.env`, artisan commands without a terminal).
 
 ## Features
 
@@ -37,10 +38,14 @@ internet): each other server runs only the small runner service. Websites on a *
     - *Files* served by the web server: PHP applications, static sites, applications run by a systemd service.
     - *Docker Compose*: the compose files of the release are run with `docker compose up -d`; images are built from
       the release (tagged with its version) or pulled; named volumes and the project name stay the same.
-  - *Hosting* with only a file manager: a generated PHP agent file unpacks the release, runs its database changes
-    (shown before the update; run automatically or marked as done by hand), swaps the files and keeps the previous
-    version for a rollback ([docs/HOSTING.md](docs/HOSTING.md)).
-- **Two release sources:** a zip asset attached to the release, or GitHub's source code archive of the release tag.
+  - *Hosting* (or a VM) where you may only drop files: a generated PHP agent file unpacks the release, runs its
+    database changes (shown before the update; run automatically or marked as done by hand), swaps the files and keeps
+    the previous version for a rollback. **Laravel**: only `public/` goes into the website folder, the application,
+    `.env` and `storage/` stay outside it; `php artisan migrate` and other artisan commands run inside PHP; the `.env`
+    is edited in the dashboard ([docs/HOSTING.md](docs/HOSTING.md)).
+- **Three version sources:** a zip asset attached to a GitHub release, GitHub's source code archive of the release
+  tag, or an archive **uploaded in the dashboard** (zip, rar, 7z, tar.gz; sent in pieces, the local `.env`, logs and
+  caches removed, no GitHub needed).
 - **Rollback** to any version still on the server within seconds.
 - **Backups** before every update, on demand, and **restore** with a safety backup first:
   - databases: MySQL/MariaDB or PostgreSQL, on the server or inside a container (the dump runs in the container with
@@ -110,10 +115,12 @@ do the work. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURI
 app/                            dashboard (PHP): Core, Http, Models, Services, Install, Console
 config/ routes/ lang/ database/schema/ bootstrap/ bin/console
 public/                         web root: index.html (single-page app), index.php (API), assets/
-runner/arsika_rollout_manager/  runner (Python, standard library only): API, job queue, deployments, compose, backups
+runner/arsika_rollout_manager/  runner (Python, standard library only): API, job queue, deployments, compose, backups,
+                                hosting agents, uploaded versions
 runner/presets/                 build/activation hooks for known applications
 runner/agent/                   PHP agent for hostings without a terminal (template; the dashboard fills it in per site)
-runner/tests/                   runner integration test (fake GitHub, fake web site, fake docker)
+runner/tests/                   runner integration test (fake GitHub, fake web site, fake docker, fake composer,
+                                a fake Laravel application for the hosting agent)
 deploy/                         install.sh, nginx examples (aaPanel and plain servers)
 docs/                           architecture, installation, servers, sites, API, security
 tests/smoke_test.py             end-to-end test: dashboard + two runners + fake GitHub
@@ -126,7 +133,9 @@ python runner/tests/test_runner.py                              # runner (needs 
 python tests/smoke_test.py --php php [--php-ini php.ini]        # dashboard + runners end to end
 ```
 
-Both tests run entirely on 127.0.0.1 with temporary folders, a fake GitHub API and a fake docker command.
+Both tests run entirely on 127.0.0.1 with temporary folders, a fake GitHub API and a fake docker command. The hosting
+tests need PHP with the `zip` and `pdo_sqlite` extensions (`ROLLOUT_TEST_PHP`, `ROLLOUT_TEST_PHP_INI` for the runner
+test; `--agent-php-ini` for the smoke test).
 
 ## Versioning
 
