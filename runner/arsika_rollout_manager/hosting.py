@@ -86,6 +86,25 @@ def agent_outdated(agent, wanted):
     return version_key(str(agent or "0")) < version_key(wanted)
 
 
+_TEMPLATE_VERSION = {}
+
+
+def template_version():
+    """RA_VERSION of the agent template this runner ships (a newer runner may ship the same agent)."""
+    try:
+        mtime = os.path.getmtime(TEMPLATE)
+    except OSError:
+        return __version__
+    cached = _TEMPLATE_VERSION.get(TEMPLATE)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    with open(TEMPLATE, encoding="utf-8") as f:
+        match = re.search(r"const RA_VERSION = '([0-9A-Za-z.+-]{1,32})';", f.read(4000))
+    version = match.group(1) if match else __version__
+    _TEMPLATE_VERSION[TEMPLATE] = (mtime, version)
+    return version
+
+
 def console_line(command):
     """The command line for Symfony's StringInput, which removes backslashes (stripcslashes): every word quoted with its
     backslashes and quotes escaped, so a class name such as App\\Models\\User arrives as typed."""
@@ -272,14 +291,15 @@ class Hosting(object):
                 "writable", "web_server", "symlink")
         return dict({k: status.get(k) for k in keys}, connected=True, url=site.get("agent_url"), error="",
                     insecure=str(site.get("agent_url") or "").startswith("http://"),
-                    outdated=agent_outdated(status.get("agent"), __version__),
+                    outdated=agent_outdated(status.get("agent"), template_version()),
                     self_update=not agent_outdated(status.get("agent"), LARAVEL_AGENT))
 
     # ------------------------------------------------------------------ the agent file itself
     def require_agent(self, site, client, info, log=None, wanted=LARAVEL_AGENT):
-        """Make sure the agent can do what the job needs: an agent from 1.5.0 on replaces itself with the code of this
-        runner; an older one must be downloaded and dropped on the hosting again. -> status"""
-        if not agent_outdated(info.get("agent"), __version__):
+        """Make sure the agent can do what the job needs: an agent from 1.5.0 on is replaced with the agent template of
+        this runner when that one is newer; an older one must be downloaded and dropped on the hosting again. -> status"""
+        latest = template_version()
+        if not agent_outdated(info.get("agent"), latest):
             return info
         if agent_outdated(info.get("agent"), LARAVEL_AGENT):
             if agent_outdated(info.get("agent"), wanted):
@@ -288,11 +308,11 @@ class Hosting(object):
                                   % (info.get("agent"), wanted))
             return info
         if log:
-            log.step("Update the agent file on the hosting (%s -> %s)" % (info.get("agent"), __version__))
+            log.step("Update the agent file on the hosting (%s -> %s)" % (info.get("agent"), latest))
         client.call("self-update", {"code": self.agent_code(site, info.get("dashboard") or "")})
         for attempt in range(6):                                     # PHP's opcache may keep the old code for a moment
             info = client.call("status", self.status_params(site))
-            if not agent_outdated(info.get("agent"), __version__):
+            if not agent_outdated(info.get("agent"), latest):
                 break
             time.sleep(2)
         if agent_outdated(info.get("agent"), wanted):

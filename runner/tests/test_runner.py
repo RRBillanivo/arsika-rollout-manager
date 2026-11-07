@@ -1537,6 +1537,13 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertIn("env=Lara2", self.page())                                                # no deployment needed
         self.assertEqual(len(os.listdir(os.path.join(self.home, ".rollout-agent-lara", "env-previous"))), 1)
 
+    def test_05b_a_newer_runner_with_the_same_agent_keeps_the_agent(self):
+        before = self.live(self.agent_name)
+        with mock.patch.object(hosting_module, "__version__", "9.9.9"):                     # the template is still 1.5.0
+            job = self.job("artisan", params={"command": "migrate:status"})
+        self.assertNotIn("Update the agent file", job["log"]["text"])
+        self.assertEqual(self.live(self.agent_name), before)
+
     def test_06_vendor_from_composer_and_the_php_check(self):
         job = self.upload("lara", "lara-1.2.0.zip", make_zip(laravel_files("1.2.0", vendor=False)))
         self.assertIn("Install the PHP dependencies with composer", job["log"]["text"])
@@ -1555,7 +1562,7 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         with open(template, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         before = self.live(self.agent_name)
-        with mock.patch.object(hosting_module, "__version__", "1.5.1"), mock.patch.object(hosting_module, "TEMPLATE", template):
+        with mock.patch.object(hosting_module, "TEMPLATE", template):                          # a newer agent template
             job = self.job("deploy", "1.2.0")
         self.assertIn("Update the agent file on the hosting (1.5.0 -> 1.5.1)", job["log"]["text"])
         after = self.live(self.agent_name)

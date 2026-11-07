@@ -3,6 +3,18 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.5.1] — 2026-11-07
+
+### Changed
+- "Add site" starts with two choices as two buttons each: **where the website runs** (Hosting / VM, where you only drop
+  files, or a full server) and **where the versions come from** (Upload zip / rar, or GitHub). The GitHub fields
+  appear only for GitHub. A new site starts with Hosting / VM and Upload.
+
+### Fixed
+- A runner that is newer than the agent it ships no longer tries to replace an agent of the same version (deployments
+  of hosting sites would wait and then stop with "the hosting still runs the old agent"): the agent is compared with
+  the agent template of the runner.
+
 ## [1.5.0] — 2026-11-07
 
 ### Added

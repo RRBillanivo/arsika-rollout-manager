@@ -35,13 +35,15 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 
 ## Connecting a site
 
-1. **Sites → Add site**, **Where the website runs: Hosting / VM without a terminal**. Choose a kind:
+1. **Sites → Add site**: **Where the website runs: Hosting / VM** and **Project source: Upload zip / rar** or
+   **GitHub** (two buttons each). Choose a kind:
    - *Hosting: static site or built files*: nothing is shared between versions, no database.
    - *Hosting: PHP website*: `.env` is shared and holds the database settings.
    - *Hosting: Laravel*: see [below](#laravel).
 
-   Choose where the versions come from: a GitHub repository (with its read-only token for a private one), or
-   **Upload** (zip, rar, 7z, tar.gz uploaded in the dashboard; see [SITES.md](SITES.md#uploaded-versions)). Under
+   With GitHub, fill in the repository (with its read-only token for a private one); with Upload there is nothing
+   to fill in: the versions are uploaded on the site page (zip, rar, 7z, tar.gz; see
+   [SITES.md](SITES.md#uploaded-versions)). Under
    **Advanced**: **Release folder to publish** (`.` for the whole release, `dist` for a build), **Shared files** (data
    that stays from version to version: `.env`, `uploads/` …), **Never touched** (files of the hosting itself:
    `.well-known`, `cgi-bin`, `.user.ini`), the folder of the **database changes**, the health check and the backups.

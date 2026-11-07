@@ -1,8 +1,8 @@
-// Site settings form, used by "Add site" and the Settings tab of a site. First choice: where the site runs, on a full
-// server (VPS/VM with the runner) or on a hosting where one may only drop files (PHP agent). With a preset, only the
-// basics need filling in; the folder layout, deployment steps, Docker Compose, health check and backups are under
-// "Advanced". Versions come from GitHub releases (each site has its own read-only token: write-only here, kept by the
-// runner, never shown again) or from archives uploaded in the dashboard (zip, rar ...).
+// Site settings form, used by "Add site" and the Settings tab of a site. Two choices first, as two buttons each: where
+// the site runs (a hosting or VM where one may only drop files: the PHP agent; or a full server with the runner) and
+// where its versions come from (archives uploaded in the dashboard: zip, rar ...; or GitHub releases, each site with its
+// own read-only token: write-only here, kept by the runner, never shown again). With a preset, only the basics need
+// filling in; the folder layout, deployment steps, Docker Compose, health check and backups are under "Advanced".
 import { get, post } from '../../core/api.js';
 import { t, tList } from '../../core/i18n.js';
 import { esc, icon } from '../../core/ui.js';
@@ -52,23 +52,39 @@ function tokenField(isNew, token) {
 
 const placeOf = (preset) => (preset.settings && preset.settings.deploy_mode === 'hosting' ? 'hosting' : 'server');
 
-/** Full server (runner on the server itself) or hosting (only a file manager: the PHP agent). */
-function placeField(isNew, place) {
-  if (!isNew) return `<input type="hidden" name="place" value="${esc(place)}">`;
-  return `<label class="field field--full"><span class="field__label">${f('place')}</span>
-    <select name="place"><option value="server" ${place === 'server' ? 'selected' : ''}>${f('place_server')}</option>
-      <option value="hosting" ${place === 'hosting' ? 'selected' : ''}>${f('place_hosting')}</option></select>
-    <span class="field__help">${f('place_help')}</span></label>`;
+/** Two choices side by side (radio buttons that look like buttons); ``help`` holds one line per choice. */
+function segmented(name, label, value, options, help) {
+  return `<div class="field field--full"><span class="field__label">${label}</span>
+    <div class="segmented" role="radiogroup" aria-label="${esc(label)}">${options.map(([key, text, iconName]) => `<label>
+      <input type="radio" name="${name}" value="${esc(key)}" ${key === value ? 'checked' : ''}><span>${icon(iconName)}${esc(text)}</span></label>`).join('')}</div>
+    <span class="field__help">${help}</span></div>`;
 }
 
-export function siteFormHtml(site, presets, { isNew = false, token = null, servers = null, server = 'local', place = 'server' } = {}) {
+/** Hosting / VM where one may only drop files (the PHP agent), or a full server (the runner on it). */
+function placeField(isNew, place) {
+  if (!isNew) return `<input type="hidden" name="place" value="${esc(place)}">`;
+  return segmented('place', f('place'), place, [['hosting', f('place_hosting'), 'upload-cloud'], ['server', f('place_server'), 'server']],
+    `<span data-place="hosting">${f('place_hosting_help')}</span><span data-place="server">${f('place_server_help')}</span>`);
+}
+
+/** Versions uploaded in the dashboard (zip, rar ...), or the releases of a GitHub repository. */
+function originField(origin) {
+  return segmented('origin', f('origin'), origin, [['upload', f('origin_upload'), 'upload'], ['github', f('origin_github'), 'github']],
+    `<span data-origin="upload">${f('origin_upload_help')}</span><span data-origin="github">${f('origin_github_help')}</span>`);
+}
+
+const originOf = (form) => (form.querySelector('[name=origin]:checked') || {}).value || 'github';
+
+export function siteFormHtml(site, presets, { isNew = false, token = null, servers = null, server = 'local', place = 'hosting' } = {}) {
   const s = site || {};
   const where = s.deploy_mode === 'hosting' ? 'hosting' : (isNew ? place : 'server');
+  const origin = s.source === 'upload' || (isNew && !s.source) ? 'upload' : 'github';
   return `
   <fieldset class="section">
     <legend>${icon('server')}${f('basics')}</legend>
     <div class="form-two">
       ${placeField(isNew, where)}
+      ${originField(origin)}
       ${isNew ? `<div class="field--full" data-place="server">${serverField(servers, server)}</div>` : ''}
       ${isNew ? `<label class="field field--full"><span class="field__label">${f('preset')}</span>
         <select name="preset">${presets.map((p) => `<option value="${esc(p.id)}" data-for="${placeOf(p)}">${esc(p.label)}</option>`).join('')}<option value="" data-for="any">${f('preset_custom')}</option></select>
@@ -77,9 +93,9 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
       ${field('name', f('name'), s.name, { placeholder: 'Example' })}
       ${isNew ? field('id', f('id'), s.id, { help: f('id_help'), placeholder: 'example', mono: true }) : ''}
       <div class="field--full" data-place="server">${field('path', f('path'), s.path, { help: f('path_help'), placeholder: '/var/www/example.com', mono: true, wide: true })}</div>
-      ${select('source', f('source'), s.source || 'asset', [['asset', f('source_asset')], ['source', f('source_source')], ['upload', f('source_upload')]], f('source_help'))}
       <div data-place="server">${select('deploy_mode', f('deploy_mode'), s.deploy_mode === 'compose' ? 'compose' : 'files', [['files', f('deploy_mode_files')], ['compose', f('deploy_mode_compose')]], f('deploy_mode_help'))}</div>
-      <div class="form-two field--full" data-github>
+      <div class="form-two field--full" data-origin="github">
+      ${select('source', f('source'), s.source === 'source' ? 'source' : 'asset', [['asset', f('source_asset')], ['source', f('source_source')]], f('source_help'))}
       <label class="field field--full"><span class="field__label">${f('repo')}</span>
         <span class="field__combo"><input type="text" name="repo" class="mono" value="${esc(s.repo || '')}" placeholder="owner/repository" autocomplete="off" spellcheck="false">
         <button type="button" class="btn btn--outline btn--small" data-check-repo>${icon('github')}${f('check_repo')}</button></span>
@@ -87,7 +103,7 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
       ${tokenField(isNew, token)}
       <div class="field--full" data-show-source="asset">${field('asset_pattern', f('asset_pattern'), s.asset_pattern || '*.zip', { help: f('asset_pattern_help'), mono: true, wide: true })}</div>
       </div>
-      <div class="box box--blue field--full" data-show-source="upload">${icon('upload')}<div>${f('source_upload_note')}</div></div>
+      <div class="box box--blue field--full" data-origin="upload">${icon('upload')}<div>${f('source_upload_note')}</div></div>
     </div>
   </fieldset>
   <details class="tech-section" ${isNew ? '' : 'open'}>
@@ -111,7 +127,7 @@ export function siteFormHtml(site, presets, { isNew = false, token = null, serve
         ${field('migrations_dir', f('migrations_dir'), s.migrations_dir || 'database/migrations', { help: f('migrations_dir_help'), mono: true, wide: true })}
       </div>
     </fieldset>
-    <fieldset class="section" data-show-source="upload">
+    <fieldset class="section" data-origin="upload">
       <legend>${icon('upload')}${f('upload')}</legend>
       <div class="form-two">
         ${area('upload_exclude', f('upload_exclude'), s.upload_exclude, f('upload_exclude_help'))}
@@ -190,21 +206,26 @@ export function readSiteForm(form) {
     delete data.migrations_dir;
     delete data.hosting_app;
   }
-  if (data.source === 'upload' && !data.repo) delete data.repo;
+  if (originOf(form) === 'upload') {                     // no GitHub: the versions are uploaded on the site page
+    data.source = 'upload';
+    if (!data.repo) delete data.repo;
+  }
   const token = e.github_token.value.trim();
   if (token) data.github_token = token;
   else if (e.remove_github_token && e.remove_github_token.checked) data.remove_github_token = true;
   return data;
 }
 
-/** Show the settings that belong to the chosen place (server or hosting), deploy mode and release source. */
+/** Show the settings that belong to the chosen place (server or hosting), origin (upload or GitHub), deploy mode and
+ * release source. */
 function syncSections(form) {
   const e = form.elements;
   const place = e.place.value;
+  const origin = originOf(form);
   form.querySelectorAll('[data-place]').forEach((el) => { el.hidden = el.dataset.place !== place; });
+  form.querySelectorAll('[data-origin]').forEach((el) => { el.hidden = el.dataset.origin !== origin; });
   form.querySelectorAll('[data-show-mode]').forEach((el) => { el.hidden = place !== 'server' || el.dataset.showMode !== e.deploy_mode.value; });
   form.querySelectorAll('[data-show-source]').forEach((el) => { el.hidden = el.dataset.showSource !== e.source.value; });
-  form.querySelectorAll('[data-github]').forEach((el) => { el.hidden = e.source.value === 'upload'; });
 }
 
 /**
@@ -225,12 +246,17 @@ export function attachSiteForm(form, presets, { isNew = false, siteId = '', serv
       else if (LIST_FIELDS.includes(name)) input.value = lines(value);
       else if (name === 'docroot_target' && e.hosting_target) { input.value = value ?? ''; e.hosting_target.value = value || '.'; }
       else if (name === 'services') input.value = (value || []).join(', ');
+      else if (name === 'source') input.value = value === 'source' ? 'source' : 'asset';      // the origin stays as chosen
       else input.value = value ?? '';
     });
     syncSections(form);
   };
-  e.deploy_mode.addEventListener('change', () => syncSections(form));
-  e.source.addEventListener('change', () => syncSections(form));
+  let choosePlace = () => {};
+  form.addEventListener('change', (event) => {            // the two-button choices are radio groups: one listener for all
+    const name = event.target.name;
+    if (name === 'place') choosePlace();
+    else if (['origin', 'source', 'deploy_mode'].includes(name)) syncSections(form);
+  });
   syncSections(form);
   let suggestPath = () => {};
   if (isNew) {
@@ -239,7 +265,7 @@ export function attachSiteForm(form, presets, { isNew = false, siteId = '', serv
       if (preset) fill(preset.settings);
       syncSections(form);
     };
-    const choosePlace = () => {                          // only the presets of the chosen place
+    choosePlace = () => {                                // only the presets of the chosen place
       const place = e.place.value;
       [...e.preset.options].forEach((o) => { o.hidden = o.dataset.for !== place && o.dataset.for !== 'any'; });
       if (e.preset.selectedOptions[0] && e.preset.selectedOptions[0].hidden) {
@@ -248,7 +274,6 @@ export function attachSiteForm(form, presets, { isNew = false, siteId = '', serv
       apply();
     };
     e.preset.addEventListener('change', apply);
-    e.place.addEventListener('change', choosePlace);
     choosePlace();
     if (e.server) {
       e.server.addEventListener('change', async () => {

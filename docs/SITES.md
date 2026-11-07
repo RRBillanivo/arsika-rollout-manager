@@ -17,9 +17,10 @@
 
 ## Adding a site
 
-**Sites → Add site**: first **where the website runs**: a *full server* (VPS / VM with the runner) or a *hosting* with
-only a file manager (a PHP agent file, see [HOSTING.md](HOSTING.md)). Then the server (when the dashboard controls more
-than one) and the kind of site:
+**Sites → Add site**: first two choices, two buttons each: **where the website runs**, a *hosting / VM* where you only
+drop files (a PHP agent file, see [HOSTING.md](HOSTING.md)) or a *full server* (VPS / VM with the runner), and **the
+project source**, *Upload zip / rar* (see [Uploaded versions](#uploaded-versions)) or *GitHub*. Then the server (when
+the dashboard controls more than one) and the kind of site:
 
 | Preset | Runs as | Source | Shared | Document root | Hooks / health check |
 |---|---|---|---|---|---|
