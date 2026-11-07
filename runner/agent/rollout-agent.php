@@ -21,7 +21,7 @@
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.5.2';
+const RA_VERSION = '1.5.3';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
@@ -30,8 +30,12 @@ const RA_BUDGET = 20;                   // seconds of work per request; longer w
 const RA_PRE = '_pre_rollout';
 
 error_reporting(E_ALL);
-ini_set('display_errors', '0');
-@set_time_limit(120);
+if (function_exists('ini_set')) {                       // hostings disable functions (aaPanel: putenv, symlink, exec ...)
+    ini_set('display_errors', '0');
+}
+if (function_exists('set_time_limit')) {
+    @set_time_limit(120);
+}
 $GLOBALS['ra_start'] = microtime(true);
 
 final class RaError extends Exception
@@ -1488,14 +1492,36 @@ function ra_artisan(array &$state, array $p): array
     if (!is_file($shared . '/.env')) {
         throw new RaError(422, 'no_env', 'the .env of the site is not set yet: fill it in the dashboard');
     }
-    @set_time_limit(max(30, min(3600, (int)($p['timeout'] ?? 300))));
+    if (!ra_disabled('set_time_limit')) {
+        @set_time_limit(max(30, min(3600, (int)($p['timeout'] ?? 300))));
+    }
     ra_save($state);                                                 // the application may end the request itself
+    // hostings (aaPanel by default) disable putenv(), chdir() and others: Laravel reads $_ENV and $_SERVER as well
+    $_ENV['APP_RUNNING_IN_CONSOLE'] = $_SERVER['APP_RUNNING_IN_CONSOLE'] = 'true';
+    if (!ra_disabled('putenv')) {
+        @putenv('APP_RUNNING_IN_CONSOLE=true');
+    }
+    if (strtok($command, ' ') === 'tinker') {
+        // PsySH (tinker) looks for its folders in the user's home and in /etc, /usr/share: outside open_basedir (aaPanel
+        // allows only the site); with PHP-FPM it reads them from $_SERVER, so they go into storage/framework/psysh
+        foreach (['HOME' => '', 'XDG_CONFIG_HOME' => '/config', 'XDG_CONFIG_DIRS' => '/config', 'XDG_DATA_HOME' => '/data',
+                  'XDG_DATA_DIRS' => '/data', 'XDG_RUNTIME_DIR' => '/run', 'APPDATA' => '/config'] as $key => $sub) {
+            $dir = $storage . '/framework/psysh' . $sub;
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0700, true);
+            }
+            $_SERVER[$key] = $_ENV[$key] = $dir;
+            if (!ra_disabled('putenv')) {
+                @putenv($key . '=' . $dir);
+            }
+        }
+    }
+    $cwd = ra_disabled('getcwd') ? false : getcwd();
+    if ($cwd !== false && !ra_disabled('chdir')) {
+        @chdir($release);
+    }
     $GLOBALS['ra_artisan_done'] = false;
     register_shutdown_function('ra_artisan_guard');
-    $_ENV['APP_RUNNING_IN_CONSOLE'] = $_SERVER['APP_RUNNING_IN_CONSOLE'] = 'true';
-    putenv('APP_RUNNING_IN_CONSOLE=true');
-    $cwd = getcwd();
-    @chdir($release);
     ob_start();
     try {
         require_once $release . '/vendor/autoload.php';
@@ -1518,7 +1544,7 @@ function ra_artisan(array &$state, array $p): array
         throw new RaError(422, 'artisan_failed', 'php artisan ' . strtok($command, ' ') . ': ' . get_class($error) . ': ' . substr($error->getMessage(), 0, 500)
             . ($stray !== '' ? "\n" . ra_clip($stray, 4000) : ''));
     } finally {
-        if ($cwd !== false) {
+        if ($cwd !== false && !ra_disabled('chdir')) {
             @chdir($cwd);
         }
     }
@@ -1650,8 +1676,10 @@ try {
         ra_send(200, ['ok' => true, 'data' => $result]);
     }
 } catch (RaError $error) {
+    $GLOBALS['ra_artisan_done'] = true;                              // answered here: the artisan guard stays quiet
     ra_send($error->status, ['ok' => false, 'error' => ['code' => $error->name, 'message' => $error->getMessage()]]);
 } catch (Throwable $error) {
+    $GLOBALS['ra_artisan_done'] = true;
     ra_send(500, ['ok' => false, 'error' => ['code' => 'agent_error', 'message' => $error->getMessage()]]);
 } finally {
     if (is_resource($ra_lock)) {

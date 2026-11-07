@@ -3,6 +3,16 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.5.3] — 2026-11-07
+
+### Fixed
+- Laravel on aaPanel (and hostings that disable PHP functions): `php artisan migrate` stopped with "Call to undefined
+  function putenv()". The agent no longer needs `putenv()`, `set_time_limit()` or `chdir()`, and an error of an artisan
+  command is reported as itself instead of "the command ended the PHP request early". The tests run the agent with
+  aaPanel's list of disabled functions. Agent 1.5.3 (replaced automatically).
+- `tinker --execute` under open_basedir (aaPanel allows PHP only the site's folder): PsySH gets its folders in
+  `storage/framework/psysh` instead of the home folder, `/etc/xdg` and `/usr/share`.
+
 ## [1.5.2] — 2026-11-07
 
 ### Added

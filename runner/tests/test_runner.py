@@ -876,9 +876,14 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def php_server(folder):
+# the functions aaPanel disables in PHP by default (the agent and Laravel must work without them)
+AAPANEL_PHP = ["-d", "disable_functions=passthru,exec,system,putenv,chroot,chgrp,chown,shell_exec,popen,proc_open,pcntl_exec,"
+                     "ini_alter,ini_restore,dl,openlog,syslog,readlink,symlink,popepassthru,imap_open,apache_setenv"]
+
+
+def php_server(folder, extra=()):
     port = free_port()
-    proc = subprocess.Popen([PHP] + (["-c", PHP_INI] if PHP_INI else []) + ["-S", "127.0.0.1:%d" % port, "-t", folder],
+    proc = subprocess.Popen([PHP] + (["-c", PHP_INI] if PHP_INI else []) + list(extra) + ["-S", "127.0.0.1:%d" % port, "-t", folder],
                             cwd=folder, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(80):
         try:
@@ -1428,7 +1433,7 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         with open(autoload, "w", encoding="utf-8", newline="\n") as f:
             f.write(FAKE_LARAVEL_AUTOLOAD)
         os.environ["FAKE_COMPOSER_AUTOLOAD"] = autoload
-        cls.php, cls.port = php_server(cls.docroot)
+        cls.php, cls.port = php_server(cls.docroot, AAPANEL_PHP)                       # as strict as aaPanel
         cls.extra_php = []
         UploadMixin.runner(cls(), "laravel", site_roots=[cls.tmp], composer_command=[sys.executable, FAKE_COMPOSER])
 
@@ -1560,17 +1565,17 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertNotIn("Backup", job["log"]["text"])                                        # stopped before anything else
 
     def test_07_the_agent_updates_itself(self):
-        template = os.path.join(self.tmp, "agent-1.5.3.php")
+        template = os.path.join(self.tmp, "agent-1.5.4.php")
         with open(hosting_module.TEMPLATE, encoding="utf-8") as f:
-            text = f.read().replace("const RA_VERSION = '1.5.2';", "const RA_VERSION = '1.5.3';")
+            text = f.read().replace("const RA_VERSION = '1.5.3';", "const RA_VERSION = '1.5.4';")
         with open(template, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         before = self.live(self.agent_name)
         with mock.patch.object(hosting_module, "TEMPLATE", template):                          # a newer agent template
             job = self.job("deploy", "1.2.0")
-        self.assertIn("Update the agent file on the hosting (1.5.2 -> 1.5.3)", job["log"]["text"])
+        self.assertIn("Update the agent file on the hosting (1.5.3 -> 1.5.4)", job["log"]["text"])
         after = self.live(self.agent_name)
-        self.assertIn("const RA_VERSION = '1.5.3';", after)
+        self.assertIn("const RA_VERSION = '1.5.4';", after)
         key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", after).group(1)
         self.assertNotIn(key, before)
         with open(os.path.join(self.home, ".rollout-agent-lara", "state.php"), encoding="utf-8") as f:
@@ -1588,7 +1593,7 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
             os.makedirs(os.path.dirname(os.path.join(docroot, name)), exist_ok=True)
             with open(os.path.join(docroot, name), "w", encoding="utf-8") as f:
                 f.write(text)
-        proc, port = php_server(docroot)
+        proc, port = php_server(docroot, AAPANEL_PHP)
         self.extra_php.append(proc)
         self.call("POST", "/v1/sites", {"preset": "hosting-laravel", "id": "lara2", "source": "upload", "repo": "",
                                         "health_url": "http://127.0.0.1:%d/" % port, "health_contains": "app {version}"})
@@ -1611,7 +1616,7 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         home = os.path.join(self.tmp, "home4")
         docroot = os.path.join(home, "public_html")
         os.makedirs(docroot)
-        proc, port = php_server(docroot)
+        proc, port = php_server(docroot, AAPANEL_PHP)
         self.extra_php.append(proc)
         type(self).lara3 = (home, docroot, port)
         self.call("POST", "/v1/sites", {"preset": "hosting-laravel", "id": "lara3", "source": "upload", "repo": "",

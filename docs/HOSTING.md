@@ -29,6 +29,7 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 |---|---|
 | PHP | 7.4 or newer, run by the web server (the agent is a normal PHP page); Laravel 11/12 needs PHP 8.2+ |
 | Extensions | `zip` (ZipArchive, required); `zlib` for database backups; `pdo_mysql` (or `pdo_sqlite`) for database changes and backups |
+| Disabled functions | fine: the agent needs no `exec`, `putenv`, `symlink` … (aaPanel's default `disable_functions` works; without `symlink` there is no public storage link) |
 | Folder | the website folder (e.g. `public_html`) must be writable by PHP, as it is on most hostings |
 | Address | HTTPS; plain `http://` only on a local network (an IP address of a private network, `localhost`, a name without a dot or ending in `.local`, `.lan`, `.internal`, `.home.arpa`), marked **No HTTPS** |
 | Reachable | the **dashboard's server** must be able to open the address of the agent file (the hosting does not need to reach GitHub or the dashboard: the runner sends everything) |
@@ -133,6 +134,8 @@ hosting, on the live release, and its output appears in the job log. Examples: `
 `db:seed --force`, `optimize:clear`, `storage:link`, `tinker --execute="echo App\Models\User::count();"`. Commands that
 wait for input or run until they are stopped (`serve`, `tinker` without `--execute`, `queue:listen`, `queue:work`
 without `--once` / `--stop-when-empty`, `schedule:work` …) are refused; any command is stopped by PHP's time limit.
+Where the hosting disables `proc_open` (aaPanel does by default), commands that start other programs (`about`,
+anything that calls composer or a shell) stop with Laravel's message "The Process class relies on proc_open".
 
 **What a hosting cannot do.** Processes that run all the time (queue workers, `schedule:work`, a listener for a device
 in the office network) need a server. The scheduler can run from the hosting panel's cron
