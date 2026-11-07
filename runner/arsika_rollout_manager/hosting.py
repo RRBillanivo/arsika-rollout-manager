@@ -112,6 +112,27 @@ def console_line(command):
     return " ".join(words[:1] + ['"%s"' % w.replace("\\", "\\\\").replace('"', '\\"') for w in words[1:]])
 
 
+def tinker_code(command):
+    """The PHP code of "tinker --execute=…" (run by the agent inside the application), or None."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if not words or words[0] != "tinker":
+        return None
+    for index, word in enumerate(words[1:], 1):
+        if word.startswith("--execute="):
+            return word[len("--execute="):]
+        if word == "--execute" and index + 1 < len(words):
+            return words[index + 1]
+    return None
+
+
+def shown_command(command):
+    """The command for logs and messages: the code of tinker may hold passwords, so it is left out."""
+    return "tinker --execute=…" if tinker_code(command) is not None else command
+
+
 def artisan_command(command):
     """A command line for artisan from the dashboard: one line, no shell; long-running commands are refused."""
     command = str(command or "").strip()
@@ -691,9 +712,12 @@ class Hosting(object):
 
     def artisan(self, site, client, version, command, log, check=True):
         """Run an artisan command of a release inside PHP on the hosting (no terminal needed). -> exit code"""
-        log.line("$ php artisan " + command)
+        log.line("$ php artisan " + shown_command(command))
+        code = tinker_code(command)
+        data = {"version": version, "timeout": ARTISAN_SECONDS}
+        data.update({"code": code} if code is not None else {"command": console_line(command)})
         try:
-            result = client.call("artisan", {"version": version, "command": console_line(command), "timeout": ARTISAN_SECONDS})
+            result = client.call("artisan", data)
         except AgentError as e:
             for line in str(e.details.get("output") or "").splitlines():
                 log.output(line)

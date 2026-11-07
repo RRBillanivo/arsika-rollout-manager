@@ -3,6 +3,14 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.5.4] — 2026-11-08
+
+### Fixed
+- `tinker --execute="…"` on aaPanel stopped with "open_basedir restriction … /usr/share/terminfo": PsySH looks for a
+  terminal and for folders outside the site. The agent now runs the code itself inside the booted application (the same
+  result, no PsySH). The code is no longer written to the job log or the job message, the runner forgets it when the
+  job ends and does not hand it to the dashboard (it may hold passwords). Agent 1.5.4 (replaced automatically).
+
 ## [1.5.3] — 2026-11-07
 
 ### Fixed

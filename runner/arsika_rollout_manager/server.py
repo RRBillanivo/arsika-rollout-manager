@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__, system
 from .deploy import DeployError
 from .github import GitHub, GitHubError
-from .hosting import artisan_command
+from .hosting import artisan_command, shown_command
 from .joblog import read_log
 from .sites import expand, layout, preset, presets_info, release_pattern, site_url, validate
 from .uploads import CHUNK, UploadError
@@ -548,13 +548,23 @@ class Api(object):
         self.hosting.forget_cache(record)
         return result
 
+    @staticmethod
+    def shown_job(record):
+        """A job for the dashboard: the code of "tinker --execute" (it may hold passwords) is left out."""
+        params = record.get("params")
+        if isinstance(params, dict) and params.get("command"):
+            record["params"] = dict(params, command=shown_command(str(params["command"])))
+        return record
+
     def jobs(self, query, data):
-        return self.store.jobs(query.get("site") or None, min(200, int(query.get("limit", 50) or 50)))
+        rows = self.store.jobs(query.get("site") or None, min(200, int(query.get("limit", 50) or 50)))
+        return [self.shown_job(row) for row in rows]
 
     def job(self, job, query, data):
         record = self.store.job(int(job))
         if not record:
             raise ApiError(404, "job_not_found", "job not found")
+        self.shown_job(record)
         text, offset, size = read_log(self.worker.log_path(record["id"]), query.get("offset", 0))
         record["log"] = {"text": text, "offset": offset, "size": size}
         return record

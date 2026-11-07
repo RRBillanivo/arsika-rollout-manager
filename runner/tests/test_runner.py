@@ -1368,6 +1368,7 @@ namespace FakeLaravel {
     class ConsoleKernel {
         private $app;
         public function __construct($app) { $this->app = $app; }
+        public function bootstrap() { $this->app->booted = true; }
         public function call($command, array $parameters = [], $output = null) {
             @file_put_contents($this->app->storage . '/logs/artisan.log', $command . "\n", FILE_APPEND);
             $name = strtok($command, ' ');
@@ -1536,6 +1537,16 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         job = self.job("artisan", params={"command": "explode"}, expect="failed")
         self.assertIn("kaput", job["message"])
         self.assertIn("migrate:status --no-interaction", self.live(self.shared("storage", "logs", "artisan.log")))
+        job = self.job("artisan", params={"command": 'tinker --execute="echo \'users=\' . count([1, 2]); $secret = \'s3cret\';"'})
+        self.assertIn("users=2", job["log"]["text"])                                           # run inside the application
+        self.assertNotIn("s3cret", job["log"]["text"] + job["message"])                        # the code is not logged
+        self.assertNotIn("s3cret", json.dumps(job["params"]) + json.dumps(self.worker.store.job(job["id"])["params"]))
+        self.assertNotIn("s3cret", json.dumps(self.call("GET", "/v1/jobs?site=lara")))  # nor kept, nor handed out
+        self.assertIn("tinker --execute=…", job["log"]["text"])
+        job = self.job("artisan", params={"command": 'tinker --execute="return [\'a\' => 1];"'})
+        self.assertIn('= {"a":1}', job["log"]["text"])                                          # the value of "return"
+        job = self.job("artisan", params={"command": 'tinker --execute="throw new RuntimeException(\'nope\');"'}, expect="failed")
+        self.assertIn("nope", job["message"])
 
     def test_05_rollback_and_edit_the_env(self):
         self.job("rollback")
@@ -1565,17 +1576,17 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertNotIn("Backup", job["log"]["text"])                                        # stopped before anything else
 
     def test_07_the_agent_updates_itself(self):
-        template = os.path.join(self.tmp, "agent-1.5.4.php")
+        template = os.path.join(self.tmp, "agent-1.5.5.php")
         with open(hosting_module.TEMPLATE, encoding="utf-8") as f:
-            text = f.read().replace("const RA_VERSION = '1.5.3';", "const RA_VERSION = '1.5.4';")
+            text = f.read().replace("const RA_VERSION = '1.5.4';", "const RA_VERSION = '1.5.5';")
         with open(template, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         before = self.live(self.agent_name)
         with mock.patch.object(hosting_module, "TEMPLATE", template):                          # a newer agent template
             job = self.job("deploy", "1.2.0")
-        self.assertIn("Update the agent file on the hosting (1.5.3 -> 1.5.4)", job["log"]["text"])
+        self.assertIn("Update the agent file on the hosting (1.5.4 -> 1.5.5)", job["log"]["text"])
         after = self.live(self.agent_name)
-        self.assertIn("const RA_VERSION = '1.5.4';", after)
+        self.assertIn("const RA_VERSION = '1.5.5';", after)
         key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", after).group(1)
         self.assertNotIn(key, before)
         with open(os.path.join(self.home, ".rollout-agent-lara", "state.php"), encoding="utf-8") as f:

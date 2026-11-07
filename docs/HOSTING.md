@@ -131,7 +131,8 @@ a newer PHP than the hosting runs, the update stops before anything changes: cho
 
 **Artisan commands.** The site page has a box for `php artisan …` (password): the command runs inside PHP on the
 hosting, on the live release, and its output appears in the job log. Examples: `migrate:status`, `migrate --force`,
-`db:seed --force`, `optimize:clear`, `storage:link`, `tinker --execute="echo App\Models\User::count();"`. Commands that
+`db:seed --force`, `optimize:clear`, `storage:link`, `tinker --execute="echo App\Models\User::count();"` (the agent runs
+that code itself in the booted application, without PsySH; it is not written to the job log). Commands that
 wait for input or run until they are stopped (`serve`, `tinker` without `--execute`, `queue:listen`, `queue:work`
 without `--once` / `--stop-when-empty`, `schedule:work` …) are refused; any command is stopped by PHP's time limit.
 Where the hosting disables `proc_open` (aaPanel does by default), commands that start other programs (`about`,

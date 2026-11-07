@@ -2,6 +2,7 @@
 
 A job (its hook, or a self-update) may ask the runner to restart with new code by creating the file
 ROLLOUT_RESTART_FILE; the runner then stops when the job has ended, and systemd starts it again."""
+import json
 import os
 import threading
 import traceback
@@ -10,7 +11,7 @@ from . import __version__, system
 from .backup import BackupError
 from .deploy import DeployError
 from .github import GitHubError
-from .hosting import Hosting
+from .hosting import Hosting, shown_command
 from .joblog import JobLog
 from .uploads import UploadError
 from .util import exists, now, remove
@@ -193,5 +194,9 @@ class Worker(object):
         if not self.hosting.is_laravel(site):
             raise DeployError("artisan commands are run for Laravel sites on a hosting")
         command = str(job["params"].get("command") or "")
-        version = self.hosting.run_artisan(site, command, log)
-        return version, version, "php artisan %s" % command.strip()[:120]
+        try:
+            version = self.hosting.run_artisan(site, command, log)
+        finally:
+            if shown_command(command) != command:                     # tinker code may hold passwords: not kept
+                self.store.update_job(job["id"], params=json.dumps(dict(job["params"], command=shown_command(command))))
+        return version, version, "php artisan %s" % shown_command(command.strip())[:120]

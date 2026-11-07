@@ -21,7 +21,7 @@
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.5.3';
+const RA_VERSION = '1.5.4';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
@@ -1482,8 +1482,15 @@ function ra_artisan(array &$state, array $p): array
 {
     $version = ra_version((string)($p['version'] ?? ($state['current'] ?? '')));
     $command = trim((string)($p['command'] ?? ''));
-    if ($command === '' || strlen($command) > 1000 || preg_match('/[\r\n\0]/', $command)) {
+    $code = (string)($p['code'] ?? '');                              // tinker --execute: PHP code run in the application
+    if ($code !== '' && (strlen($code) > 20000 || strpos($code, "\0") !== false)) {
+        throw new RaError(422, 'bad_command', 'invalid code');
+    }
+    if ($code === '' && ($command === '' || strlen($command) > 1000 || preg_match('/[\r\n\0]/', $command))) {
         throw new RaError(422, 'bad_command', 'invalid artisan command');
+    }
+    if ($code !== '') {
+        $command = 'tinker';
     }
     list($release, $shared, $storage) = ra_laravel_paths($version);
     if (!is_file($release . '/artisan') || !is_file($release . '/vendor/autoload.php')) {
@@ -1500,21 +1507,6 @@ function ra_artisan(array &$state, array $p): array
     $_ENV['APP_RUNNING_IN_CONSOLE'] = $_SERVER['APP_RUNNING_IN_CONSOLE'] = 'true';
     if (!ra_disabled('putenv')) {
         @putenv('APP_RUNNING_IN_CONSOLE=true');
-    }
-    if (strtok($command, ' ') === 'tinker') {
-        // PsySH (tinker) looks for its folders in the user's home and in /etc, /usr/share: outside open_basedir (aaPanel
-        // allows only the site); with PHP-FPM it reads them from $_SERVER, so they go into storage/framework/psysh
-        foreach (['HOME' => '', 'XDG_CONFIG_HOME' => '/config', 'XDG_CONFIG_DIRS' => '/config', 'XDG_DATA_HOME' => '/data',
-                  'XDG_DATA_DIRS' => '/data', 'XDG_RUNTIME_DIR' => '/run', 'APPDATA' => '/config'] as $key => $sub) {
-            $dir = $storage . '/framework/psysh' . $sub;
-            if (!is_dir($dir)) {
-                @mkdir($dir, 0700, true);
-            }
-            $_SERVER[$key] = $_ENV[$key] = $dir;
-            if (!ra_disabled('putenv')) {
-                @putenv($key . '=' . $dir);
-            }
-        }
     }
     $cwd = ra_disabled('getcwd') ? false : getcwd();
     if ($cwd !== false && !ra_disabled('chdir')) {
@@ -1534,10 +1526,26 @@ function ra_artisan(array &$state, array $p): array
             $app->instance('path.public', __DIR__);
         }
         $kernel = $app->make('Illuminate\Contracts\Console\Kernel');
-        $buffer = new \Symfony\Component\Console\Output\BufferedOutput();
-        $line = $command . (preg_match('/(^|\s)(--no-interaction|-n)(\s|$)/', $command) ? '' : ' --no-interaction');
-        $status = (int)$kernel->call($line, [], $buffer);
-        $text = $buffer->fetch();
+        if ($code !== '') {
+            // like tinker --execute, without PsySH: PsySH looks for a terminal (/usr/share/terminfo) and for folders
+            // outside the site, which open_basedir (aaPanel) forbids
+            $kernel->bootstrap();
+            $value = (static function (string $ra_code) {
+                return eval($ra_code . "\n;");
+            })($code);
+            $status = 0;
+            if (is_object($value)) {
+                $value = get_class($value) . (method_exists($value, 'toJson') ? ' ' . $value->toJson() : '');
+            } elseif (!is_scalar($value) && $value !== null) {
+                $value = json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            }
+            $text = $value === null ? '' : "\n= " . (is_string($value) && !is_numeric($value) ? $value : var_export($value, true));
+        } else {
+            $buffer = new \Symfony\Component\Console\Output\BufferedOutput();
+            $line = $command . (preg_match('/(^|\s)(--no-interaction|-n)(\s|$)/', $command) ? '' : ' --no-interaction');
+            $status = (int)$kernel->call($line, [], $buffer);
+            $text = $buffer->fetch();
+        }
     } catch (Throwable $error) {
         $GLOBALS['ra_artisan_done'] = true;
         $stray = (string)ob_get_clean();
