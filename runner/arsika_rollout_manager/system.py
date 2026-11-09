@@ -182,12 +182,13 @@ def php_error(body):
     return match.group(1) if match else None
 
 
-def health_check(url, contains, log=None, attempts=10, delay=3.0, local=False):
-    """True when url answers 200 (and contains the given text) within the given attempts."""
+def health_check(url, contains, log=None, attempts=10, delay=3.0, local=False, fetch=None):
+    """True when url answers 200 (and contains the given text) within the given attempts. ``fetch(url)``: another way to
+    GET (the agent of a hosting in another network)."""
     last = ""
     for attempt in range(1, attempts + 1):
         try:
-            status, body = http_get(url, local=local)
+            status, body = fetch(url) if fetch else http_get(url, local=local)
             error = php_error(body)
             if status == 200 and not error and (not contains or contains in body):
                 if log:
@@ -204,11 +205,11 @@ def health_check(url, contains, log=None, attempts=10, delay=3.0, local=False):
     return False
 
 
-def quick_health(url, contains, timeout=8, local=False):
+def quick_health(url, contains, timeout=8, local=False, fetch=None):
     """One request for the dashboard overview. -> dict(ok, status, ms, error)"""
     t0 = time.time()
     try:
-        status, body = http_get(url, timeout=timeout, local=local)
+        status, body = fetch(url, timeout) if fetch else http_get(url, timeout=timeout, local=local)
         error = php_error(body)
         ok = status == 200 and not error and (not contains or contains in body)
         return {"ok": ok, "status": status, "ms": int((time.time() - t0) * 1000), "error": "" if ok else

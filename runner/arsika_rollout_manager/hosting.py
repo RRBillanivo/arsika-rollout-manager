@@ -31,6 +31,7 @@ from urllib.parse import urlencode, urlsplit
 
 from . import __version__
 from .deploy import RUNNER_DIR, DeployError
+from .relay import Relay, RelayError, poll_message
 from .sites import release_pattern, site_url
 from .uploads import UploadError, long_path, pack, php_satisfies, prepare_tree, project_root, unpack
 from .util import VERSION, ensure_dir, exists, human_size, now, remove, sha256_file, stamp, version_key, write_private
@@ -42,6 +43,9 @@ AGENT_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[A-Za-z0-9._~%/-]*
 STATUS_SECONDS = 30
 LARAVEL_AGENT = "1.5.0"                  # the first agent that runs Laravel sites, edits .env, runs artisan, updates itself
 PAIR_AGENT = "1.5.5"                     # the first agent that derives its secret from its one-time key (nothing secret is sent)
+PULL_AGENT = "1.6.0"                     # the first agent that calls the dashboard itself (a hosting in another network)
+PULL_CHUNK = 1 << 20                     # pieces through the dashboard: small enough for its PHP and proxies
+PROBE_SECONDS = 5                        # direct attempt when the agent calls the dashboard already
 ENV_LIMIT = 256 << 10
 ARTISAN_SECONDS = 300
 # artisan commands that wait for input or run until they are stopped: not possible in a request of a web server
@@ -151,10 +155,16 @@ def artisan_command(command):
 
 
 class AgentClient(object):
-    def __init__(self, url, secret, timeout=120):
+    """Signed requests to the agent of a site: over HTTP to its address, or (``relay``) through the dashboard when the
+    agent calls the dashboard itself (a hosting in another network). ``auth`` names the key: the site's "secret" or the
+    one-time key of the agent file ("pairing") while it connects."""
+
+    def __init__(self, url, secret, timeout=120, relay=None, site="", auth="secret"):
         self.url = url
         self.secret = secret
         self.timeout = timeout
+        self.relay, self.site, self.auth = relay, site, auth
+        self.chunk = PULL_CHUNK if relay is not None else CHUNK          # pieces of uploads and downloads
         self.opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
     def call(self, action, data=None, raw=None, query=None, binary=False):
@@ -164,27 +174,21 @@ class AgentClient(object):
         body = raw if raw is not None else json.dumps(data or {}).encode("utf-8")
         parts = urlsplit(url)
         ts, nonce = int(time.time()), secrets.token_hex(16)
-        message = "POST\n%s?%s\n%d\n%s\n%s" % (parts.path, parts.query, ts, nonce, hashlib.sha256(body).hexdigest())
+        target = "%s?%s" % (parts.path, parts.query)
+        message = "POST\n%s\n%d\n%s\n%s" % (target, ts, nonce, hashlib.sha256(body).hexdigest())
         headers = {"X-Rollout-Timestamp": str(ts), "X-Rollout-Nonce": nonce, "User-Agent": "arsika-rollout-manager/" + __version__,
                    "X-Rollout-Signature": hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest(),
                    "Content-Type": "application/octet-stream" if raw is not None else "application/json"}
-        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with self.opener.open(request, timeout=self.timeout) as response:
-                content = response.read()
-                kind = response.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308):
-                raise AgentError("the agent address redirects to %s: use that address" % e.headers.get("Location"), "redirect", e.code)
-            content = e.read(4000)
+        status, kind, content, location = self.send(url, target, body, headers)
+        if status in (301, 302, 303, 307, 308):
+            raise AgentError("the agent address redirects to %s: use that address" % location, "redirect", status)
+        if status >= 400:
             try:
                 error = json.loads(content.decode("utf-8")).get("error") or {}
             except ValueError:
                 raise AgentError("the hosting answered HTTP %d instead of the agent (is the file there? a firewall of the hosting?)"
-                                 % e.code, "http", e.code)
-            raise AgentError(str(error.get("message") or "agent error"), str(error.get("code") or ""), e.code, error)
-        except (urllib.error.URLError, OSError) as e:
-            raise AgentError("the hosting does not answer: %s" % getattr(e, "reason", e), "unreachable")
+                                 % status, "http", status)
+            raise AgentError(str(error.get("message") or "agent error"), str(error.get("code") or ""), status, error)
         if binary:
             return content
         if "json" not in kind:
@@ -194,6 +198,27 @@ class AgentClient(object):
             error = doc.get("error") or {}
             raise AgentError(str(error.get("message") or "agent error"), str(error.get("code") or ""))
         return doc.get("data")
+
+    def send(self, url, target, body, headers):
+        """-> (status, content type, bytes, redirect address)"""
+        if self.relay is not None:
+            request = {"uri": target, "ts": headers["X-Rollout-Timestamp"], "nonce": headers["X-Rollout-Nonce"],
+                       "signature": headers["X-Rollout-Signature"], "type": headers["Content-Type"], "body": body, "auth": self.auth}
+            try:
+                status, kind, content = self.relay.send(self.site, request, self.timeout)
+            except RelayError as e:
+                raise AgentError(str(e), e.code, e.status)
+            return status, kind, content, ""
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                return response.status, response.headers.get("Content-Type", ""), response.read(), ""
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                return e.code, "", b"", e.headers.get("Location") or ""
+            return e.code, e.headers.get("Content-Type", ""), e.read(1 << 20), ""
+        except (urllib.error.URLError, OSError) as e:
+            raise AgentError("the hosting does not answer: %s" % getattr(e, "reason", e), "unreachable")
 
     def repeat(self, action, data, log=None, describe=None, key="done", limit=2000):
         """Call an action until it reports done (long work goes on in the next request)."""
@@ -218,6 +243,7 @@ class Hosting(object):
         self.backups = deployer.backups
         self.uploads = deployer.uploads
         self.cache = {}
+        self.relay = Relay(wait=int(config.get("agent_poll_wait", 20)), offline=int(config.get("agent_offline_seconds", 120)))
 
     @staticmethod
     def is_hosting(site):
@@ -243,7 +269,24 @@ class Hosting(object):
         if not site.get("agent_url") or not secret:
             raise DeployError("the hosting of this site is not connected yet: download the agent file in the dashboard, upload it "
                               "with the file manager of the hosting, open it and click Connect")
+        if self.pulls(site):
+            return AgentClient(site["agent_url"], secret, timeout, relay=self.relay, site=site["id"])
         return AgentClient(site["agent_url"], secret, timeout)
+
+    @staticmethod
+    def pulls(site):
+        """The agent calls the dashboard itself: this runner cannot open the address of the hosting (another network)."""
+        return site.get("agent_mode") == "pull"
+
+    def fetcher(self, site):
+        """GET for health checks: from this server, or by the agent when only the hosting's network can open the site."""
+        if not self.pulls(site):
+            return None
+
+        def fetch(url, timeout=10):
+            result = self.client(site, timeout=timeout + 20).call("fetch", {"url": url, "timeout": timeout})
+            return int(result.get("status") or 0), str(result.get("body") or "")
+        return fetch
 
     # ------------------------------------------------------------------ state, as the deployer answers it for other sites
     def status(self, site, refresh=False):
@@ -251,8 +294,11 @@ class Hosting(object):
         if not site.get("agent_url") or not self.config.secret_of("agent_secrets", site["id"]):
             return None
         cached = self.cache.get(site["id"])
-        if cached and not refresh and time.time() - cached[0] < STATUS_SECONDS:
+        back = cached and "error" in cached[1] and self.pulls(site) and self.relay.online(site["id"])   # it calls again
+        if cached and not refresh and not back and time.time() - cached[0] < STATUS_SECONDS:
             return cached[1]
+        if cached and "error" not in cached[1] and self.pulls(site) and self.relay.is_busy(site["id"]):
+            return cached[1]                                         # the agent runs one request at a time: a job is running
         try:
             result = self.client(site, timeout=20).call("status", self.status_params(site))
         except AgentError as e:
@@ -262,6 +308,10 @@ class Hosting(object):
 
     def forget_cache(self, site):
         self.cache.pop(site["id"], None)
+
+    def last_error(self, site):
+        """Why the last look at the hosting failed ('' when it worked)."""
+        return str(((self.cache.get(site["id"]) or (0, {}))[1] or {}).get("error") or "")
 
     def state(self, site):
         """unpaired | unreachable | ready | classic (files that were not installed by the runner) | empty"""
@@ -301,14 +351,27 @@ class Hosting(object):
         status = self.status(site, refresh=True)
         if status is None:
             return {"connected": False}
+        mode = self.mode_info(site)
         if "error" in status:
-            return {"connected": True, "error": status["error"], "url": site.get("agent_url")}
+            return dict({"connected": True, "error": status["error"], "url": site.get("agent_url")}, **mode)
         keys = ("agent", "php", "site_dir", "data_outside", "zip", "zlib", "pdo", "max_execution_time", "memory_limit", "disk_free",
                 "writable", "web_server", "symlink")
-        return dict({k: status.get(k) for k in keys}, connected=True, url=site.get("agent_url"), error="",
-                    insecure=str(site.get("agent_url") or "").startswith("http://"),
+        # the agent that calls the dashboard sends everything through the dashboard's address, not through its own
+        if self.pulls(site):
+            insecure = not str(status.get("dashboard") or "").startswith("https://")
+        else:
+            insecure = str(site.get("agent_url") or "").startswith("http://")
+        return dict({k: status.get(k) for k in keys}, connected=True, url=site.get("agent_url"), error="", insecure=insecure,
                     outdated=agent_outdated(status.get("agent"), template_version()),
-                    self_update=not agent_outdated(status.get("agent"), LARAVEL_AGENT))
+                    self_update=not agent_outdated(status.get("agent"), LARAVEL_AGENT), **mode)
+
+    def mode_info(self, site):
+        """direct: this runner opens the address of the agent; pull: the agent calls the dashboard (another network)."""
+        if not self.pulls(site):
+            return {"mode": "direct"}
+        since = self.relay.last_seen(site["id"])
+        return {"mode": "pull", "last_seen": None if since is None else int(since), "online": self.relay.online(site["id"]),
+                "poll_url": str(site.get("agent_url") or "") + "?poll=run"}
 
     # ------------------------------------------------------------------ the agent file itself
     def require_agent(self, site, client, info, log=None, wanted=LARAVEL_AGENT):
@@ -368,8 +431,21 @@ class Hosting(object):
         key = self.config.secret_of("agent_keys", site["id"])
         if not key:
             raise DeployError("download the agent file first (the key of an earlier file has been used)")
-        client = AgentClient(url, key, timeout=30)
-        info = client.call("hello")
+        # an agent whose page is open calls the dashboard: when this runner cannot open the address of the hosting
+        # (another network, no public address), the agent keeps calling instead and takes its requests that way
+        calling = self.relay.online(site["id"], key="pairing")
+        client, mode = AgentClient(url, key, timeout=PROBE_SECONDS if calling else 30), ""
+        try:
+            info = client.call("hello")
+        except AgentError as e:
+            if e.code not in ("unreachable", "http", "not_agent", "redirect") or (not calling and e.code == "redirect"):
+                raise
+            if not calling:
+                raise DeployError("%s; the agent file has not called the dashboard either: open it in a browser on the network of "
+                                  "the hosting and keep its page open until it is connected (its row \"Calls the dashboard\" "
+                                  "must be OK)" % e)
+            client, mode = AgentClient(url, key, timeout=30, relay=self.relay, site=site["id"], auth="pairing"), "pull"
+            info = client.call("hello")
         if info.get("site") != site["id"]:
             raise DeployError("this agent file belongs to the site %s, not %s" % (info.get("site"), site["id"]))
         missing = [name for name, ok in (("the PHP zip extension (ZipArchive)", info.get("zip")),
@@ -388,14 +464,34 @@ class Hosting(object):
                               "connects over plain http without sending its secret" % info.get("agent"))
         self.config.set_secret_of("agent_secrets", site["id"], secret)
         self.config.set_secret_of("agent_keys", site["id"], "")
-        site["agent_url"], site["path"] = url, str(info.get("site_dir") or "")
+        site["agent_url"], site["path"], site["agent_mode"] = url, str(info.get("site_dir") or ""), mode
         self.store.save_site({k: v for k, v in site.items() if k not in ("created_at", "updated_at")})
         self.forget_cache(site)
         try:                                                         # the .env prepared in the dashboard before connecting
-            self.push_pending_env(site, AgentClient(url, secret, timeout=30), None)
+            self.push_pending_env(site, self.client(site, timeout=30), None)
         except DeployError:
             pass                                                     # sent again before the first deployment
         return info
+
+    def poll(self, site, fields, body):
+        """A question of an agent that calls the dashboard, passed on by the dashboard: its answer to an earlier request
+        (if any), then the next request for it. -> {"command": request or None} or {"stop": "direct"}"""
+        try:
+            ts, status, wait = int(fields.get("ts") or 0), int(fields.get("status") or 0), int(fields.get("wait") or 0)
+        except ValueError:
+            raise RelayError(400, "bad_request", "invalid question")
+        nonce, signature = str(fields.get("nonce") or ""), str(fields.get("sig") or "")
+        agent, url, result, kind = (str(fields.get(k) or "")[:500] for k in ("agent", "url", "result", "type"))
+        used = self.relay.check(site["id"], self.config.secret_of("agent_secrets", site["id"]),
+                                self.config.secret_of("agent_keys", site["id"]), ts, nonce, signature,
+                                poll_message(site["id"], ts, nonce, agent, url, result, status, kind, body))
+        if used == "secret" and not self.pulls(site):
+            return {"stop": "direct"}                                # connected directly: the agent need not call
+        request = self.relay.question(site["id"], used, agent, url, result, status, kind, body, wait)
+        if request is None:
+            return {"command": None}
+        return {"command": {"uri": request["uri"], "ts": request["ts"], "nonce": request["nonce"], "signature": request["signature"],
+                            "type": request["type"], "body": base64.b64encode(request["body"]).decode("ascii")}}
 
     def disconnect(self, site):
         """When a site is removed: the agent forgets its secret (best effort), the runner forgets both keys."""
@@ -407,6 +503,7 @@ class Hosting(object):
         self.config.set_secret_of("agent_secrets", site["id"], "")
         self.config.set_secret_of("agent_keys", site["id"], "")
         self.forget_cache(site)
+        self.relay.forget(site["id"])
         if exists(self.pending_env_path(site)):
             os.unlink(self.pending_env_path(site))
 
@@ -634,7 +731,7 @@ class Hosting(object):
         size, digest = os.path.getsize(archive), sha256_file(archive)
         name = "release-%s.zip" % re.sub(r"[^A-Za-z0-9._-]", "-", version)
         limit = int(info.get("post_max_size") or 0)
-        chunk = max(256 << 10, min(CHUNK, limit // 2 if limit > 0 else CHUNK))
+        chunk = max(256 << 10, min(client.chunk, limit // 2 if limit > 0 else client.chunk))
         log.step("Upload the release to the hosting (%s, in pieces of %s)" % (human_size(size), human_size(chunk)))
         offset, last = 0, time.time()
         with open(archive, "rb") as f:
@@ -804,17 +901,17 @@ class Hosting(object):
             if laravel:
                 self.laravel_finish(site, client, version, log)
             self.forget_cache(site)
-            if not self.deployer.healthy(site, version, log):
+            if not self.deployer.healthy(site, version, log, self.fetcher(site)):
                 raise DeployError("health check failed for %s" % version)
             self.store.mark_activated(site["id"], version)
             return current, version
         switched = self.activate(site, client, version, log)
         previous = switched.get("previous")
-        if not self.deployer.healthy(site, version, log):
+        if not self.deployer.healthy(site, version, log, self.fetcher(site)):
             if previous:
                 log.step("Automatic rollback to " + ("the files from before" if previous == PRE else previous))
                 self.activate(site, client, previous, log)
-                ok = self.deployer.healthy(site, previous, log) if previous != PRE else True
+                ok = self.deployer.healthy(site, previous, log, self.fetcher(site)) if previous != PRE else True
                 log.line("rollback done; " + ("site healthy again" if ok else "the site is still NOT healthy"))
                 raise DeployError("health check failed for %s; rolled back to %s" % (version, previous))
             raise DeployError("health check failed for " + version)
@@ -846,7 +943,7 @@ class Hosting(object):
         if self.is_laravel(site):
             self.laravel_prepare(site, client, target, False, log)    # .env, storage/ and its public/index.php
         self.activate(site, client, target, log)
-        if not self.deployer.healthy(site, target, log):
+        if not self.deployer.healthy(site, target, log, self.fetcher(site)):
             if current:
                 log.step("Automatic rollback to " + current)
                 self.activate(site, client, current, log)
@@ -932,7 +1029,7 @@ class Hosting(object):
         offset = 0
         with open(target, "wb") as out:
             while offset < part["size"]:
-                data = client.call("download", {"path": part["path"], "offset": offset, "length": CHUNK}, binary=True)
+                data = client.call("download", {"path": part["path"], "offset": offset, "length": client.chunk}, binary=True)
                 if not data:
                     raise DeployError("the download of %s from the hosting stopped" % part["file"])
                 out.write(data)
@@ -946,7 +1043,7 @@ class Hosting(object):
         with open(path, "rb") as f:
             while offset < size:
                 f.seek(offset)
-                offset = int(client.call("upload", raw=f.read(CHUNK), query={"name": name, "offset": offset})["size"])
+                offset = int(client.call("upload", raw=f.read(client.chunk), query={"name": name, "offset": offset})["size"])
         if size == 0:
             client.call("upload", raw=b"", query={"name": name, "offset": 0})
         client.call("finish-upload", {"name": name, "size": size, "sha256": sha256_file(path)})

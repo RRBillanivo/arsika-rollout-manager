@@ -19,7 +19,7 @@ use Throwable;
  */
 final class Application
 {
-    const VERSION = '1.5.5';
+    const VERSION = '1.6.0';
 
     /** @var self|null */
     private static $instance = null;

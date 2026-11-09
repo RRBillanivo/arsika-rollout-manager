@@ -32,7 +32,7 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 | Disabled functions | fine: the agent needs no `exec`, `putenv`, `symlink` … (aaPanel's default `disable_functions` works; without `symlink` there is no public storage link) |
 | Folder | the website folder (e.g. `public_html`) must be writable by PHP, as it is on most hostings |
 | Address | HTTPS, or plain `http://` (e.g. a local IP address without a certificate), marked **No HTTPS**: the release, the `.env` and backups then travel unencrypted, the connection secret never does |
-| Reachable | the **dashboard's server** must be able to open the address of the agent file (the hosting does not need to reach GitHub or the dashboard: the runner sends everything) |
+| Reachable | the **dashboard's server** opens the address of the agent file; when it cannot (a hosting in another network without a public address, e.g. an office server), the hosting must be able to open the **dashboard's address** instead: then the agent calls the dashboard ([below](#a-hosting-in-another-network)) |
 
 ## Connecting a site
 
@@ -63,6 +63,36 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 Only the dashboard that holds the file's key can connect it, so the address on the agent page may be changed safely.
 The site page changes by itself once it is connected. A newly downloaded file replaces an earlier one that was not
 connected yet; uploading a new file later connects again (for example after moving the site).
+
+## A hosting in another network
+
+An office server or a VM behind a router has no address that the dashboard's server can open (a local IP such as
+`192.168.1.20` of another network, no public IP), but it can usually open the dashboard's address, as any browser
+there can. Then the agent calls the dashboard instead of being called:
+
+```
+Dashboard (its address, e.g. https://cicd.example.com)  <── the agent asks "anything to do?" and sends the answers
+   └─ runner: queues its requests for the agent                rollout-agent-xxxxxx.php in the office
+```
+
+- **Nothing to set up for it.** Open the agent file in a browser of that network (`http://192.168.1.20/rollout-agent-….php`)
+  and click **Connect to the dashboard**: the dashboard opens in a new tab, and the page of the agent file stays open
+  and lets it call the dashboard meanwhile. When the dashboard's server cannot open the agent's address, the runner
+  connects through these calls and the site is marked **Agent calls cicd**. A hosting that the dashboard's server can
+  open is connected directly, as before.
+- **It keeps calling by itself.** A round of calls lasts up to 50 seconds (less when PHP's time limit is lower); the
+  agent then starts the next round with a request to its own address, so no page has to stay open. The dashboard
+  waits up to 20 seconds per call while there is nothing to do, so a job starts within a moment.
+- **After the server restarted** the agent waits until something opens it once: open its page again, or add a cron
+  task that opens `<address of the agent file>?poll=run` every 5 minutes (aaPanel: Cron → *Access URL*; cPanel or
+  Linux: `curl -s <address>?poll=run`). The site page shows when the agent called last and this address.
+- **What the hosting needs:** PHP with `curl` (or `allow_url_fopen`) and access to the dashboard's address. The page of
+  the agent file checks it (**Calls the dashboard**). A sign-in in front of the dashboard (e.g. Cloudflare Access) must
+  let `/api/v1/agent/` through (a *Bypass* rule for that path): every call is signed with the site's secret and the
+  runner checks it.
+- **Health checks** are made by the agent from inside its network (the dashboard's server cannot open the site).
+- The dashboard's PHP must serve several requests at once (PHP-FPM does); its upload limit (`client_max_body_size`,
+  `post_max_size`) must allow 2 MB: releases and backups travel in pieces of 1 MB.
 
 ## First installation
 
@@ -208,6 +238,10 @@ backups for them); big databases take longer.
   always private ones). Requests stay signed, but the release, the `.env` and the backups travel unencrypted, and the
   answers of the agent are not protected: use it only inside a network you trust, and HTTPS for an address on the
   internet.
+- An agent that calls the dashboard (a hosting in another network) signs every call with the site's secret; the
+  runner's requests stay signed as before and the agent checks them, so neither side can be impersonated by whoever
+  passes the calls on. The release, the `.env` and backups then travel over the dashboard's address (HTTPS when the
+  dashboard uses it). The calls need no session: the public route `/api/v1/agent/` only passes them on to the runner.
 - Removing the site from the dashboard makes the agent forget its secret; delete the file to remove it completely.
 - Keep the random file name, use HTTPS on the internet, and keep the dashboard's own access protected (it can change
   the site).
@@ -220,6 +254,10 @@ backups for them); big databases take longer.
 | The agent address redirects to … | Use the final address (https, with or without www) |
 | not the address of the agent file | The address must end in the `.php` file of the agent, without `?…` or `#…` (`https://…` or `http://…`) |
 | this agent file is from an earlier version | Plain `http://` with an agent file downloaded before 1.5.5: download the agent file again and replace it |
+| the hosting does not answer … the agent file has not called the dashboard either | The dashboard's server cannot open the agent's address (another network) and the agent did not call: keep the page of the agent file open, and check its row **Calls the dashboard** |
+| the hosting has not called the dashboard for … | An agent that calls the dashboard stopped (the server restarted, PHP was restarted): open the agent file once, or add the cron task `<address>?poll=run` |
+| Calls the dashboard: the dashboard answered HTTP 302 … Cloudflare Access | A sign-in in front of the dashboard: add a *Bypass* rule for the path `/api/v1/agent/` |
+| Calls the dashboard: SSL certificate problem | PHP on the hosting cannot check the dashboard's certificate: set `curl.cainfo` in its `php.ini` (Windows: download `cacert.pem` from curl.se) |
 | the PHP extension zip is not enabled | Enable `zip` in the panel (PHP settings / extensions) |
 | the file .env with the database settings is not on the hosting | The site has database changes or backups but its environment file is missing: upload it, or fill it in with **Edit .env** |
 | the .env of the site is not set yet | Laravel: **Edit .env** on the site page, then deploy again |

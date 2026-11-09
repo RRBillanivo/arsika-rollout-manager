@@ -409,15 +409,17 @@ class Deployer(object):
             log.step("Reload PHP-FPM")
             system.reload_php_fpm(log)
 
-    def healthy(self, site, version, log):
+    def healthy(self, site, version, log, fetch=None):
+        """``fetch``: GET through the agent of a hosting that only its own network can open."""
         if not site.get("health_url"):
             log.line("no health check configured")
             return True
         url, contains = expand(site, site["health_url"], version), expand(site, site.get("health_contains", ""), version)
         local = bool(site.get("health_local"))
-        log.step("Health check " + url + (" on this server (127.0.0.1)" if local else "") + (' (expects "%s")' % contains if contains else ""))
+        log.step("Health check " + url + (" on this server (127.0.0.1)" if local else " from the hosting (its agent)" if fetch else "")
+                 + (' (expects "%s")' % contains if contains else ""))
         return system.health_check(url, contains, log, attempts=int(self.config.get("health_attempts", 10)),
-                                   delay=float(self.config.get("health_delay", 3)), local=local)
+                                   delay=float(self.config.get("health_delay", 3)), local=local, fetch=fetch)
 
     def go_live(self, site, version, previous, log):
         """Switch + activate + health check; switches back to ``previous`` when anything fails."""

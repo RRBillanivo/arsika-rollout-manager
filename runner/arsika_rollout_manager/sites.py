@@ -62,6 +62,7 @@ DEFAULTS = {
     "backup_db_service": "",
     "backup_volumes": [],
     "agent_url": "",
+    "agent_mode": "",                                                # "pull": the agent calls the dashboard (another network)
     "migrations_dir": "database/migrations",
     "hosting_app": "",
     "upload_exclude": UPLOAD_EXCLUDE,
@@ -307,6 +308,7 @@ def validate(data, site_roots, existing=None):
     if not RELATIVE.match(site["migrations_dir"]):
         errors["migrations_dir"] = "Folder inside the release, e.g. database/migrations."
     site["agent_url"] = str(site["agent_url"] or "").strip()
+    site["agent_mode"] = "pull" if (existing or {}).get("agent_mode") == "pull" else ""   # set when the agent connects
     site["hosting_app"] = str(site.get("hosting_app") or "").strip().lower()
     if site["hosting_app"] not in ("", "laravel"):
         errors["hosting_app"] = "Empty (plain files) or laravel."

@@ -22,18 +22,21 @@
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.5.5';
+const RA_VERSION = '1.6.0';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
 const RA_WINDOW = 300;                  // seconds a signed request stays valid (hosting clocks drift a little)
 const RA_BUDGET = 20;                   // seconds of work per request; longer work continues in the next request
 const RA_PRE = '_pre_rollout';
+const RA_POLL_SPAN = 50;               // seconds of one round of calls to the dashboard; the next round is a new request
+const RA_POLL_WAIT = 20;               // seconds the dashboard may hold one call while there is nothing to do
 
 error_reporting(E_ALL);
 if (function_exists('ini_set')) {                       // hostings disable functions (aaPanel: putenv, symlink, exec ...)
     ini_set('display_errors', '0');
 }
+$GLOBALS['ra_limit'] = (int)ini_get('max_execution_time');            // as the hosting set it, before the line below
 if (function_exists('set_time_limit')) {
     @set_time_limit(120);
 }
@@ -296,17 +299,18 @@ function ra_url(): string
 
 // ------------------------------------------------------------------ requests
 
-function ra_auth(array &$state, string $action, string $body): string
+/** $request: uri (path and query as signed), ts, nonce and signature of a request of the runner. */
+function ra_auth(array &$state, string $action, string $body, array $request): string
 {
     $now = time();
     $failures = array_values(array_filter($state['failures'] ?? [], function ($t) use ($now) { return $t > $now - 600; }));
     if (count($failures) >= 30) {
         throw new RaError(429, 'locked', 'too many invalid requests: try again in 10 minutes');
     }
-    $ts = (int)($_SERVER['HTTP_X_ROLLOUT_TIMESTAMP'] ?? 0);
-    $nonce = (string)($_SERVER['HTTP_X_ROLLOUT_NONCE'] ?? '');
-    $signature = (string)($_SERVER['HTTP_X_ROLLOUT_SIGNATURE'] ?? '');
-    $message = "POST\n" . (string)($_SERVER['REQUEST_URI'] ?? '') . "\n" . $ts . "\n" . $nonce . "\n" . hash('sha256', $body);
+    $ts = (int)($request['ts'] ?? 0);
+    $nonce = (string)($request['nonce'] ?? '');
+    $signature = (string)($request['signature'] ?? '');
+    $message = "POST\n" . (string)($request['uri'] ?? '') . "\n" . $ts . "\n" . $nonce . "\n" . hash('sha256', $body);
     $used = null;
     $secret = (string)($state['secret'] ?? '');
     if (abs($now - $ts) <= RA_WINDOW && preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
@@ -339,12 +343,24 @@ function ra_pairing_open(array $state): bool
     return !ra_is_template() && (string)($state['pairing_hash'] ?? '') !== hash('sha256', RA_PAIRING_KEY);
 }
 
+function ra_json($document): string
+{
+    return (string)json_encode($document, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+}
+
+/** The answer to the runner: to the HTTP request, or (a request taken from the dashboard, ra_poll) back to the dashboard. */
 function ra_send(int $status, array $document): void
 {
+    if (!empty($GLOBALS['ra_pulled'])) {
+        ra_poll_answer(['nonce' => $GLOBALS['ra_pulled'], 'status' => $status, 'type' => 'application/json; charset=utf-8',
+                        'body' => ra_json($document)]);
+        $GLOBALS['ra_pulled'] = '';
+        return;
+    }
     http_response_code($status);
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
-    echo json_encode($document, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    echo ra_json($document);
 }
 
 function ra_info(array $state): array
@@ -352,6 +368,7 @@ function ra_info(array $state): array
     $pdo = class_exists('PDO') ? PDO::getAvailableDrivers() : [];
     return [
         'agent' => RA_VERSION, 'site' => RA_SITE, 'php' => PHP_VERSION, 'paired' => (string)($state['secret'] ?? '') !== '',
+        'mode' => (string)($state['pull']['mode'] ?? ''), 'calls_out' => ra_calls_out(),
         'site_dir' => __DIR__, 'file' => ra_self(), 'data_dir' => ra_data(), 'data_outside' => strpos(ra_data(), __DIR__ . '/') !== 0,
         'writable' => is_writable(__DIR__), 'zip' => class_exists('ZipArchive'), 'zlib' => function_exists('gzopen'),
         'pdo' => array_values($pdo), 'max_execution_time' => (int)ini_get('max_execution_time'),
@@ -454,6 +471,8 @@ function ra_pair(array &$state, array $p): array
     $state['pairing_hash'] = hash('sha256', RA_PAIRING_KEY);
     $state['paired_at'] = gmdate('c');
     $state['nonces'] = [];
+    // taken from the dashboard: the runner cannot open this address, so this file keeps calling the dashboard
+    $state['pull'] = ['mode' => !empty($GLOBALS['ra_pulled']) ? 'pull' : 'direct'] + ($state['pull'] ?? []);
     return ra_info($state);
 }
 
@@ -1454,13 +1473,14 @@ function ra_artisan_guard(): void
     if (!empty($GLOBALS['ra_artisan_done'])) {
         return;
     }
+    $GLOBALS['ra_artisan_done'] = true;                              // a guard of an earlier command does not answer again
     $error = error_get_last();
     $fatal = $error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true);
     $output = '';
     while (ob_get_level() > 0) {
         $output = (string)ob_get_clean() . $output;
     }
-    if (!headers_sent()) {
+    if (!headers_sent() || !empty($GLOBALS['ra_pulled'])) {
         ra_send(500, ['ok' => false, 'error' => [
             'code' => $fatal ? 'php_fatal' : 'exited',
             'message' => $fatal ? 'PHP error in the application: ' . $error['message'] . ' (' . basename((string)$error['file']) . ':' . $error['line'] . ')'
@@ -1555,6 +1575,434 @@ function ra_artisan(array &$state, array $p): array
     return ['status' => $status, 'output' => ra_clip($stray . $text)];
 }
 
+// ------------------------------------------------------------------ a hosting in another network: this file calls the dashboard
+
+/** PHP can make HTTP requests: curl, or PHP's http stream (allow_url_fopen). */
+function ra_calls_out(): bool
+{
+    return (function_exists('curl_init') && !ra_disabled('curl_exec')) || filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN);
+}
+
+/**
+ * An HTTP request from this hosting (curl when it is there, else PHP's http stream); certificates are checked.
+ * -> [status (0: no answer), body, error, address of a redirect]
+ */
+function ra_http(string $method, string $url, array $headers, string $body, int $timeout, bool $follow = false): array
+{
+    if (function_exists('curl_init') && !ra_disabled('curl_exec')) {
+        $curl = curl_init($url);
+        $options = [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => min(10, $timeout), CURLOPT_TIMEOUT => $timeout,
+                    CURLOPT_HTTPHEADER => array_merge($headers, ['Expect:']), CURLOPT_FOLLOWLOCATION => $follow, CURLOPT_MAXREDIRS => 5];
+        if ($method === 'POST') {
+            $options[CURLOPT_POST] = true;
+            $options[CURLOPT_POSTFIELDS] = $body;
+        }
+        curl_setopt_array($curl, $options);
+        $answer = curl_exec($curl);
+        if ($answer === false) {
+            return [0, '', curl_error($curl), ''];
+        }
+        return [(int)curl_getinfo($curl, CURLINFO_HTTP_CODE), (string)$answer, '', (string)curl_getinfo($curl, CURLINFO_REDIRECT_URL)];
+    }
+    if (!filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
+        return [0, '', 'PHP cannot make requests: enable the curl extension or allow_url_fopen', ''];
+    }
+    $context = stream_context_create(['http' => ['method' => $method, 'header' => implode("\r\n", $headers), 'content' => $body,
+        'timeout' => $timeout, 'ignore_errors' => true, 'follow_location' => $follow ? 1 : 0, 'max_redirects' => 6]]);
+    $answer = @file_get_contents($url, false, $context);
+    $lines = function_exists('http_get_last_response_headers') ? (http_get_last_response_headers() ?: [])
+        : (get_defined_vars()['http_response_header'] ?? []);
+    $status = 0;
+    $location = '';
+    foreach ($lines as $line) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#', (string)$line, $match)) {
+            $status = (int)$match[1];
+        } elseif (stripos((string)$line, 'Location:') === 0) {
+            $location = trim(substr((string)$line, 9));
+        }
+    }
+    if ($answer === false && $status === 0) {
+        return [0, '', (string)(error_get_last()['message'] ?? 'no answer'), ''];
+    }
+    return [$status, (string)$answer, '', $location];
+}
+
+function ra_dashboard(string $path): string
+{
+    return rtrim(RA_DASHBOARD, '/') . $path;
+}
+
+/** What went wrong when this file called the dashboard, in words. */
+function ra_poll_problem(int $status, string $answer, string $error, string $location): string
+{
+    if ($status === 0) {
+        return 'cannot reach the dashboard ' . RA_DASHBOARD . ($error !== '' ? ': ' . $error : '');
+    }
+    if ($status >= 300 && $status < 400) {
+        $access = stripos($location, 'cloudflareaccess.com') !== false || stripos($location, '/cdn-cgi/access') !== false;
+        return 'the dashboard answered HTTP ' . $status . ($location !== '' ? ' (to ' . substr($location, 0, 120) . ')' : '')
+            . ($access ? ': a sign-in in front of the dashboard (Cloudflare Access) must let /api/v1/agent/ through' : '');
+    }
+    $doc = json_decode($answer, true);
+    if (is_array($doc) && isset($doc['error']['message'])) {
+        return 'the dashboard answered HTTP ' . $status . ': ' . substr((string)$doc['error']['message'], 0, 300);
+    }
+    return 'the dashboard answered HTTP ' . $status . ' (is ' . RA_DASHBOARD . ' the address of Arsika Rollout Manager?)';
+}
+
+/** For the page: can this hosting call the dashboard? Needed when the dashboard's server cannot open this address. -> [ok|warn, note] */
+function ra_dashboard_check(): array
+{
+    if (!ra_calls_out()) {
+        return ['warn', 'PHP tidak bisa membuat request keluar (aktifkan curl) / PHP cannot make requests (enable curl)'];
+    }
+    list($status, $answer, $error, $location) = ra_http('GET', ra_dashboard('/api/v1/agent/ping'),
+        ['User-Agent: arsika-rollout-agent/' . RA_VERSION, 'Accept: application/json'], '', 6);
+    $doc = json_decode($answer, true);
+    if ($status === 200 && is_array($doc) && isset($doc['data']['app'])) {
+        return ['ok', 'dasbor menjawab / the dashboard answers'];
+    }
+    return ['warn', ra_poll_problem($status, $answer, $error, $location)];
+}
+
+/** Remember how the calls go (under the lock of the requests). -> the state */
+function ra_poll_note(array $values): array
+{
+    $lock = @fopen(ra_data() . '/lock', 'c');
+    if ($lock !== false) {
+        flock($lock, LOCK_EX);
+    }
+    try {
+        $state = ra_load();
+        $state['pull'] = $values + ($state['pull'] ?? []);
+        ra_save($state);
+        return $state;
+    } finally {
+        if ($lock !== false) {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+}
+
+/** Why this file does not call the dashboard ('' = it calls). */
+function ra_poll_stop(array $state): string
+{
+    if (ra_is_template()) {
+        return 'template';
+    }
+    if ((string)($state['secret'] ?? '') === '') {
+        if (!ra_pairing_open($state)) {
+            return 'not connected';
+        }
+        return time() < (int)($state['pull']['until'] ?? 0) ? '' : 'waiting for its page';
+    }
+    return ($state['pull']['mode'] ?? '') === 'pull' ? '' : 'connected directly';
+}
+
+function ra_poll_key(array $state): string
+{
+    $secret = (string)($state['secret'] ?? '');
+    return $secret !== '' ? $secret : (ra_pairing_open($state) ? RA_PAIRING_KEY : '');
+}
+
+/** The signed headers of one call. */
+function ra_poll_headers(string $key, string $url, ?array $answer, int $wait): array
+{
+    $ts = (string)time();
+    $nonce = bin2hex(random_bytes(16));
+    $fields = [RA_VERSION, $url, (string)($answer['nonce'] ?? ''), (string)(int)($answer['status'] ?? 0), (string)($answer['type'] ?? '')];
+    $message = implode("\n", array_merge(['POLL', RA_SITE, $ts, $nonce], $fields, [hash('sha256', (string)($answer['body'] ?? ''))]));
+    return ['Content-Type: application/octet-stream', 'User-Agent: arsika-rollout-agent/' . RA_VERSION, 'X-Rollout-Timestamp: ' . $ts,
+            'X-Rollout-Nonce: ' . $nonce, 'X-Rollout-Signature: ' . hash_hmac('sha256', $message, $key), 'X-Rollout-Agent: ' . $fields[0],
+            'X-Rollout-Agent-Url: ' . $fields[1], 'X-Rollout-Result: ' . $fields[2], 'X-Rollout-Result-Status: ' . $fields[3],
+            'X-Rollout-Result-Type: ' . $fields[4], 'X-Rollout-Wait: ' . $wait];
+}
+
+/**
+ * One call: the answer to the last request (if any), then the next request (the dashboard holds the call up to $wait
+ * seconds while there is nothing to do). -> [HTTP status, data (or the error document), problem ('' when it worked)]
+ */
+function ra_poll_call(string $key, string $url, ?array $answer, int $wait): array
+{
+    list($status, $body, $error, $location) = ra_http('POST', ra_dashboard('/api/v1/agent/' . rawurlencode(RA_SITE) . '/poll'),
+        ra_poll_headers($key, $url, $answer, $wait), (string)($answer['body'] ?? ''), $wait + 25);
+    $doc = json_decode($body, true);
+    if ($status === 200 && is_array($doc) && isset($doc['data']) && is_array($doc['data'])) {
+        return [$status, $doc['data'], ''];
+    }
+    return [$status, is_array($doc) ? $doc : [], ra_poll_problem($status, $body, $error, $location)];
+}
+
+/** Run a request of the runner taken from the dashboard (signed by the runner, checked like a request to this file). */
+function ra_poll_run(array $command): array
+{
+    $uri = (string)($command['uri'] ?? '');
+    $query = [];
+    parse_str((string)parse_url($uri, PHP_URL_QUERY), $query);
+    $body = base64_decode((string)($command['body'] ?? ''), true);
+    $nonce = (string)($command['nonce'] ?? '');
+    $GLOBALS['ra_start'] = microtime(true);                          // ra_left(): the time budget counts per request
+    if (!ra_disabled('set_time_limit')) {
+        @set_time_limit(120);
+    }
+    $GLOBALS['ra_pulled'] = $nonce;
+    if ($body === false) {
+        $answer = [400, 'application/json; charset=utf-8', ra_json(['ok' => false, 'error' => ['code' => 'bad_request', 'message' => 'invalid request']])];
+    } else {
+        $answer = ra_handle(['uri' => $uri, 'ts' => (int)($command['ts'] ?? 0), 'nonce' => $nonce,
+                             'signature' => (string)($command['signature'] ?? '')], $body, $query);
+    }
+    $GLOBALS['ra_pulled'] = '';
+    return ['nonce' => $nonce, 'status' => $answer[0], 'type' => $answer[1], 'body' => $answer[2], 'action' => (string)($query['action'] ?? '')];
+}
+
+/** The answer to a request taken from the dashboard when this PHP request ends early (exit in an artisan command). */
+function ra_poll_answer(array $answer): void
+{
+    $key = (string)($GLOBALS['ra_poll']['key'] ?? '');
+    if ($key !== '') {
+        ra_poll_call($key, (string)($GLOBALS['ra_poll']['url'] ?? ra_url()), $answer, 0);
+    }
+}
+
+/**
+ * This file calls the dashboard because the runner cannot open its address (another network, no public address): it
+ * takes the runner's next request, runs it and sends the answer with its next call. One round lasts up to RA_POLL_SPAN
+ * seconds; the next round runs in a new request to this file (PHP's time limit). After the server restarted, an open
+ * page of this file or a cron task (GET <this file>?poll=run) starts it again. -> the state of the calls
+ */
+function ra_poll(bool $page = false): array
+{
+    $state = ra_load();
+    if ($page && (string)($state['secret'] ?? '') === '' && ra_pairing_open($state)) {
+        $state = ra_poll_note(['until' => time() + 900]);           // the page is open: call while it waits for the dashboard
+    }
+    $guard = @fopen(ra_data() . '/poll.lock', 'c');
+    if ($guard === false || !flock($guard, LOCK_EX | LOCK_NB)) {
+        if ($guard !== false) {
+            fclose($guard);
+        }
+        return ra_poll_status($state);                               // a round is running already
+    }
+    if (ra_poll_stop($state) !== '') {
+        flock($guard, LOCK_UN);
+        fclose($guard);
+        return ra_poll_status($state);
+    }
+    if (function_exists('ignore_user_abort')) {
+        @ignore_user_abort(true);                                    // the page or a cron task may stop waiting
+    }
+    $max = (int)($GLOBALS['ra_limit'] ?? ini_get('max_execution_time'));    // the hosting's limit, not the one set above
+    $span = $max > 0 ? max(5, min(RA_POLL_SPAN, $max - 10)) : RA_POLL_SPAN;
+    if (!ra_disabled('set_time_limit')) {
+        @set_time_limit($span + 150);
+    }
+    $url = substr(ra_url(), 0, 500);
+    $GLOBALS['ra_poll'] = ['lock' => $guard, 'url' => $url, 'open' => true, 'key' => ''];
+    register_shutdown_function('ra_poll_shutdown');
+    $deadline = microtime(true) + $span;
+    $answer = null;                                                  // sent with the next call
+    $last = false;                                                   // the round ends once the answer is sent
+    $quick = false;                                                  // send the answer at once (while connecting)
+    $refused = false;
+    while (true) {
+        $state = ra_load();
+        $key = $answer !== null ? (string)$GLOBALS['ra_poll']['key'] : ra_poll_key($state);
+        $left = $deadline - microtime(true);
+        $wait = $last || $quick || ra_poll_stop($state) !== '' || $left < 2 ? 0 : (int)max(1, min(RA_POLL_WAIT, $left - 1));
+        if (($answer === null && $wait === 0) || $key === '') {
+            break;
+        }
+        list($status, $data, $problem) = ra_poll_call($key, $url, $answer, $wait);
+        if ($problem === '') {
+            $answer = null;
+            $quick = false;
+            ra_poll_note(['at' => time(), 'error' => '']);
+            if (!empty($data['stop'])) {
+                ra_poll_note(['mode' => 'direct']);                  // connected directly: the runner calls this file
+                break;
+            }
+            if ($last) {
+                break;
+            }
+            if (isset($data['command']) && is_array($data['command'])) {
+                $GLOBALS['ra_poll']['key'] = $key;                   // the answer is signed with the key that took it
+                $answer = ra_poll_run($data['command']);
+                // a new agent file, an application loaded by artisan, a forgotten secret: go on in a new PHP request
+                $last = in_array($answer['action'], ['self-update', 'artisan', 'forget'], true);
+                $quick = $answer['action'] === 'pair';
+            }
+            continue;
+        }
+        ra_poll_note(['error' => $problem]);
+        if (in_array($status, [401, 403, 404, 429], true) && isset($data['error'])) {
+            $refused = true;                                         // the dashboard refuses this file (removed, new file, locked)
+            break;
+        }
+        // the dashboard or the network is down: try again a little later (an answer not sent by the end of the round is
+        // lost, its request times out); a round lasts its full time, so a dashboard that is down is not called in a loop
+        $pause = min(10.0, $deadline - microtime(true));
+        if ($pause > 0) {
+            usleep((int)($pause * 1000000));
+        }
+        if (microtime(true) >= $deadline) {
+            break;
+        }
+    }
+    $GLOBALS['ra_poll']['open'] = false;
+    ra_poll_end($guard, $url, !$refused);
+    return ra_poll_status(ra_load());
+}
+
+/** Release the round; the next one runs in a new request to this file while it should keep calling. */
+function ra_poll_end($guard, string $url, bool $again): void
+{
+    if (is_resource($guard)) {
+        flock($guard, LOCK_UN);
+        fclose($guard);
+    }
+    if ($again && ra_poll_stop(ra_load()) === '') {
+        ra_kick($url . '?poll=run');
+    }
+}
+
+/** A round that ended early (an exit in an artisan command, a fatal error): the next one runs in a new request. */
+function ra_poll_shutdown(): void
+{
+    $poll = $GLOBALS['ra_poll'] ?? null;
+    if (!is_array($poll) || empty($poll['open'])) {
+        return;
+    }
+    $GLOBALS['ra_poll']['open'] = false;
+    if (!empty($GLOBALS['ra_pulled'])) {
+        ra_artisan_guard();                // PHP ended inside a request taken from the dashboard: its answer before the next round
+    }
+    ra_poll_end($poll['lock'], (string)$poll['url'], true);
+}
+
+/** Start a request to this file without waiting for its answer. */
+function ra_kick(string $url): void
+{
+    if (function_exists('curl_init') && !ra_disabled('curl_exec')) {
+        $curl = curl_init($url);
+        curl_setopt_array($curl, [CURLOPT_RETURNTRANSFER => true, CURLOPT_NOSIGNAL => true, CURLOPT_CONNECTTIMEOUT_MS => 1000,
+                                  CURLOPT_TIMEOUT_MS => 1500, CURLOPT_HTTPHEADER => ['User-Agent: arsika-rollout-agent/' . RA_VERSION],
+                                  CURLOPT_SSL_VERIFYPEER => false, CURLOPT_SSL_VERIFYHOST => 0]);
+        @curl_exec($curl);
+        return;
+    }
+    $parts = parse_url($url);
+    $secure = ($parts['scheme'] ?? 'http') === 'https';
+    $host = (string)($parts['host'] ?? '');
+    if ($host === '' || ra_disabled('fsockopen')) {
+        return;
+    }
+    $port = (int)($parts['port'] ?? ($secure ? 443 : 80));
+    $socket = @fsockopen(($secure ? 'ssl://' : '') . $host, $port, $errno, $error, 2);
+    if ($socket === false) {
+        return;
+    }
+    fwrite($socket, 'GET ' . ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '') . " HTTP/1.1\r\nHost: " . $host
+        . (isset($parts['port']) ? ':' . $port : '') . "\r\nUser-Agent: arsika-rollout-agent/" . RA_VERSION . "\r\nConnection: close\r\n\r\n");
+    usleep(300000);
+    fclose($socket);
+}
+
+/** For the page: paired, how, the last call to the dashboard and its problem, a round running. */
+function ra_poll_status(array $state): array
+{
+    $pull = $state['pull'] ?? [];
+    $running = false;
+    $guard = @fopen(ra_data() . '/poll.lock', 'c');
+    if ($guard !== false) {
+        $running = !flock($guard, LOCK_EX | LOCK_NB);
+        if (!$running) {
+            flock($guard, LOCK_UN);
+        }
+        fclose($guard);
+    }
+    return ['paired' => (string)($state['secret'] ?? '') !== '', 'mode' => (string)($pull['mode'] ?? ''), 'running' => $running,
+            'contact' => isset($pull['at']) ? max(0, time() - (int)$pull['at']) : null, 'error' => (string)($pull['error'] ?? '')];
+}
+
+/** GET an address from the hosting: the health check of a site that only the network of the hosting can open. */
+function ra_fetch(array &$state, array $p): array
+{
+    $url = (string)($p['url'] ?? '');
+    if (!preg_match('#^https?://[^\s/?\#]+#i', $url)) {
+        throw new RaError(422, 'bad_url', 'not an http(s) address: ' . substr($url, 0, 200));
+    }
+    list($status, $body, $error) = ra_http('GET', $url, ['User-Agent: arsika-rollout-manager/' . RA_VERSION, 'Cache-Control: no-cache'], '',
+        max(2, min(30, (int)($p['timeout'] ?? 10))), true);
+    if ($status === 0) {
+        throw new RaError(502, 'fetch_failed', 'the hosting cannot open ' . substr($url, 0, 200) . ': ' . $error);
+    }
+    return ['status' => $status, 'body' => substr($body, 0, 1 << 20)];
+}
+
+// ------------------------------------------------------------------ one request of the runner
+
+/**
+ * One signed request of the runner: sent to this file over HTTP, or taken from the dashboard by ra_poll() when the
+ * runner cannot open this address. $request: uri (path and query as signed), ts, nonce, signature.
+ * -> [HTTP status, content type, bytes]
+ */
+function ra_handle(array $request, string $body, array $query): array
+{
+    $json = 'application/json; charset=utf-8';
+    $lock = null;
+    try {
+        if (ra_is_template()) {
+            throw new RaError(503, 'template', 'this is the template of the agent: download the agent file from the dashboard');
+        }
+        $action = (string)($query['action'] ?? '');
+        $lock = fopen(ra_data() . '/lock', 'c');
+        if ($lock !== false) {
+            flock($lock, LOCK_EX);
+        }
+        $state = ra_load();
+        $used = ra_auth($state, $action, $body, $request);
+        ra_save($state);
+        if ($used === 'pairing' && !in_array($action, ['hello', 'pair'], true)) {
+            throw new RaError(401, 'not_paired', 'connect the site first');
+        }
+        ra_journal($state);                                          // finish a switch that an earlier request left open
+        $params = $action === 'upload' ? $query : (json_decode($body === '' ? '{}' : $body, true) ?: []);
+        $handlers = [
+            'hello' => function (&$state, $p) { return ra_info($state); },
+            'pair' => 'ra_pair', 'forget' => 'ra_forget', 'status' => 'ra_status',
+            'upload' => 'ra_upload', 'finish-upload' => 'ra_finish_upload', 'extract' => 'ra_extract',
+            'activate' => 'ra_activate', 'delete-release' => 'ra_delete_release', 'migrate' => 'ra_migrate',
+            'backup' => 'ra_backup', 'download' => 'ra_download', 'clear' => 'ra_clear',
+            'restore-files' => 'ra_restore_files', 'restore-db' => 'ra_restore_db',
+            'self-update' => 'ra_self_update', 'env-read' => 'ra_env_read', 'env-write' => 'ra_env_write',
+            'laravel-prepare' => 'ra_laravel_prepare', 'laravel-finish' => 'ra_laravel_finish',
+            'laravel-migrations' => 'ra_laravel_migrations', 'artisan' => 'ra_artisan', 'fetch' => 'ra_fetch',
+        ];
+        if (!isset($handlers[$action])) {
+            throw new RaError(404, 'unknown_action', 'unknown action: ' . $action);
+        }
+        $result = call_user_func_array($handlers[$action], [&$state, $params, $body]);
+        ra_save($state);
+        if ($result instanceof RaRaw) {
+            return [200, 'application/octet-stream', $result->bytes];
+        }
+        return [200, $json, ra_json(['ok' => true, 'data' => $result])];
+    } catch (RaError $error) {
+        $GLOBALS['ra_artisan_done'] = true;                          // answered here: the artisan guard stays quiet
+        return [$error->status, $json, ra_json(['ok' => false, 'error' => ['code' => $error->name, 'message' => $error->getMessage()]])];
+    } catch (Throwable $error) {
+        $GLOBALS['ra_artisan_done'] = true;
+        return [500, $json, ra_json(['ok' => false, 'error' => ['code' => 'agent_error', 'message' => $error->getMessage()]])];
+    } finally {
+        if (is_resource($lock)) {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ the page in the browser
 
 function ra_page(): void
@@ -1564,6 +2012,21 @@ function ra_page(): void
     header('X-Frame-Options: DENY');
     header('X-Robots-Tag: noindex, nofollow');
     $e = function ($text) { return htmlspecialchars((string)$text, ENT_QUOTES, 'UTF-8'); };
+    $json = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES;
+    // while the page is open it lets this file call the dashboard (?poll=run), so a dashboard that cannot open this
+    // address (another network) can still connect it; ?poll=status shows how it goes
+    $poller = function (bool $connecting) use ($json) {
+        $text = ['wait' => 'Menunggu konfirmasi di dasbor… / Waiting for the confirmation in the dashboard…',
+                 'ok' => 'Terhubung. / Connected.', 'calling' => 'Menghubungi dasbor… / Calling the dashboard…',
+                 'seen' => 'Terakhir menghubungi dasbor: %s detik lalu / Last call to the dashboard: %s seconds ago'];
+        return '<script>(function(){var s=document.getElementById("ra-state"),t=' . json_encode($text, $json) . ',c=' . ($connecting ? 'true' : 'false')
+            . ',done=false;function show(d){if(!d||done)return;if(c&&d.paired){done=true;s.className="ok";s.textContent=t.ok;'
+            . 'setTimeout(function(){location.reload();},1500);return;}s.className=d.error?"warn":"";s.textContent=d.error?d.error'
+            . ':(d.contact===null?t.calling:(c?t.wait:t.seen.replace(/%s/g,d.contact)));}function get(q){return fetch("?poll="+q,'
+            . '{cache:"no-store"}).then(function(r){return r.json();}).then(show,function(){});}function run(){if(done)return;'
+            . 'get(c?"run&page=1":"run").then(function(){if(c&&!done)setTimeout(run,2000);});}run();setInterval(function(){'
+            . 'if(!done)get("status");},3000);})();</script>';
+    };
     $body = '';
     if (ra_is_template()) {
         $body = '<p class="bad">Ini file contoh. Unduh file agen dari dasbor (Situs → Hosting → Unduh file agen).<br><small>This is the template: download the agent file from the dashboard.</small></p>';
@@ -1575,10 +2038,22 @@ function ra_page(): void
             $state = [];
             $info = null;
         }
-        if ($info !== null && $info['paired']) {
+        if ($info !== null && $info['paired'] && $info['mode'] === 'pull') {
+            $cron = ra_url() . '?poll=run';
+            $body = '<p class="ok">Terhubung. Situs ini di-update oleh Arsika Rollout Manager.<br><small>Connected: this website is updated by Arsika Rollout Manager.</small></p>'
+                . '<p>Server cicd tidak bisa membuka alamat ini (jaringan lain), jadi file ini yang menghubungi dasbor dan menjaga sambungannya. '
+                . 'Setelah server ini restart, buka halaman ini sekali lagi, atau pasang tugas cron yang membuka alamat ini tiap 5 menit:<br>'
+                . '<small>The cicd server cannot open this address (another network), so this file calls the dashboard and keeps calling. '
+                . 'After this server restarts, open this page once more, or add a cron task that opens this address every 5 minutes:</small></p>'
+                . '<p><code>' . $e($cron) . '</code></p><p id="ra-state"></p>' . $poller(false);
+        } elseif ($info !== null && $info['paired']) {
             $body = '<p class="ok">Terhubung. Situs ini di-update oleh Arsika Rollout Manager.<br><small>Connected: this website is updated by Arsika Rollout Manager.</small></p>';
         } else {
+            if (ra_pairing_open($state)) {
+                ra_poll_note(['until' => time() + 900]);             // the page is open: this file may call the dashboard
+            }
             $https = strncmp(ra_url(), 'https://', 8) === 0;
+            $dash = ra_dashboard_check();
             $checks = [                                                // [what, ok | warn | bad, note]
                 ['PHP ' . PHP_VERSION, version_compare(PHP_VERSION, '7.4', '>=') ? 'ok' : 'bad', 'PHP 7.4+'],
                 ['ZipArchive', class_exists('ZipArchive') ? 'ok' : 'bad', 'ekstensi zip / zip extension'],
@@ -1587,6 +2062,8 @@ function ra_page(): void
                 ['Folder bisa ditulis / writable', $info !== null && $info['writable'] ? 'ok' : 'bad', ''],
                 ['HTTPS', $https ? 'ok' : 'warn', $https ? '' : 'http juga boleh (mis. IP lokal), tetapi data dikirim tanpa enkripsi / '
                     . 'plain http works too (e.g. a local IP), but data travels unencrypted'],
+                ['Menghubungi dasbor / Calls the dashboard', $dash[0], $dash[1] . ($dash[0] === 'ok' ? '' : ' (perlu kalau server cicd tidak bisa '
+                    . 'membuka alamat ini, mis. jaringan lain / needed when the cicd server cannot open this address, e.g. another network)')],
             ];
             $ready = $checks[0][1] === 'ok' && $checks[1][1] === 'ok' && $checks[4][1] === 'ok';
             $rows = '';
@@ -1595,19 +2072,21 @@ function ra_page(): void
                     . '</td><td><small>' . $e($check[2]) . '</small></td></tr>';
             }
             // a query (not a #fragment) survives a sign-in in front of the dashboard, e.g. Cloudflare Access; only the
-            // dashboard that knows this file's key can connect it, so the address may be changed safely
+            // dashboard that knows this file's key can connect it, so the address may be changed safely. The dashboard
+            // opens in a new tab: this page stays open and lets this file call the dashboard meanwhile
             $link = rtrim(RA_DASHBOARD, '/') . '/?connect=' . rawurlencode(RA_SITE) . '&agent=' . rawurlencode(ra_url());
-            $json = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES;
             $form = '<form id="ra-connect"><label for="ra-dash">Alamat cicd (dasbor) / Address of the dashboard</label>'
                 . '<input id="ra-dash" type="text" inputmode="url" required value="' . $e(RA_DASHBOARD) . '" placeholder="https://cicd.example.com">'
                 . '<p><button class="button" type="submit">Hubungkan ke dasbor / Connect to the dashboard</button></p>'
-                . '<p><small>Sudah terisi dari dasbor; ubah hanya kalau dasbor dibuka lewat alamat lain (mis. alamat jaringan lokal).<br>'
-                . 'Filled in by the dashboard; change it only when you open the dashboard at another address.</small></p></form>'
+                . '<p><small>Dasbor terbuka di tab baru; biarkan halaman ini terbuka sampai terhubung. Alamat dasbor sudah terisi; ubah hanya kalau dasbor dibuka lewat alamat lain.<br>'
+                . 'The dashboard opens in a new tab; keep this page open until it is connected. The address is filled in; change it only when you open the dashboard at another address.</small></p></form>'
+                . '<p id="ra-state"></p>'
                 . '<script>document.getElementById("ra-connect").addEventListener("submit",function(e){e.preventDefault();'
                 . 'var d=document.getElementById("ra-dash").value.trim().replace(/\/+$/,"");if(!/^https?:\/\//i.test(d)){d="https://"+d;}'
-                . 'location.href=d+"/?connect="+encodeURIComponent(' . json_encode(RA_SITE, $json) . ')+"&agent="+encodeURIComponent('
-                . json_encode(ra_url(), $json) . ');});</script>'
-                . '<noscript><p><a class="button" href="' . $e($link) . '">Hubungkan ke dasbor / Connect to the dashboard</a></p></noscript>';
+                . 'window.open(d+"/?connect="+encodeURIComponent(' . json_encode(RA_SITE, $json) . ')+"&agent="+encodeURIComponent('
+                . json_encode(ra_url(), $json) . '),"_blank");});</script>'
+                . '<noscript><p><a class="button" target="_blank" rel="noopener" href="' . $e($link) . '">Hubungkan ke dasbor / Connect to the dashboard</a></p></noscript>'
+                . $poller(true);
             $body = '<p>File agen untuk situs <b>' . $e(RA_SITE) . '</b>. Periksa alamat dasbor, klik Hubungkan, lalu konfirmasi di dasbor.<br><small>Agent file of the site '
                 . $e(RA_SITE) . ': check the address of the dashboard, click Connect, then confirm in the dashboard.</small></p><table>' . $rows . '</table>'
                 . ($ready ? $form : '<p class="bad">Tempat ini belum memenuhi syarat di atas. / This place does not meet the requirements above.</p>');
@@ -1618,6 +2097,7 @@ function ra_page(): void
         . 'h1{font-size:1.3rem}table{border-collapse:collapse;width:100%;margin-bottom:18px}td{border-bottom:1px solid #e5e7eb;padding:8px 6px}'
         . '.ok{color:#047857}.warn{color:#b45309}.bad{color:#b91c1c}label{display:block;font-weight:600;margin-bottom:6px}'
         . 'input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;font:inherit}'
+        . 'code{word-break:break-all}'
         . '.button{display:inline-block;background:#4f46e5;color:#fff;padding:10px 18px;border:0;border-radius:999px;text-decoration:none;font:inherit;font-weight:600;cursor:pointer}</style></head>'
         . '<body><h1>Arsika Rollout Manager · agent ' . RA_VERSION . '</h1>' . $body . '</body></html>';
 }
@@ -1628,61 +2108,29 @@ if (PHP_SAPI === 'cli') {
     return;
 }
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+    if (isset($_GET['poll']) && !ra_is_template()) {
+        // a round of calls to the dashboard (from the open page, a cron task or the round before), or how it goes
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        header('X-Robots-Tag: noindex, nofollow');
+        try {
+            echo ra_json($_GET['poll'] === 'status' ? ra_poll_status(ra_load()) : ra_poll(!empty($_GET['page'])));
+        } catch (Throwable $error) {
+            echo ra_json(['error' => $error->getMessage()]);
+        }
+        return;
+    }
     ra_page();
     return;
 }
-$ra_lock = null;
-try {
-    if (ra_is_template()) {
-        throw new RaError(503, 'template', 'this is the template of the agent: download the agent file from the dashboard');
-    }
-    $action = (string)($_GET['action'] ?? '');
-    $body = (string)file_get_contents('php://input');
-    $ra_lock = fopen(ra_data() . '/lock', 'c');
-    if ($ra_lock !== false) {
-        flock($ra_lock, LOCK_EX);
-    }
-    $state = ra_load();
-    $used = ra_auth($state, $action, $body);
-    ra_save($state);
-    if ($used === 'pairing' && !in_array($action, ['hello', 'pair'], true)) {
-        throw new RaError(401, 'not_paired', 'connect the site first');
-    }
-    ra_journal($state);                                              // finish a switch that an earlier request left open
-    $params = $action === 'upload' ? $_GET : (json_decode($body === '' ? '{}' : $body, true) ?: []);
-    $handlers = [
-        'hello' => function (&$state, $p) { return ra_info($state); },
-        'pair' => 'ra_pair', 'forget' => 'ra_forget', 'status' => 'ra_status',
-        'upload' => 'ra_upload', 'finish-upload' => 'ra_finish_upload', 'extract' => 'ra_extract',
-        'activate' => 'ra_activate', 'delete-release' => 'ra_delete_release', 'migrate' => 'ra_migrate',
-        'backup' => 'ra_backup', 'download' => 'ra_download', 'clear' => 'ra_clear',
-        'restore-files' => 'ra_restore_files', 'restore-db' => 'ra_restore_db',
-        'self-update' => 'ra_self_update', 'env-read' => 'ra_env_read', 'env-write' => 'ra_env_write',
-        'laravel-prepare' => 'ra_laravel_prepare', 'laravel-finish' => 'ra_laravel_finish',
-        'laravel-migrations' => 'ra_laravel_migrations', 'artisan' => 'ra_artisan',
-    ];
-    if (!isset($handlers[$action])) {
-        throw new RaError(404, 'unknown_action', 'unknown action: ' . $action);
-    }
-    $result = call_user_func_array($handlers[$action], [&$state, $params, $body]);
-    ra_save($state);
-    if ($result instanceof RaRaw) {
-        header('Content-Type: application/octet-stream');
-        header('Cache-Control: no-store');
-        header('Content-Length: ' . strlen($result->bytes));
-        echo $result->bytes;
-    } else {
-        ra_send(200, ['ok' => true, 'data' => $result]);
-    }
-} catch (RaError $error) {
-    $GLOBALS['ra_artisan_done'] = true;                              // answered here: the artisan guard stays quiet
-    ra_send($error->status, ['ok' => false, 'error' => ['code' => $error->name, 'message' => $error->getMessage()]]);
-} catch (Throwable $error) {
-    $GLOBALS['ra_artisan_done'] = true;
-    ra_send(500, ['ok' => false, 'error' => ['code' => 'agent_error', 'message' => $error->getMessage()]]);
-} finally {
-    if (is_resource($ra_lock)) {
-        flock($ra_lock, LOCK_UN);
-        fclose($ra_lock);
-    }
+list($ra_status, $ra_type, $ra_bytes) = ra_handle([
+    'uri' => (string)($_SERVER['REQUEST_URI'] ?? ''), 'ts' => (int)($_SERVER['HTTP_X_ROLLOUT_TIMESTAMP'] ?? 0),
+    'nonce' => (string)($_SERVER['HTTP_X_ROLLOUT_NONCE'] ?? ''), 'signature' => (string)($_SERVER['HTTP_X_ROLLOUT_SIGNATURE'] ?? ''),
+], (string)file_get_contents('php://input'), $_GET);
+http_response_code($ra_status);
+header('Content-Type: ' . $ra_type);
+header('Cache-Control: no-store');
+if ($ra_type === 'application/octet-stream') {
+    header('Content-Length: ' . strlen($ra_bytes));
 }
+echo $ra_bytes;

@@ -7,6 +7,7 @@
 
 use App\Core\Router;
 use App\Http\Controllers\AccountController;
+use App\Http\Controllers\AgentRelayController;
 use App\Http\Controllers\ActivityController;
 use App\Http\Controllers\AppController;
 use App\Http\Controllers\AuthController;
@@ -22,6 +23,13 @@ return static function (Router $router): void {
     $router->pattern('server', '(?:local|\d{1,10})');
     $router->pattern('upload', '[0-9a-f]{16}');
     $router->pattern('version', '[0-9A-Za-z][0-9A-Za-z._+-]{0,63}');
+
+    // the agent of a hosting that the runner cannot open (another network) calls the dashboard instead: no session, no
+    // CSRF token; every call is signed by the agent and checked by the runner of the site
+    $router->group(['prefix' => '/api/v1/agent'], static function (Router $router): void {
+        $router->get('/ping', [AgentRelayController::class, 'ping']);
+        $router->post('/{site}/poll', [AgentRelayController::class, 'poll']);
+    });
 
     $router->group(['prefix' => '/api/v1', 'middleware' => ['csrf']], static function (Router $router): void {
         $router->get('/app', [AppController::class, 'show']);

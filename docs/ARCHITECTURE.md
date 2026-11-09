@@ -21,7 +21,10 @@ their site (`/sites/{site}/jobs/{job}`).
 
 A site on a **hosting without a terminal** (`deploy_mode` `hosting`) belongs to a runner too (normally the one of the
 dashboard's server), but its files live on the hosting: the runner drives a generated PHP agent there with signed
-requests (upload in pieces, unpack, migrate, swap, back up, in short steps). See [HOSTING.md](HOSTING.md).
+requests (upload in pieces, unpack, migrate, swap, back up, in short steps). When the runner cannot open the
+hosting's address (another network, no public address), the agent calls the dashboard instead: the dashboard's public
+route `/api/v1/agent/<site>/poll` passes each call on to the runner, which answers with the next request queued for that
+agent (`relay.py`, in memory); the signatures stay the same both ways. See [HOSTING.md](HOSTING.md).
 
 Versions of a site with the release source **upload** come from the dashboard instead of GitHub: the archive goes in
 pieces through the dashboard to the runner (`state_dir/uploads/<site>/incoming/`), an `upload` job unpacks, checks,

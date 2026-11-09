@@ -31,6 +31,8 @@ function header(site) {
         ${site.deploy_mode === 'hosting' ? `<span class="badge badge--server">${icon('upload-cloud')}Hosting${laravel(site) ? ' · Laravel' : ''}</span>` : ''}
         ${uploaded(site) ? `<span class="badge badge--admin">${icon('upload')}${t('sites.upload.badge')}</span>` : ''}
         ${site.hosting && site.hosting.insecure ? `<span class="badge badge--yellow">${icon('alert')}${t('sites.hosting.insecure')}</span>` : ''}
+        ${site.hosting && site.hosting.mode === 'pull' ? `<span class="badge badge--server" title="${esc(t('sites.hosting.pull_title'))}">${icon('refresh')}${t('sites.hosting.pull_badge')}</span>
+          ${site.hosting.last_seen !== null && site.hosting.last_seen !== undefined ? `<span class="small muted">${t('sites.hosting.pull_seen', { seconds: site.hosting.last_seen })}</span>` : ''}` : ''}
         ${site.disk ? `<span class="small muted">${icon('hard-drive')}${d('disk', { free: formatBytes(site.disk.free), total: formatBytes(site.disk.total) })}</span>` : ''}</div>
     </div>
     <div class="site-header__actions">
@@ -39,7 +41,10 @@ function header(site) {
       ${ready || site.state === 'classic' ? `<button type="button" class="btn btn--outline btn--small" data-backup ${busy ? 'disabled' : ''}>${icon('archive')}${d('backup_now')}</button>` : ''}
     </div>
   </header>
-  ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' || site.state === 'unreachable' ? 'red' : 'yellow'}">${icon('info')}<div>${t('sites.state.' + site.state + '_hint')}
+  ${site.state !== 'ready' ? `<div class="box box--${site.state === 'missing' || site.state === 'unreachable' ? 'red' : 'yellow'}">${icon('info')}<div>${
+    site.state === 'unreachable' && site.hosting && site.hosting.mode === 'pull' ? t('sites.hosting.pull_offline') : t('sites.state.' + site.state + '_hint')}
+    ${site.state === 'unreachable' && site.hosting && site.hosting.mode === 'pull' && site.hosting.poll_url
+      ? `<br><code class="mono small">${esc(site.hosting.poll_url)}</code>` : ''}
     ${site.state === 'unreachable' && site.hosting && site.hosting.error ? `<br><small>${esc(site.hosting.error)}</small>` : ''}</div></div>` : ''}
   ${site.deploy_mode === 'hosting' && site.state === 'unpaired' ? connectCard(site) : ''}
   ${busy ? `<div class="box box--blue">${icon('activity')}<div>${t('jobs.in_progress')} ${jobStatusBadge(site.active_job.status)}

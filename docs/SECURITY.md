@@ -53,7 +53,10 @@ not in a public issue.
   folder. The runner may replace the agent with the agent of its own version (`self-update`, signed like every
   request); the key in the new file is marked as used. Connecting sends no secret: both sides derive it from that
   key. Plain `http://` agent addresses are accepted (e.g. a local IP address) and marked "No HTTPS": requests stay
-  signed, but the release, the `.env` and backups travel unencrypted. See [HOSTING.md](HOSTING.md#security).
+  signed, but the release, the `.env` and backups travel unencrypted. An agent in another network (no address the
+  runner can open) calls the dashboard instead: the public route `/api/v1/agent/` takes no session, only calls signed
+  with the site's secret (or the file's one-time key while it connects), checked by the runner with a one-time nonce
+  and a lockout; the runner's requests keep their own signature. See [HOSTING.md](HOSTING.md#security).
 - Uploaded archives are unpacked into an empty folder on the runner's server: absolute paths, `..`, links and special
   files are refused or dropped, the size and the number of files are limited, and the local `.env` and similar files
   are removed before a version is stored. composer (Laravel without `vendor/`) runs with `--no-scripts --no-plugins`,

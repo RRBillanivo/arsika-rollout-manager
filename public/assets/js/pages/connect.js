@@ -53,7 +53,7 @@ export async function render(main, [siteId], app, isCurrent) {
       }
       if (deployNow && version && details.state === 'classic') toast(c('needs_adopt', { name: site.name }), 'info', 10000);
       else if (deployNow && version && envMissing) toast(c('needs_env', { name: site.name }), 'info', 10000);
-      else toast(c('done', { name: site.name }), 'success', 8000);
+      else toast(c(details.hosting && details.hosting.mode === 'pull' ? 'done_pull' : 'done', { name: site.name }), 'success', 8000);
       app.go(`/sites/${site.id}`);
     } catch (error) {
       showErrors(form, error);

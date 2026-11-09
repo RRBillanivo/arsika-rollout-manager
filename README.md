@@ -3,7 +3,7 @@
 A self-hosted web dashboard to **deploy, update, roll back and back up web applications on your own Linux servers**,
 straight from their **GitHub Releases**: a zip attached to the release, or the release's source code.
 
-![version](https://img.shields.io/badge/version-1.5.5-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
+![version](https://img.shields.io/badge/version-1.6.0-4f46e5) ![license](https://img.shields.io/badge/license-MIT-16a34a)
 ![php](https://img.shields.io/badge/PHP-7.4%E2%80%938.4-777bb4) ![python](https://img.shields.io/badge/Python-3.6%E2%80%933.13-3776ab)
 
 > **Status: early release.** Version 1.1 runs in production on an aaPanel server (adoption of an existing site,
@@ -26,7 +26,9 @@ and hope nothing breaks. Arsika Rollout Manager does this for you:
 One dashboard manages many sites on **this server and on other servers** (in the local network, over a VPN or over the
 internet): each other server runs only the small runner service. Websites on a **hosting with only a file manager**
 (no terminal, no SSH), or on a virtual machine where you may only drop files, are updated through one PHP file that the
-dashboard generates; Laravel applications included (migrations, `.env`, artisan commands without a terminal).
+dashboard generates; Laravel applications included (migrations, `.env`, artisan commands without a terminal). Such a
+server may even be in **another network without a public address** (e.g. an office server): its agent file then calls
+the dashboard instead of being called.
 
 ## Features
 
@@ -42,7 +44,8 @@ dashboard generates; Laravel applications included (migrations, `.env`, artisan 
     database changes (shown before the update; run automatically or marked as done by hand), swaps the files and keeps
     the previous version for a rollback. **Laravel**: only `public/` goes into the website folder, the application,
     `.env` and `storage/` stay outside it; `php artisan migrate` and other artisan commands run inside PHP; the `.env`
-    is edited in the dashboard ([docs/HOSTING.md](docs/HOSTING.md)).
+    is edited in the dashboard. In another network (a local IP, no public address) the agent calls the dashboard and
+    keeps the connection itself ([docs/HOSTING.md](docs/HOSTING.md)).
 - **Three version sources:** a zip asset attached to a GitHub release, GitHub's source code archive of the release
   tag, or an archive **uploaded in the dashboard** (zip, rar, 7z, tar.gz; sent in pieces, the local `.env`, logs and
   caches removed, no GitHub needed).

@@ -11,7 +11,9 @@ with a wrong key pin, without a pin and with a wrong secret, a site on that serv
 log, history), site ids unique across servers, "Update runner" (the runner installs a release and restarts, as systemd
 would start it again), a server that is down, removing the server. The dashboard writes a linked .env through the link.
 Hosting without a terminal (needs the zip extension for --agent-php-ini, default --php-ini): a hosting site, its agent
-file (password), the agent on a second PHP server, connecting, the plan of database changes, a deployment. A Laravel site
+file (password), the agent on a second PHP server, connecting, the plan of database changes, a deployment. A hosting in
+another network: its agent calls the dashboard's public route /api/v1/agent/ (connecting, a deployment with the health
+check made by the agent, calling on by itself, removal). A Laravel site
 on a hosting whose versions are uploaded through the dashboard: the upload in pieces (CSRF), the .env prepared before
 connecting (password), connecting, the plan of migrations, a deployment with php artisan migrate, an artisan job
 (password), the activity log."""
@@ -373,6 +375,84 @@ def remote_tests(admin, password, tmp, github, args, logs, run_job):
             agent.terminate()
 
 
+def pull_tests(admin, password, tmp, github, agent_php, php, env, logs, base, run_job):
+    """A hosting in another network (no address the dashboard's server can open): its agent calls the dashboard (the
+    public route /api/v1/agent/<site>/poll, passed on to the runner) and takes the runner's requests that way."""
+    docroot = tmp / "office" / "public_html"
+    docroot.mkdir(parents=True)
+    github.publish_source("o/office", "1.0.0", {"index.html": "<h1>office 1.0.0</h1>", "version.txt": "version 1.0.0"})
+    relay_port, port, web_port = free_port(), free_port(), free_port()
+    # PHP's built-in server answers one request at a time: the agent calls a second server of the same dashboard, its
+    # rounds run in one server and the website (for the health checks the agent makes) is served by another
+    servers = [subprocess.Popen(php + ["-S", "127.0.0.1:%d" % relay_port, "-t", "public", "scripts/dev-server.php"], cwd=ROOT, env=env,
+                                stdout=logs, stderr=logs),
+               subprocess.Popen(agent_php + ["-d", "max_execution_time=15", "-S", "127.0.0.1:%d" % port, "-t", str(docroot)],
+                                cwd=str(docroot), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+               subprocess.Popen(agent_php + ["-S", "127.0.0.1:%d" % web_port, "-t", str(docroot)], cwd=str(docroot),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)]
+    halt = threading.Event()
+    try:
+        relay = "http://127.0.0.1:%d" % relay_port
+        status, doc = None, None
+        check("public route for agents: /api/v1/agent/ping", wait_for(relay + "/api/v1/agent/ping"))
+        site = {"preset": "hosting-static", "id": "office", "name": "Office", "repo": "o/office", "source": "source",
+                "deploy_mode": "hosting", "health_url": "http://127.0.0.1:%d/version.txt" % web_port, "health_contains": "version {version}",
+                "password": password}
+        status, doc = admin.post("sites", site)
+        check("hosting site in another network created", status == 201, json.dumps(doc)[:300])
+        status, doc = admin.post("sites/office/agent-file", {"password": password})
+        agent = doc["data"]
+        content = agent["content"].replace("const RA_DASHBOARD = '%s';" % base, "const RA_DASHBOARD = '%s';" % relay)
+        (docroot / agent["filename"]).write_text(content, encoding="utf-8")
+        url = "http://127.0.0.1:%d/%s" % (port, agent["filename"])
+        wait_for(url)
+        with urllib.request.urlopen(url, timeout=30) as response:
+            page = response.read().decode("utf-8")
+        check("the agent page: the dashboard answers its call", '<td>Menghubungi dasbor / Calls the dashboard</td><td class="ok">' in page)
+
+        def keep_open():                                             # the agent's page stays open in a browser
+            while not halt.is_set():
+                try:
+                    urllib.request.urlopen(url + "?poll=run&page=1", timeout=90).read()
+                except Exception:
+                    pass
+                halt.wait(0.3)
+
+        threading.Thread(target=keep_open, daemon=True).start()
+
+        def agent_state():
+            with urllib.request.urlopen(url + "?poll=status", timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        for _ in range(60):
+            if agent_state()["contact"] is not None:
+                break
+            time.sleep(0.5)
+        status, doc = admin.post("sites/office/agent/connect", {"url": "http://127.0.0.1:1/" + agent["filename"], "password": password})
+        hosting = (doc.get("data") or {}).get("hosting") or {}
+        check("connected although the dashboard's server cannot open its address: the agent calls the dashboard",
+              status == 200 and hosting.get("connected") and hosting.get("mode") == "pull" and doc["data"]["state"] == "empty",
+              json.dumps(doc)[:300])
+        status, doc = run_job({"type": "deploy", "version": "1.0.0"}, site_id="office")
+        check("deploy through the dashboard, health check by the agent", doc["data"]["status"] == "succeeded"
+              and (docroot / "version.txt").read_text() == "version 1.0.0" and "from the hosting (its agent)" in doc["data"]["log"]["text"],
+              doc["data"].get("message", "") + doc["data"]["log"]["text"][-500:])
+        halt.set()                                                   # the page is closed: the agent keeps calling itself
+        time.sleep(12)
+        status, doc = admin.get("sites/office")
+        hosting = (doc.get("data") or {}).get("hosting") or {}
+        check("the agent keeps calling by itself", status == 200 and hosting.get("online") and hosting.get("last_seen") is not None
+              and hosting["last_seen"] < 8,
+              json.dumps({k: hosting.get(k) for k in ("online", "last_seen", "error", "mode")}) + " " + json.dumps(agent_state()))
+        status, doc = admin.delete("sites/office", {"password": password})
+        check("site in another network removed (its agent forgets its secret)", status == 200 and not agent_state()["paired"])
+    finally:
+        halt.set()
+        for server in servers:
+            server.terminate()
+            server.wait(10)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--php", default="php")
@@ -545,6 +625,8 @@ def main():
             print("  (skipped: the PHP for the agent has no zip extension; pass --agent-php-ini)")
         else:
             hosting_tests(admin, admin_password, tmp, github, agent_php, base, run_job)
+            print("== hosting in another network: the agent calls the dashboard")
+            pull_tests(admin, admin_password, tmp, github, agent_php, php, env, logs, base, run_job)
             print("== Laravel on a hosting, uploaded versions")
             laravel_tests(admin, admin_password, tmp, agent_php, run_job)
 

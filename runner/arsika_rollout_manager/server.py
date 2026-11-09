@@ -29,6 +29,7 @@ from .deploy import DeployError
 from .github import GitHub, GitHubError
 from .hosting import artisan_command, shown_command
 from .joblog import read_log
+from .relay import RelayError
 from .sites import expand, layout, preset, presets_info, release_pattern, site_url, validate
 from .uploads import CHUNK, UploadError
 from .util import VERSION, exists, now, version_key
@@ -36,6 +37,7 @@ from .worker import JOB_TYPES, RUNNER_SITE
 
 MAX_BODY = 1 << 20
 UPLOAD_BODY = CHUNK + 4096                # a piece of an uploaded archive (PUT /v1/sites/<site>/uploads/<id>)
+POLL_BODY = (2 << 20) + 65536             # an answer of an agent that calls the dashboard (POST /v1/sites/<site>/agent/poll)
 WINDOW = 120
 TOKEN = re.compile(r"^[A-Za-z0-9_]{20,255}$")
 TOKEN_ERROR = "This does not look like a GitHub token."
@@ -119,6 +121,7 @@ class Api(object):
         ("POST", r"/v1/runner/update$", "update_runner"),
         ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent-file$", "agent_file"),
         ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent/connect$", "agent_connect"),
+        ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/agent/poll$", "agent_poll"),
         ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/plan$", "plan"),
         ("POST", r"/v1/sites/(?P<site>[a-z0-9-]+)/uploads$", "upload_start"),
         ("PUT", r"/v1/sites/(?P<site>[a-z0-9-]+)/uploads/(?P<upload>[0-9a-f]{16})$", "upload_chunk"),
@@ -127,7 +130,7 @@ class Api(object):
         ("GET", r"/v1/sites/(?P<site>[a-z0-9-]+)/env$", "env_read"),
         ("PUT", r"/v1/sites/(?P<site>[a-z0-9-]+)/env$", "env_write"),
     ]
-    RAW = ("upload_chunk",)                                          # the body is data, not JSON
+    RAW = ("upload_chunk", "agent_poll")                             # the body is data, not JSON
 
     def __init__(self, config, store, deployer, worker):
         self.config = config
@@ -227,8 +230,11 @@ class Api(object):
         contains = site.get("health_contains", "")
         if "{version}" in contains and not version:
             contains = ""                       # an installation that is not adopted yet: its version is not known
+        hosting = self.hosting if self.hosting is not None and self.hosting.is_hosting(site) else None
+        if cached and hosting and hosting.pulls(site) and hosting.relay.is_busy(site["id"]):
+            return cached[1]                    # its agent runs one request at a time: a job is running
         result = system.quick_health(expand(site, site["health_url"], version), expand(site, contains, version),
-                                     local=bool(site.get("health_local")))
+                                     local=bool(site.get("health_local")), fetch=hosting.fetcher(site) if hosting else None)
         result["checked_at"] = now()
         self.health_cache[site["id"]] = (time.time(), result, version)
         return result
@@ -348,6 +354,7 @@ class Api(object):
         installed = self.ops(record).state(record) == "ready"
         if not errors and record.get("deploy_mode") == "hosting":
             updated["path"], updated["agent_url"] = record.get("path", ""), record.get("agent_url", "")   # set by the agent
+            updated["agent_mode"] = record.get("agent_mode", "")
             if updated["deploy_mode"] != "hosting":
                 errors["deploy_mode"] = "A hosting site stays a hosting site (remove it and add it again)."
         elif not errors and updated["deploy_mode"] == "hosting":
@@ -446,8 +453,9 @@ class Api(object):
             raise ApiError(422, "validation_failed", "backup not found", {"backup_id": "Backup not found."})
         state = self.ops(record).state(record)
         if state in ("unpaired", "unreachable"):
+            error = self.hosting.last_error(record) if state == "unreachable" else ""     # the look that found it
             raise ApiError(409, "not_connected", "the hosting of this site is %s" % ("not connected yet" if state == "unpaired"
-                                                                                       else "not answering"))
+                                                                                       else "not answering" + (": " + error if error else "")))
         if job_type == "adopt" and state != "classic":
             raise ApiError(409, "not_classic", "nothing to adopt: the site folder is %s" % state)
         if job_type in ("deploy", "restore") and state == "classic":
@@ -494,6 +502,16 @@ class Api(object):
         self.hosting.connect(record, str(data.get("url") or ""))
         self.health_cache.pop(site, None)
         return self.site(site, query, {})
+
+    def agent_poll(self, site, query, data, raw):
+        """A question of an agent that calls the dashboard (a hosting in another network), passed on by the dashboard."""
+        record = self.store.site(site)
+        if self.hosting is None or record is None or not self.hosting.is_hosting(record):
+            raise ApiError(404, "site_not_found", "site %s is not registered" % site)
+        try:
+            return self.hosting.poll(record, query, raw)
+        except RelayError as e:
+            raise ApiError(e.status, e.code, str(e))
 
     def plan(self, site, query, data):
         return self.hosting.plan(self.hosting_site(site), str(query.get("version") or ""))
@@ -583,7 +601,9 @@ def make_handler(api):
 
         def _serve(self, method):
             length = int(self.headers.get("Content-Length") or 0)
-            if length > (UPLOAD_BODY if method == "PUT" and "/uploads/" in self.path else MAX_BODY):
+            path = self.path.split("?", 1)[0]
+            limit = UPLOAD_BODY if method == "PUT" and "/uploads/" in path else POLL_BODY if path.endswith("/agent/poll") else MAX_BODY
+            if length > limit:
                 status, doc = 413, {"error": {"code": "too_large", "message": "request too large", "fields": {}}}
             else:
                 body = self.rfile.read(length) if length else b""

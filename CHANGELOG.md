@@ -3,6 +3,21 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.6.0] — 2026-11-10
+
+### Added
+- **A hosting in another network**, e.g. an office server with a local IP and no public address: when the dashboard's
+  server cannot open the address of the agent file, the agent calls the dashboard instead (a new public route
+  `/api/v1/agent/<site>/poll`, passed on to the runner) and takes the runner's requests that way. Nothing to set up:
+  open the agent file in a browser of that network and click Connect; the agent keeps calling by itself, and after the
+  server restarted, opening it once (or a cron task on `<agent>?poll=run`) starts it again. Health checks of such a
+  site are made by the agent. The site page shows **Agent calls cicd** and when it called last. Agent 1.6.0 (new
+  action `fetch`; connected agents are updated automatically).
+
+### Changed
+- The page of the agent file checks that the hosting can call the dashboard, and opens the dashboard in a new tab
+  (the page stays open while it connects).
+
 ## [1.5.5] — 2026-11-09
 
 ### Changed

@@ -18,7 +18,10 @@ restore. HTTPS runner: public key pin (same as openssl computes it), wrong pin, 
 Hosting without a terminal (PHP in PATH or ROLLOUT_TEST_PHP, ini ROLLOUT_TEST_PHP_INI; needs zip and pdo_sqlite): the
 generated agent file served by PHP's built-in server, connecting, adoption of files made by hand, database changes run
 or marked as done by hand, automatic rollback, rollback, backups kept on the runner and restore, a published subfolder,
-signatures, replays and unsafe archives refused.
+signatures, replays and unsafe archives refused. A hosting in another network (the runner cannot open it): the agent
+calls a fake dashboard that passes the calls on as the PHP dashboard does: connecting without sending a secret, deploy,
+backup in pieces and restore through it, health checks by the agent, calling on by itself, offline and back, refused
+and replayed calls, a reachable agent connected directly, removal.
 Uploaded versions (no GitHub): a zip in pieces with junk that is removed, a tar.gz, refused uploads, pruning, archives
 unpacked by bsdtar (when there is one). Laravel on a hosting (fake Laravel application that records what the agent asks):
 the .env prepared in the dashboard and sent when the agent connects, only public/ in the website folder, APP_KEY,
@@ -57,6 +60,7 @@ from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
 from arsika_rollout_manager import hosting as hosting_module  # noqa: E402
 from arsika_rollout_manager.hosting import AgentClient, AgentError, artisan_command, pair_secret, valid_agent_url  # noqa: E402
+from arsika_rollout_manager.relay import Relay, RelayError  # noqa: E402
 from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
 from arsika_rollout_manager import system  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
@@ -881,8 +885,8 @@ AAPANEL_PHP = ["-d", "disable_functions=passthru,exec,system,putenv,chroot,chgrp
                      "ini_alter,ini_restore,dl,openlog,syslog,readlink,symlink,popepassthru,imap_open,apache_setenv"]
 
 
-def php_server(folder, extra=()):
-    port = free_port()
+def php_server(folder, extra=(), port=None):
+    port = port or free_port()
     proc = subprocess.Popen([PHP] + (["-c", PHP_INI] if PHP_INI else []) + list(extra) + ["-S", "127.0.0.1:%d" % port, "-t", folder],
                             cwd=folder, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(80):
@@ -1182,6 +1186,358 @@ class HostingTest(unittest.TestCase):
             AgentClient(url, key).call("hello")                                                 # the key worked once
         self.assertEqual(error.exception.code, "bad_signature")
         self.call("DELETE", "/v1/sites/lan")
+
+
+class RelayTest(unittest.TestCase):
+    """The queue between the runner and an agent that calls the dashboard (no PHP needed)."""
+
+    @staticmethod
+    def ask(relay, result="", wait=0, status=0, body=b""):
+        return relay.question("office", "secret", "1.6.0", "http://10.0.0.5/a.php", result, status, "application/json", body, wait)
+
+    @staticmethod
+    def send_later(relay, nonce, timeout=10):
+        out = {}
+
+        def run():
+            try:
+                out["answer"] = relay.send("office", {"uri": "/a.php?action=status", "ts": "1", "nonce": nonce, "signature": "s",
+                                                      "type": "application/json", "body": b"{}", "auth": "secret"}, timeout)
+            except RelayError as e:
+                out["error"] = e
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, out
+
+    def test_a_request_and_its_answer(self):
+        relay = Relay(wait=5, offline=60)
+        self.ask(relay)                                                                       # the agent calls: online
+        thread, out = self.send_later(relay, "a" * 32)
+        self.assertEqual(self.ask(relay, wait=5)["nonce"], "a" * 32)
+        self.assertTrue(relay.is_busy("office"))
+        self.ask(relay, result="a" * 32, status=200, body=b'{"ok":true}')
+        thread.join(5)
+        self.assertEqual(out["answer"], (200, "application/json", b'{"ok":true}'))
+        self.assertFalse(relay.is_busy("office"))
+
+    def test_a_call_whose_agent_is_gone_takes_no_request(self):
+        relay = Relay(wait=5, offline=60)
+        stale, fresh = [], []
+        old = threading.Thread(target=lambda: stale.append(self.ask(relay, wait=5)), daemon=True)
+        old.start()
+        time.sleep(0.3)                                                                       # it waits; its agent restarts
+        new = threading.Thread(target=lambda: fresh.append(self.ask(relay, wait=5)), daemon=True)
+        new.start()
+        old.join(2)
+        self.assertEqual(stale, [None])                                                        # the old call gives up at once
+        thread, out = self.send_later(relay, "b" * 32)
+        new.join(5)
+        self.assertEqual(fresh[0]["nonce"], "b" * 32)                                          # the request goes to the new call
+        self.ask(relay, result="b" * 32, status=200, body=b"{}")
+        thread.join(5)
+        self.assertEqual(out["answer"][0], 200)
+
+    def test_a_request_that_never_reached_the_agent_fails_at_once(self):
+        relay = Relay(wait=5, offline=60)
+        self.ask(relay)
+        thread, out = self.send_later(relay, "c" * 32, timeout=60)
+        self.assertEqual(self.ask(relay, wait=5)["nonce"], "c" * 32)                            # taken; then the connection broke
+        started = time.time()
+        self.ask(relay)                                                                       # it asks again without the answer
+        thread.join(5)
+        self.assertEqual(out["error"].code, "lost")
+        self.assertLess(time.time() - started, 5)                                              # not after its 60 seconds
+
+    def test_an_agent_that_does_not_call_is_offline(self):
+        relay = Relay(wait=5, offline=1)
+        thread, out = self.send_later(relay, "d" * 32)
+        thread.join(5)
+        self.assertEqual(out["error"].code, "offline")
+        self.ask(relay)
+        time.sleep(1.2)
+        self.assertFalse(relay.online("office"))
+
+
+class FakeDashboard(object):
+    """The public part of the dashboard that the agent of a hosting in another network calls (/api/v1/agent/ping and
+    /api/v1/agent/<site>/poll), passing the calls on to the runner as the PHP dashboard does. Calls are kept."""
+
+    FIELDS = (("ts", "X-Rollout-Timestamp"), ("nonce", "X-Rollout-Nonce"), ("sig", "X-Rollout-Signature"), ("agent", "X-Rollout-Agent"),
+              ("url", "X-Rollout-Agent-Url"), ("result", "X-Rollout-Result"), ("status", "X-Rollout-Result-Status"),
+              ("type", "X-Rollout-Result-Type"), ("wait", "X-Rollout-Wait"))
+
+    def __init__(self, runner):
+        self.calls = []                                    # (site, query, body, answer of the runner)
+        dashboard = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def answer(self, status, doc):
+                payload = json.dumps(doc).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                if self.path == "/api/v1/agent/ping":
+                    return self.answer(200, {"data": {"app": "Arsika Rollout Manager"}})
+                self.answer(404, {"error": {"code": "route_not_found", "message": "not found"}})
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                match = re.match(r"^/api/v1/agent/([a-z0-9-]+)/poll$", self.path)
+                if not match:
+                    return self.answer(404, {"error": {"code": "route_not_found", "message": "not found"}})
+                query = {key: self.headers.get(header) or "" for key, header in FakeDashboard.FIELDS}
+                status, doc = runner.request("POST", "/v1/sites/%s/agent/poll?%s" % (match.group(1), urllib.parse.urlencode(query)), raw=body)
+                dashboard.calls.append((match.group(1), query, body, doc))
+                self.answer(status, doc)
+
+        self.server = ThreadingServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def commands(self, action):
+        """The requests of the runner for one action that the agent took."""
+        found = []
+        for _, _, _, doc in self.calls:
+            command = (doc.get("data") or {}).get("command") if isinstance(doc.get("data"), dict) else None
+            if command and ("action=%s&" % action in command["uri"] + "&"):
+                found.append(command)
+        return found
+
+
+class Poller(threading.Thread):
+    """An open page of the agent file (or a cron task): it lets the agent call the dashboard, again and again."""
+
+    def __init__(self, url, page=True):
+        threading.Thread.__init__(self, daemon=True)
+        self.url = url + ("?poll=run&page=1" if page else "?poll=run")
+        self.halt = threading.Event()
+        self.start()
+
+    def run(self):
+        while not self.halt.is_set():
+            try:
+                urllib.request.urlopen(self.url, timeout=90).read()
+            except Exception:
+                pass
+            self.halt.wait(0.3)
+
+    def stop(self):
+        self.halt.set()
+
+
+@unittest.skipUnless(PHP, "PHP is needed to run the hosting agent")
+class PullHostingTest(unittest.TestCase):
+    """A hosting in another network, e.g. an office server without a public IP: the runner cannot open the address of
+    its agent file, so the agent calls the dashboard, takes the runner's requests that way and keeps calling by itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-pull-")
+        cls.home = os.path.join(cls.tmp, "office")
+        cls.docroot = os.path.join(cls.home, "public_html")
+        os.makedirs(os.path.join(cls.docroot, "uploads"))
+        with open(os.path.join(cls.docroot, "uploads", "scan.bin"), "wb") as f:
+            f.write(os.urandom(int(2.5 * (1 << 20))))                              # a backup of several pieces
+        cls.github = FakeGitHub()
+        for version in ("1.0.0", "1.1.0"):
+            cls.github.publish(version, {"index.html": "<h1>office %s</h1>" % version, "version.txt": "version " + version}, repo="o/office")
+        # the agent runs in one PHP built-in server (rounds of 5 s with this time limit); a second one serves the website
+        # for the health checks the agent makes (the built-in server answers one request at a time)
+        cls.php_port = free_port()
+        cls.php = php_server(cls.docroot, ["-d", "max_execution_time=15"], cls.php_port)[0]
+        cls.web, cls.web_port = php_server(cls.docroot)
+        cls.extra_php = []
+        config_path = os.path.join(cls.tmp, "etc", "runner.json")
+        os.makedirs(os.path.dirname(config_path))
+        cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
+                                   github_api="http://127.0.0.1:%d" % cls.github.port, site_roots=[cls.tmp], shell=SHELL, port=0,
+                                   health_attempts=3, health_delay=0.3, agent_poll_wait=2, agent_offline_seconds=6)
+        cls.config.prepare_dirs()
+        store = Store(cls.config.state_path("runner.db"))
+        cls.deployer = Deployer(cls.config, store, Backups(cls.config, store))
+        cls.worker = Worker(cls.config, store, cls.deployer)
+        cls.worker.start()
+        cls.server = serve(Api(cls.config, store, cls.deployer, cls.worker))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.client = Client("http://127.0.0.1:%d" % cls.server.server_address[1], cls.config["secret"])
+        cls.dashboard = FakeDashboard(cls.client)
+        cls.pollers = []
+
+    @classmethod
+    def tearDownClass(cls):
+        for poller in cls.pollers:
+            poller.stop()
+        stop(cls.server, cls.github.server, cls.dashboard.server)
+        cls.worker.stopping = True
+        cls.worker.wake.set()
+        for proc in [cls.php, cls.web] + cls.extra_php:
+            proc.terminate()
+            proc.wait(10)
+        time.sleep(0.3)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    call = RunnerTest.call
+    wait_job = RunnerTest.wait_job
+    job = HostingTest.job
+    live = HostingTest.live
+
+    def agent_url(self):
+        return "http://127.0.0.1:%d/%s" % (self.php_port, self.agent_name)
+
+    def relay(self):
+        return self.worker.hosting.relay
+
+    def agent_status(self, url=None):
+        with urllib.request.urlopen((url or self.agent_url()) + "?poll=status", timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def wait_for(self, check, what, seconds=30):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if check():
+                return
+            time.sleep(0.2)
+        self.fail("timed out: " + what)
+
+    # ---------- tests (run in order) ----------
+    def test_00_connect_through_the_dashboard(self):
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "office", "repo": "o/office", "asset_pattern": "demo_v*.zip",
+                                        "shared": ["uploads/"], "backup_paths": ["uploads/"],
+                                        "health_url": "http://127.0.0.1:%d/version.txt" % self.web_port, "health_contains": "version {version}"})
+        agent = self.call("POST", "/v1/sites/office/agent-file", {"dashboard": self.dashboard.url})
+        type(self).agent_name = agent["filename"]
+        key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", agent["content"]).group(1)
+        with open(os.path.join(self.docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        with urllib.request.urlopen(self.agent_url(), timeout=30) as response:
+            page = response.read().decode("utf-8")
+        self.assertIn('<td>Menghubungi dasbor / Calls the dashboard</td><td class="ok">', page)     # the dashboard answers
+        self.assertIn('"_blank"', page)                                                           # the page stays open
+        self.pollers.append(Poller(self.agent_url()))                                            # the open page
+        self.wait_for(lambda: self.relay().online("office", key="pairing"), "the agent calls the dashboard with its key")
+        unreachable = "http://127.0.0.1:1/" + agent["filename"]                                  # another network
+        details = self.call("POST", "/v1/sites/office/agent/connect", {"url": unreachable})
+        hosting = details["hosting"]
+        self.assertEqual((hosting["connected"], hosting["mode"], hosting["online"], hosting["error"]), (True, "pull", True, ""))
+        self.assertEqual(hosting["poll_url"], unreachable + "?poll=run")
+        self.assertEqual(details["state"], "empty")
+        secret = self.config.secret_of("agent_secrets", "office")
+        pair = self.dashboard.commands("pair")
+        self.assertEqual(len(pair), 1)
+        sent = json.loads(base64.b64decode(pair[0]["body"]).decode("utf-8"))
+        self.assertEqual(sorted(sent), ["salt"])                                                  # no secret on the wire
+        self.assertEqual(secret, pair_secret(key, sent["salt"]))
+        traffic = b"".join(body + json.dumps(doc).encode("utf-8") for _, _, body, doc in self.dashboard.calls)
+        self.assertNotIn(secret.encode(), traffic)
+        self.assertNotIn(key.encode(), traffic)
+        status = self.agent_status()
+        self.assertEqual((status["paired"], status["mode"], status["error"]), (True, "pull", ""))
+
+    def test_01_deploy_backup_and_restore_through_the_dashboard(self):
+        job = self.job("deploy", "1.0.0", site="office")
+        self.assertIn("Health check http://127.0.0.1:%d/version.txt from the hosting (its agent)" % self.web_port, job["log"]["text"])
+        self.assertIn("health check OK", job["log"]["text"])
+        self.assertEqual(self.live("version.txt"), "version 1.0.0")
+        self.job("deploy", "1.1.0", site="office")
+        self.assertEqual(self.live("version.txt"), "version 1.1.0")
+        self.assertTrue(self.dashboard.commands("upload"))                                       # the release in pieces
+        backup_id = self.job("backup", site="office")["message"].split()[-1]                     # 2.5 MB in pieces of 1 MB
+        self.assertGreaterEqual(len(self.dashboard.commands("download")), 3)
+        with open(os.path.join(self.docroot, "uploads", "scan.bin"), "rb") as f:
+            scan = f.read()
+        with open(os.path.join(self.docroot, "uploads", "scan.bin"), "wb") as f:
+            f.write(b"changed")
+        self.job("restore", params={"backup_id": backup_id, "safety_backup": False}, site="office")
+        with open(os.path.join(self.docroot, "uploads", "scan.bin"), "rb") as f:
+            self.assertEqual(f.read(), scan)
+        self.job("rollback", site="office")
+        self.assertEqual(self.live("version.txt"), "version 1.0.0")
+        site = self.call("GET", "/v1/sites/office")
+        self.assertEqual((site["state"], site["current_version"], site["health"]["ok"]), ("ready", "1.0.0", True))
+
+    def test_02_it_keeps_calling_by_itself(self):
+        for poller in self.pollers:
+            poller.stop()                                                                         # the page is closed
+        time.sleep(12)                                                                            # rounds of 5 s
+        self.assertLess(self.relay().last_seen("office"), 6)
+        self.job("backup", site="office")
+
+    def test_03_offline_then_back(self):
+        self.php.terminate()                                                                      # the office server is down
+        self.php.wait(10)
+        self.wait_for(lambda: not self.relay().online("office"), "the agent is offline", 20)
+        started = time.time()
+        status, doc = self.client.post("/v1/sites/office/jobs", {"type": "backup", "actor": "test"})
+        self.assertEqual((status, doc["error"]["code"]), (409, "not_connected"))
+        self.assertIn("has not called the dashboard", doc["error"]["message"])
+        self.assertLess(time.time() - started, 10)                                               # at once, not after a timeout
+        site = self.call("GET", "/v1/sites/office")
+        self.assertEqual((site["state"], site["hosting"]["mode"], site["hosting"]["online"]), ("unreachable", "pull", False))
+        self.assertIn("has not called the dashboard", site["hosting"]["error"])
+        type(self).php = php_server(self.docroot, ["-d", "max_execution_time=15"], self.php_port)[0]
+        urllib.request.urlopen(self.agent_url() + "?poll=run", timeout=60).read()               # once, like a cron task
+        self.wait_for(lambda: self.relay().online("office"), "the agent calls again")
+        self.job("backup", site="office")
+        time.sleep(12)
+        self.assertLess(self.relay().last_seen("office"), 6)                                      # and goes on by itself
+
+    def test_04_refused_calls(self):
+        headers = {"X-Rollout-Timestamp": str(int(time.time())), "X-Rollout-Nonce": "a" * 32, "X-Rollout-Signature": "0" * 64,
+                   "X-Rollout-Agent": "1.6.0", "X-Rollout-Wait": "0"}
+        for site, code in (("office", 401), ("nowhere", 404)):
+            request = urllib.request.Request(self.dashboard.url + "/api/v1/agent/%s/poll" % site, data=b"", headers=headers, method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=30)
+            self.assertEqual(error.exception.code, code)
+        _, query, body, _ = [c for c in self.dashboard.calls if c[0] == "office" and "data" in c[3]][-1]
+        status, doc = self.client.request("POST", "/v1/sites/office/agent/poll?" + urllib.parse.urlencode(query), raw=body)
+        self.assertEqual((status, doc["error"]["code"]), (401, "replayed"))                      # a call seen before
+
+    def test_04b_an_agent_that_neither_answers_nor_calls(self):
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "silent", "repo": "o/office", "asset_pattern": "demo_v*.zip"})
+        agent = self.call("POST", "/v1/sites/silent/agent-file", {"dashboard": self.dashboard.url})
+        status, doc = self.client.post("/v1/sites/silent/agent/connect", {"url": "http://127.0.0.1:1/" + agent["filename"]})
+        self.assertEqual(status, 422)
+        self.assertIn("has not called the dashboard either", doc["error"]["message"])           # what to do about it
+        self.call("DELETE", "/v1/sites/silent")
+
+    def test_05_an_agent_the_runner_can_open_is_connected_directly(self):
+        docroot = os.path.join(self.tmp, "near", "public_html")
+        os.makedirs(docroot)
+        page, page_port = php_server(docroot, ["-d", "max_execution_time=15"])                  # the open page's rounds
+        direct, direct_port = php_server(docroot)                                                 # what the runner opens
+        self.extra_php.extend([page, direct])
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "near", "repo": "o/office", "asset_pattern": "demo_v*.zip",
+                                        "health_url": "{site_url}/version.txt", "health_contains": "version {version}"})
+        agent = self.call("POST", "/v1/sites/near/agent-file", {"dashboard": self.dashboard.url})
+        with open(os.path.join(docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        page_url = "http://127.0.0.1:%d/%s" % (page_port, agent["filename"])
+        poller = Poller(page_url)
+        self.pollers.append(poller)
+        self.wait_for(lambda: self.relay().online("near", key="pairing"), "the agent of the second site calls the dashboard")
+        details = self.call("POST", "/v1/sites/near/agent/connect", {"url": "http://127.0.0.1:%d/%s" % (direct_port, agent["filename"])})
+        self.assertEqual((details["hosting"]["connected"], details["hosting"]["mode"]), (True, "direct"))
+        self.wait_for(lambda: self.agent_status(page_url)["mode"] == "direct", "the agent stops calling")
+        poller.stop()
+        self.call("DELETE", "/v1/sites/near")
+
+    def test_06_removing_the_site_stops_the_calls(self):
+        self.call("DELETE", "/v1/sites/office")                                                  # "forget" through the dashboard
+        self.wait_for(lambda: not self.agent_status()["paired"], "the agent forgets its secret")
+        calls = len(self.dashboard.calls)
+        time.sleep(7)
+        self.assertLessEqual(len(self.dashboard.calls), calls + 1)                                # and stops calling
 
 
 def make_tar(files, top=""):
@@ -1635,17 +1991,17 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertNotIn("Backup", job["log"]["text"])                                        # stopped before anything else
 
     def test_07_the_agent_updates_itself(self):
-        template = os.path.join(self.tmp, "agent-1.5.6.php")
+        template, current = os.path.join(self.tmp, "agent-newer.php"), hosting_module.template_version()
         with open(hosting_module.TEMPLATE, encoding="utf-8") as f:
-            text = f.read().replace("const RA_VERSION = '1.5.5';", "const RA_VERSION = '1.5.6';")
+            text = f.read().replace("const RA_VERSION = '%s';" % current, "const RA_VERSION = '9.9.9';")
         with open(template, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         before = self.live(self.agent_name)
         with mock.patch.object(hosting_module, "TEMPLATE", template):                          # a newer agent template
             job = self.job("deploy", "1.2.0")
-        self.assertIn("Update the agent file on the hosting (1.5.5 -> 1.5.6)", job["log"]["text"])
+        self.assertIn("Update the agent file on the hosting (%s -> 9.9.9)" % current, job["log"]["text"])
         after = self.live(self.agent_name)
-        self.assertIn("const RA_VERSION = '1.5.6';", after)
+        self.assertIn("const RA_VERSION = '9.9.9';", after)
         key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", after).group(1)
         self.assertNotIn(key, before)
         with open(os.path.join(self.home, ".rollout-agent-lara", "state.php"), encoding="utf-8") as f:

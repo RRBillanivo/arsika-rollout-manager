@@ -26,7 +26,7 @@ POST/PUT/DELETE (token from `GET /app`); `X-Locale: id|en` for the message langu
 | POST | `/sites/{site}/jobs` | `{type, version, params}`; 🔒 for `adopt`, `restore`, `delete-release`, `cleanup-adopt`, `artisan` |
 | GET | `/sites/{site}/jobs/{job}?offset=` | the job with its log from byte `offset` |
 | POST 🔒 | `/sites/{site}/agent-file` | hosting site: a new agent file `{filename, content}` with a new one-time key (the button of the file opens `APP_URL`) |
-| POST 🔒 | `/sites/{site}/agent/connect` | `{url}`: connect the uploaded agent file |
+| POST 🔒 | `/sites/{site}/agent/connect` | `{url}`: connect the uploaded agent file (directly, or through the dashboard when the runner cannot open `url`) |
 | GET | `/sites/{site}/plan?version=` | hosting site: the database changes of a release (`kind` `sql` or `laravel`; `migrations`: name, content, `pending` or `changed`) |
 | POST | `/sites/{site}/uploads` | `{name, size, version?}` → `{id, version, chunk_size}`: start uploading an archive (release source `upload`) |
 | POST | `/sites/{site}/uploads/{id}?offset=` | body: the bytes of one piece (`Content-Type: application/octet-stream`, with `X-CSRF-Token`) → `{received}` |
@@ -49,6 +49,16 @@ Job types: `deploy` (`version`, `params.backup`), `rollback` (`version` optional
 `adopt` (`version`, `params.backup`), `backup` (`params.reason`), `restore` (`params.backup_id`, `params.safety_backup`),
 `delete-release` (`version`), `cleanup-adopt`, `artisan` (`params.command`: an artisan command line for a Laravel
 site on a hosting), `upload` (started by `/uploads/{id}/finish`).
+
+### For agents (no session, no CSRF token)
+
+The agent of a hosting that the runner cannot open (another network, no public address) calls the dashboard instead.
+A sign-in in front of the dashboard (e.g. Cloudflare Access) must let `/api/v1/agent/` through: every call is signed.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/agent/ping` | `{"data": {"app": …}}`: the agent's page checks that the hosting can reach the dashboard |
+| POST | `/agent/{site}/poll` | raw body: the agent's answer to the runner's last request; headers `X-Rollout-Timestamp`, `X-Rollout-Nonce`, `X-Rollout-Signature`, `X-Rollout-Agent`, `X-Rollout-Agent-Url`, `X-Rollout-Result`, `X-Rollout-Result-Status`, `X-Rollout-Result-Type`, `X-Rollout-Wait`. Passed on to the runner of the site → `{"command": request or null}` or `{"stop": "direct"}` |
 
 ## Runner API (`/v1`, used by the dashboard and `python3 -m arsika_rollout_manager`)
 
@@ -77,8 +87,9 @@ X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD "\n" PATH_WITH_QUERY "\n" TI
 | PUT | `/v1/sites/{site}/uploads/{id}?offset=` raw body (one piece, up to 8 MB) → `{received, size}` |
 | POST · DELETE | `/v1/sites/{site}/uploads/{id}/finish` `{actor}` (→ the `upload` job) · `/v1/sites/{site}/uploads/{version}` |
 | GET · PUT | `/v1/sites/{site}/env` · `{content}`: the `.env` of a hosting site (a copy kept by the runner until the agent connects) |
+| POST | `/v1/sites/{site}/agent/poll?ts=&nonce=&sig=&agent=&url=&result=&status=&type=&wait=` raw body: a call of an agent that calls the dashboard (from the headers above). The agent signs hex HMAC-SHA256(site secret, or the one-time key while it connects, `POLL` \n site \n ts \n nonce \n agent version \n agent address \n answered nonce \n answer status \n answer content type \n hex SHA-256(body)); ±300 s, one-time nonce, 30 invalid calls in 10 minutes lock the site for a while. The runner holds the call up to `wait` seconds (`agent_poll_wait`, 20) while it has no request. A request is `{uri, ts, nonce, signature, type, body (base64)}`: signed exactly as a request sent to the agent's address |
 
-## Hosting agent (`https://<site>/rollout-agent-….php`, used by the runner)
+## Hosting agent (`https://<site>/rollout-agent-….php` or `http://<local address>/…`, used by the runner)
 
 `POST ?action=<name>[&…]`, signed like the runner API (`X-Rollout-Timestamp` ±300 s, `X-Rollout-Nonce`,
 `X-Rollout-Signature` over `POST`, the path with the query, timestamp, nonce and the body's SHA-256) with the site's
@@ -86,5 +97,7 @@ secret; `hello` and `pair` also with the file's one-time key until it is used. A
 `upload` (raw body, `name`, `offset`), `finish-upload`, `extract` (in steps), `migrate`, `activate`, `delete-release`,
 `backup` (in steps), `download`, `clear`, `restore-files`, `restore-db`, `forget`; from 1.5.0 `self-update` (`code`:
 the agent of the runner's version), `env-read` / `env-write` (`file`, `content`), `laravel-prepare`, `laravel-finish`,
-`laravel-migrations`, `artisan` (`version`, `command`). Paths starting with `@shared/` are in the agent's data folder.
-A `GET` shows the page for the browser.
+`laravel-migrations`, `artisan` (`version`, `command`); from 1.6.0 `fetch` (`url`, `timeout`: a GET from the hosting, the
+health check of a site that only its own network can open). Paths starting with `@shared/` are in the agent's data
+folder. A `GET` shows the page for the browser; `GET ?poll=run` runs one round of calls to the dashboard (an agent that
+the runner cannot open: from its open page, a cron task or the round before), `GET ?poll=status` tells how it goes.
