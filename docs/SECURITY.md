@@ -51,8 +51,9 @@ not in a public issue.
   commands, and keeps its secret outside the web root when the hosting allows it (inside it: a random folder name and
   an `.htaccess` that denies access). Backups are moved off the hosting. Laravel applications live outside the website
   folder. The runner may replace the agent with the agent of its own version (`self-update`, signed like every
-  request); the key in the new file is marked as used. Plain `http://` agent addresses are accepted only for local
-  networks. See [HOSTING.md](HOSTING.md#security).
+  request); the key in the new file is marked as used. Connecting sends no secret: both sides derive it from that
+  key. Plain `http://` agent addresses are accepted (e.g. a local IP address) and marked "No HTTPS": requests stay
+  signed, but the release, the `.env` and backups travel unencrypted. See [HOSTING.md](HOSTING.md#security).
 - Uploaded archives are unpacked into an empty folder on the runner's server: absolute paths, `..`, links and special
   files are refused or dropped, the size and the number of files are limited, and the local `.env` and similar files
   are removed before a version is stored. composer (Laravel without `vendor/`) runs with `--no-scripts --no-plugins`,

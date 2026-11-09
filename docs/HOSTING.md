@@ -6,7 +6,7 @@ Updating a site there usually means zipping it and uploading it by hand. Arsika 
 the website gets one PHP file, the **agent**, and every update goes through it.
 
 ```
-Dashboard ── runner (on the dashboard's server)  ── HTTPS, signed requests ──>  rollout-agent-xxxxxx.php
+Dashboard ── runner (on the dashboard's server)  ── HTTPS (or http), signed ──>  rollout-agent-xxxxxx.php
                GitHub or uploaded versions,                                      in the website folder:
                composer, checksums, health checks,                               unpack, database changes,
                backups (kept here)                                               swap files, artisan
@@ -31,7 +31,7 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 | Extensions | `zip` (ZipArchive, required); `zlib` for database backups; `pdo_mysql` (or `pdo_sqlite`) for database changes and backups |
 | Disabled functions | fine: the agent needs no `exec`, `putenv`, `symlink` … (aaPanel's default `disable_functions` works; without `symlink` there is no public storage link) |
 | Folder | the website folder (e.g. `public_html`) must be writable by PHP, as it is on most hostings |
-| Address | HTTPS; plain `http://` only on a local network (an IP address of a private network, `localhost`, a name without a dot or ending in `.local`, `.lan`, `.internal`, `.home.arpa`), marked **No HTTPS** |
+| Address | HTTPS, or plain `http://` (e.g. a local IP address without a certificate), marked **No HTTPS**: the release, the `.env` and backups then travel unencrypted, the connection secret never does |
 | Reachable | the **dashboard's server** must be able to open the address of the agent file (the hosting does not need to reach GitHub or the dashboard: the runner sends everything) |
 
 ## Connecting a site
@@ -53,10 +53,11 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 3. Click **Download the agent file** (your password is asked): a file `rollout-agent-xxxxxx.php` with a one-time key
    for this site.
 4. Put it into the website folder (the file manager of the hosting, FTP, or the folder of the VM's web server).
-5. Open it in the browser (`https://example.com/rollout-agent-xxxxxx.php`). It checks the place (PHP, zip, folder,
-   HTTPS) and shows the **address of the dashboard**, filled in already: change it only when you open the dashboard at
-   another address. **Connect to the dashboard** opens the dashboard (signed in), which asks for your password and
-   connects: the runner calls the agent with the one-time key and gives it its own long secret. With **Deploy right
+5. Open it in the browser (`https://example.com/rollout-agent-xxxxxx.php`; on a local network
+   `http://192.168.1.20/rollout-agent-xxxxxx.php` works too). It checks the place (PHP, zip, folder, HTTPS) and shows
+   the **address of the dashboard**, filled in already: change it only when you open the dashboard at another address.
+   **Connect to the dashboard** opens the dashboard (signed in), which asks for your password and connects: the runner
+   calls the agent with the one-time key, and both derive the site's own long secret from it. With **Deploy right
    after connecting** (when the website folder is empty) the newest version is installed at once and its log opens.
 
 Only the dashboard that holds the file's key can connect it, so the address on the agent page may be changed safely.
@@ -200,10 +201,16 @@ backups for them); big databases take longer.
 - The agent only works inside its website folder and its data folder: paths with `..`, absolute paths and unsafe
   archives are refused, and it never runs shell commands. artisan commands run the site's own application inside PHP,
   only on request of the runner (and the dashboard asks for the password). Downloads are limited to its backups.
-- Plain `http://` agent addresses are accepted only for local networks; there the release, the `.env` and the backups
-  travel unencrypted inside that network.
+- Connecting sends no secret: the runner and the agent (1.5.5 and newer) derive the site's secret from the file's
+  one-time key and a random salt (HMAC-SHA256). An agent file of an earlier version still receives its secret, so the
+  runner connects it only over HTTPS; over plain `http://` download the agent file again.
+- Plain `http://` agent addresses are accepted (a local network often has no certificate, and its addresses are not
+  always private ones). Requests stay signed, but the release, the `.env` and the backups travel unencrypted, and the
+  answers of the agent are not protected: use it only inside a network you trust, and HTTPS for an address on the
+  internet.
 - Removing the site from the dashboard makes the agent forget its secret; delete the file to remove it completely.
-- Keep the random file name, use HTTPS, and keep the dashboard's own access protected (it can change the site).
+- Keep the random file name, use HTTPS on the internet, and keep the dashboard's own access protected (it can change
+  the site).
 
 ## Troubleshooting
 
@@ -211,7 +218,8 @@ backups for them); big databases take longer.
 |---|---|
 | The hosting answered HTTP 403 / 406 instead of the agent | A firewall of the hosting (ModSecurity, a WAF) blocks the requests: ask the hosting to allow requests to the agent file |
 | The agent address redirects to … | Use the final address (https, with or without www) |
-| not the address of the agent file | Plain `http://` to an address on the internet: use https (plain http only on a local network) |
+| not the address of the agent file | The address must end in the `.php` file of the agent, without `?…` or `#…` (`https://…` or `http://…`) |
+| this agent file is from an earlier version | Plain `http://` with an agent file downloaded before 1.5.5: download the agent file again and replace it |
 | the PHP extension zip is not enabled | Enable `zip` in the panel (PHP settings / extensions) |
 | the file .env with the database settings is not on the hosting | The site has database changes or backups but its environment file is missing: upload it, or fill it in with **Edit .env** |
 | the .env of the site is not set yet | Laravel: **Edit .env** on the site page, then deploy again |

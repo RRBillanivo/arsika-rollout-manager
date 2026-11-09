@@ -3,6 +3,20 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.5.5] — 2026-11-09
+
+### Changed
+- Hosting sites may be connected over plain `http://` at any address, e.g. a local network whose IP addresses are not
+  in a private range. Before, plain http was refused unless the address looked local (a private IP range,
+  `localhost`, `.local` …). The agent page shows "!" instead of "✗" for http, the dashboard marks the site
+  **No HTTPS** and says what travels unencrypted (the release, the `.env`, backups).
+
+### Security
+- Connecting a hosting site no longer sends a secret: the runner and the agent derive the site's secret from the one-time
+  key in the agent file and a random salt. An agent file downloaded before 1.5.5 still receives its secret, so it is
+  connected only over HTTPS; over plain http the dashboard asks to download the agent file again. Agent 1.5.5 (connected
+  sites are updated automatically).
+
 ## [1.5.4] — 2026-11-08
 
 ### Fixed

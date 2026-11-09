@@ -56,7 +56,7 @@ from arsika_rollout_manager.compose import ComposeError  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
 from arsika_rollout_manager import hosting as hosting_module  # noqa: E402
-from arsika_rollout_manager.hosting import AgentClient, AgentError, artisan_command, valid_agent_url  # noqa: E402
+from arsika_rollout_manager.hosting import AgentClient, AgentError, artisan_command, pair_secret, valid_agent_url  # noqa: E402
 from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
 from arsika_rollout_manager import system  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
@@ -995,12 +995,32 @@ class HostingTest(unittest.TestCase):
             page = response.read().decode("utf-8")
         self.assertIn("https://dash.example.com/?connect=shop&amp;agent=" + urllib.parse.quote(self.agent_url(), safe=""), page)
         self.assertNotIn(self.docroot, page)                                                   # no paths on the page
+        public = urllib.request.Request(self.agent_url(), headers={"Host": "31.41.59.26"})    # not a private address
+        with urllib.request.urlopen(public, timeout=10) as response:
+            page = response.read().decode("utf-8")
+        self.assertIn('<td>HTTPS</td><td class="warn">!</td>', page)                           # plain http: allowed, marked
+        self.assertIn('id="ra-connect"', page)
+        self.assertIn(urllib.parse.quote("http://31.41.59.26/" + self.agent_name, safe=""), page)
 
     def test_01_connect(self):
-        status, doc = self.client.post("/v1/sites/shop/agent/connect", {"url": "http://example.com/" + self.agent_name})
-        self.assertEqual(status, 422)                                                          # plain http only on this machine
-        details = self.call("POST", "/v1/sites/shop/agent/connect", {"url": self.agent_url()})
+        status, doc = self.client.post("/v1/sites/shop/agent/connect", {"url": self.agent_url() + "?x=1"})
+        self.assertEqual(status, 422)                                                          # not the address of the file
+        key = self.config.secret_of("agent_keys", "shop")
+        sent, call = [], AgentClient.call
+
+        def record(client, action, data=None, *args, **kwargs):
+            sent.append((action, json.dumps(data or {})))
+            return call(client, action, data, *args, **kwargs)
+
+        with mock.patch.object(AgentClient, "call", record):
+            details = self.call("POST", "/v1/sites/shop/agent/connect", {"url": self.agent_url()})
         self.assertEqual((details["state"], details["hosting"]["connected"], details["hosting"]["data_outside"]), ("classic", True, True))
+        self.assertTrue(details["hosting"]["insecure"])                                        # plain http: marked "No HTTPS"
+        secret = self.config.secret_of("agent_secrets", "shop")
+        pair = [json.loads(data) for action, data in sent if action == "pair"]
+        self.assertEqual([sorted(p) for p in pair], [["salt"]])                                # no secret on the wire
+        self.assertEqual(secret, pair_secret(key, pair[0]["salt"]))                            # the agent derives the same one
+        self.assertFalse([action for action, data in sent if secret in data or key in data])
         self.assertTrue(os.path.isdir(os.path.join(self.home, ".rollout-agent-shop")))       # outside the website folder
         status, doc = self.client.post("/v1/sites/shop/agent/connect", {"url": self.agent_url()})
         self.assertIn("download the agent file first", doc["error"]["message"])               # the key works once
@@ -1129,6 +1149,39 @@ class HostingTest(unittest.TestCase):
         with self.assertRaises(AgentError) as error:
             AgentClient(url, secret).call("status")
         self.assertEqual(error.exception.code, "bad_signature")
+
+    def test_11_plain_http_needs_an_agent_that_derives_its_secret(self):
+        docroot = os.path.join(self.tmp, "home3", "public_html")
+        os.makedirs(docroot)
+        proc, port = php_server(docroot)
+        type(self).extra_php = getattr(type(self), "extra_php", []) + [proc]
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "lan", "repo": "o/spa", "source": "source",
+                                        "health_url": "http://127.0.0.1:%d/" % port})
+        agent = self.call("POST", "/v1/sites/lan/agent-file", {"dashboard": "https://dash.example.com"})
+        key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", agent["content"]).group(1)
+
+        def drop(name, content):                                                               # a new name: no stale opcache
+            with open(os.path.join(docroot, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+            return "http://127.0.0.1:%d/%s" % (port, name)
+
+        url = drop(agent["filename"], agent["content"])
+        with self.assertRaises(AgentError) as error:                                           # a secret from an old runner
+            AgentClient(url, key).call("pair", {"secret": "a" * 64})
+        self.assertEqual((error.exception.code, error.exception.status), ("bad_salt", 422))
+        old = drop("rollout-agent-old000.php", re.sub(r"const RA_VERSION = '[^']+';", "const RA_VERSION = '1.5.4';", agent["content"]))
+        status, doc = self.client.post("/v1/sites/lan/agent/connect", {"url": old})            # an agent file of 1.5.4
+        self.assertEqual(status, 422)
+        self.assertIn("download the agent file again", doc["error"]["message"])
+        self.assertFalse(AgentClient(old, key).call("hello")["paired"])                         # nothing sent, the key still works
+        details = self.call("POST", "/v1/sites/lan/agent/connect", {"url": url})
+        self.assertTrue(details["hosting"]["connected"] and details["hosting"]["insecure"])
+        secret = self.config.secret_of("agent_secrets", "lan")
+        self.assertEqual(AgentClient(url, secret).call("status")["agent"], hosting_module.template_version())
+        with self.assertRaises(AgentError) as error:
+            AgentClient(url, key).call("hello")                                                 # the key worked once
+        self.assertEqual(error.exception.code, "bad_signature")
+        self.call("DELETE", "/v1/sites/lan")
 
 
 def make_tar(files, top=""):
@@ -1313,9 +1366,15 @@ class UploadTest(UploadMixin, unittest.TestCase):
         self.assertTrue(excluded("a/b/.DS_Store", False, ["**/.DS_Store"]))
         self.assertFalse(excluded("config/.env", False, [".env"]))                              # only the top level
         for url in ("http://192.168.1.20/rollout-agent-abc123.php", "http://nas.local/site/rollout-agent-abc123.php",
-                    "http://10.0.0.5:8080/a.php", "https://example.com/a.php"):
+                    "http://10.0.0.5:8080/a.php", "https://example.com/a.php",
+                    "http://31.41.59.26/rollout-agent-abc123.php", "http://example.com/a.php"):  # plain http: any address
             self.assertEqual(valid_agent_url(url), url)
-        self.assertIsNone(valid_agent_url("http://example.com/a.php"))                         # plain http: local networks only
+        for url in ("ftp://example.com/a.php", "http://example.com/a.txt", "http://example.com/a.php?x=1",
+                    "https://example.com/a.php#x", "http://exa mple.com/a.php", "http://user@example.com/a.php", ""):
+            self.assertIsNone(valid_agent_url(url))
+        self.assertEqual(pair_secret("k" * 64, "s" * 64), pair_secret("k" * 64, "s" * 64))
+        self.assertNotEqual(pair_secret("k" * 64, "s" * 64), pair_secret("k" * 64, "t" * 64))
+        self.assertRegex(pair_secret("k" * 64, "s" * 64), r"^[0-9a-f]{64}$")
         self.assertEqual(artisan_command("php artisan migrate:status"), "migrate:status")
         for refused in ("serve", "tinker", "queue:work", "a; rm -rf /", "migrate\nstatus"):
             with self.assertRaises(DeployError):
@@ -1576,17 +1635,17 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertNotIn("Backup", job["log"]["text"])                                        # stopped before anything else
 
     def test_07_the_agent_updates_itself(self):
-        template = os.path.join(self.tmp, "agent-1.5.5.php")
+        template = os.path.join(self.tmp, "agent-1.5.6.php")
         with open(hosting_module.TEMPLATE, encoding="utf-8") as f:
-            text = f.read().replace("const RA_VERSION = '1.5.4';", "const RA_VERSION = '1.5.5';")
+            text = f.read().replace("const RA_VERSION = '1.5.5';", "const RA_VERSION = '1.5.6';")
         with open(template, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         before = self.live(self.agent_name)
         with mock.patch.object(hosting_module, "TEMPLATE", template):                          # a newer agent template
             job = self.job("deploy", "1.2.0")
-        self.assertIn("Update the agent file on the hosting (1.5.4 -> 1.5.5)", job["log"]["text"])
+        self.assertIn("Update the agent file on the hosting (1.5.5 -> 1.5.6)", job["log"]["text"])
         after = self.live(self.agent_name)
-        self.assertIn("const RA_VERSION = '1.5.5';", after)
+        self.assertIn("const RA_VERSION = '1.5.6';", after)
         key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", after).group(1)
         self.assertNotIn(key, before)
         with open(os.path.join(self.home, ".rollout-agent-lara", "state.php"), encoding="utf-8") as f:

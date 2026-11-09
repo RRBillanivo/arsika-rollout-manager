@@ -3,12 +3,12 @@ file manager, FTP), no SSH, no root. A virtual machine where one may only drop f
 
 The dashboard generates a PHP agent for the site (runner/agent/rollout-agent.php with the site id, the dashboard's
 address and a one-time key), the user drops it into the website folder, opens it in the browser and clicks "Connect";
-the runner then exchanges a long secret with it. From then on this runner does what it can do itself (GitHub with the
-site's token, uploaded versions, composer, checksums, health checks, keeping the backups) and drives the agent with
-signed requests: upload the release in pieces, unpack it next to the live files, run the release's database changes
-(database/migrations/*.sql, or marked as done by hand; Laravel: php artisan migrate inside PHP), swap the files, keep
-the previous version for a rollback. Long work is split into short requests, so the hosting's PHP time limit is never
-reached.
+both sides then derive a long secret from that key (it never travels, also not over plain http). From then on this
+runner does what it can do itself (GitHub with the site's token, uploaded versions, composer, checksums, health checks,
+keeping the backups) and drives the agent with signed requests: upload the release in pieces, unpack it next to the
+live files, run the release's database changes (database/migrations/*.sql, or marked as done by hand; Laravel: php
+artisan migrate inside PHP), swap the files, keep the previous version for a rollback. Long work is split into short
+requests, so the hosting's PHP time limit is never reached.
 
 Laravel sites (hosting_app "laravel"): only public/ goes into the website folder; the application of every release,
 the .env and storage/ stay in the agent's data folder (outside the website folder when the hosting allows it), so they
@@ -17,7 +17,6 @@ are never served, whatever the web server (Apache, LiteSpeed or nginx).
 import base64
 import hashlib
 import hmac
-import ipaddress
 import json
 import os
 import re
@@ -42,7 +41,7 @@ CHUNK = 4 << 20
 AGENT_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[A-Za-z0-9._~%/-]*)?\.php$")
 STATUS_SECONDS = 30
 LARAVEL_AGENT = "1.5.0"                  # the first agent that runs Laravel sites, edits .env, runs artisan, updates itself
-LAN_SUFFIXES = (".local", ".lan", ".internal", ".home.arpa", ".localdomain")
+PAIR_AGENT = "1.5.5"                     # the first agent that derives its secret from its one-time key (nothing secret is sent)
 ENV_LIMIT = 256 << 10
 ARTISAN_SECONDS = 300
 # artisan commands that wait for input or run until they are stopped: not possible in a request of a web server
@@ -61,25 +60,20 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def local_host(host):
-    """An address of this machine or of a local network (a virtual machine without a certificate)."""
-    host = str(host or "").lower()
-    try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_private or ip.is_loopback or ip.is_link_local
-    except ValueError:
-        return host == "localhost" or "." not in host or host.endswith(LAN_SUFFIXES)
-
-
 def valid_agent_url(url):
-    """https:// address of a .php file; plain http only on this machine or a local network."""
+    """http(s):// address of a .php file. Plain http is allowed (a local network often has no certificate, and its
+    addresses are not always private ones): the release, the .env and backups then travel unencrypted, the secret never."""
     url = str(url or "").strip()
     parts = urlsplit(url)
     if not AGENT_URL.match(url) or parts.query or parts.fragment:
         return None
-    if parts.scheme == "http" and not local_host(parts.hostname):
-        return None
     return url
+
+
+def pair_secret(key, salt):
+    """The secret of a connected agent: derived from the one-time key in the agent file and a random salt, by the runner
+    and by the agent alike, so it never travels (it is safe over plain http too)."""
+    return hmac.new(key.encode(), ("arsika-rollout-manager pair\n" + salt).encode(), hashlib.sha256).hexdigest()
 
 
 def agent_outdated(agent, wanted):
@@ -369,7 +363,8 @@ class Hosting(object):
     def connect(self, site, url):
         url = valid_agent_url(url)
         if not url:
-            raise DeployError("not the address of the agent file: https://<domain>/<folder>/rollout-agent-….php")
+            raise DeployError("not the address of the agent file: https://<domain>/<folder>/rollout-agent-….php "
+                              "(or http://<address>/…)")
         key = self.config.secret_of("agent_keys", site["id"])
         if not key:
             raise DeployError("download the agent file first (the key of an earlier file has been used)")
@@ -381,8 +376,16 @@ class Hosting(object):
                                          ("a writable website folder", info.get("writable"))) if not ok]
         if missing:
             raise DeployError("the hosting is missing " + " and ".join(missing))
-        secret = secrets.token_hex(32)
-        client.call("pair", {"secret": secret})
+        if not agent_outdated(info.get("agent"), PAIR_AGENT):
+            salt = secrets.token_hex(32)
+            client.call("pair", {"salt": salt})
+            secret = pair_secret(key, salt)
+        elif urlsplit(url).scheme == "https":                         # an agent file of an earlier version takes it
+            secret = secrets.token_hex(32)
+            client.call("pair", {"secret": secret})
+        else:
+            raise DeployError("this agent file is from an earlier version (agent %s): download the agent file again, it "
+                              "connects over plain http without sending its secret" % info.get("agent"))
         self.config.set_secret_of("agent_secrets", site["id"], secret)
         self.config.set_secret_of("agent_keys", site["id"], "")
         site["agent_url"], site["path"] = url, str(info.get("site_dir") or "")

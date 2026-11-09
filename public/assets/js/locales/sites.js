@@ -113,7 +113,7 @@ export default {
       steps: [
         'Klik <b>Unduh file agen</b> (perlu kata sandi). File bernama <code>rollout-agent-….php</code> tersimpan di komputer Anda.',
         'Taruh file itu di folder website (hosting: File Manager → <code>public_html</code>; VM: folder yang dilayani web server).',
-        'Buka file itu di browser, mis. <code>https://domain-anda/rollout-agent-….php</code>. Halaman cek muncul dengan kolom alamat cicd yang sudah terisi.',
+        'Buka file itu di browser, mis. <code>https://domain-anda/rollout-agent-….php</code> (jaringan lokal: <code>http://IP-lokal/rollout-agent-….php</code> juga bisa). Halaman cek muncul dengan kolom alamat cicd yang sudah terisi.',
         'Klik <b>Hubungkan ke dasbor</b>, lalu konfirmasi dengan kata sandi. Versi terbaru bisa langsung di-deploy; halaman ini berganti sendiri.',
       ],
       prep_title: 'Persiapan', prep_upload_ok: 'Versi {version} sudah diunggah.', prep_upload_none: 'Belum ada versi: unggah file zip/rar di tab Versi.',
@@ -132,7 +132,7 @@ export default {
       deploy_now_help: 'Hanya kalau folder website masih kosong. Ada file lama: adopsi dulu di halaman situs.',
       deploying: '{name} terhubung. Deploy {version} dimulai.', needs_adopt: '{name} terhubung. Folder website berisi file lama: adopsi dulu di tab Versi.',
       needs_env: '{name} terhubung. Isi .env dulu (tab Versi), lalu deploy.',
-      insecure: 'Alamat ini memakai http tanpa HTTPS. Boleh di jaringan lokal (VM), tetapi isi file dan .env dikirim tanpa enkripsi.',
+      insecure: 'Alamat ini memakai http tanpa HTTPS: boleh (mis. IP lokal), tetapi rilis, .env dan backup dikirim tanpa enkripsi. Kunci sambungan tidak ikut dikirim. Untuk alamat internet sebaiknya pakai HTTPS.',
     },
     history: {
       title: 'Riwayat job',
@@ -370,7 +370,7 @@ export default {
       steps: [
         'Click <b>Download the agent file</b> (password needed). A file named <code>rollout-agent-….php</code> is saved on your computer.',
         'Put the file into the website folder (hosting: file manager → <code>public_html</code>; VM: the folder the web server serves).',
-        'Open the file in the browser, e.g. <code>https://your-domain/rollout-agent-….php</code>. A check appears, with the address of cicd filled in.',
+        'Open the file in the browser, e.g. <code>https://your-domain/rollout-agent-….php</code> (a local network: <code>http://local-IP/rollout-agent-….php</code> works too). A check appears, with the address of cicd filled in.',
         'Click <b>Connect to the dashboard</b> and confirm with your password. The newest version can be deployed at once; this page changes by itself.',
       ],
       prep_title: 'Ready so far', prep_upload_ok: 'Version {version} is uploaded.', prep_upload_none: 'No version yet: upload a zip/rar file in the Versions tab.',
@@ -389,7 +389,7 @@ export default {
       deploy_now_help: 'Only when the website folder is empty. With old files there: adopt them first on the site page.',
       deploying: '{name} connected. Deploying {version}.', needs_adopt: '{name} connected. The website folder holds old files: adopt them first in the Versions tab.',
       needs_env: '{name} connected. Fill in the .env first (Versions tab), then deploy.',
-      insecure: 'This address uses plain http without HTTPS. Fine on a local network (a VM), but files and the .env travel unencrypted.',
+      insecure: 'This address uses plain http without HTTPS: allowed (e.g. a local IP), but the release, the .env and backups travel unencrypted. The connection key is never sent. Use HTTPS for an address on the internet.',
     },
     history: {
       title: 'Job history',

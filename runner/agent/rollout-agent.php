@@ -17,11 +17,12 @@
  *       shared/                        Laravel: .env and storage/ of the site
  *
  * Every request except the page shown in the browser must be signed with the site's secret (HMAC-SHA256 over method,
- * path, timestamp, a one-time nonce and the body). The key written into this file only works once, to connect.
+ * path, timestamp, a one-time nonce and the body). The key written into this file only works once, to connect; the
+ * secret is derived from it on both sides and never travels, so plain http (e.g. a local IP address) is possible too.
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.5.4';
+const RA_VERSION = '1.5.5';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
@@ -188,16 +189,6 @@ function ra_write_file(string $path, string $content, int $mode = 0644): void
 function ra_disabled(string $function): bool
 {
     return !function_exists($function) || in_array($function, array_map('trim', explode(',', (string)ini_get('disable_functions'))), true);
-}
-
-/** An address of this machine or of a local network (a virtual machine without a certificate). */
-function ra_local_host(string $host): bool
-{
-    $host = strtolower(trim($host, '[]'));
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return !filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
-    }
-    return $host === 'localhost' || strpos($host, '.') === false || (bool)preg_match('/\.(local|lan|internal|home\.arpa|localdomain)$/', $host);
 }
 
 function ra_clip(string $text, int $limit = 65536): string
@@ -452,13 +443,14 @@ function ra_rel_list($items): array
 
 // ------------------------------------------------------------------ connecting
 
+/** The secret is derived from the one-time key of this file, as the runner does: it never travels (plain http is safe). */
 function ra_pair(array &$state, array $p): array
 {
-    $secret = (string)($p['secret'] ?? '');
-    if (!preg_match('/^[0-9a-f]{64}$/', $secret)) {
-        throw new RaError(422, 'bad_secret', 'the secret must be 64 hex characters');
+    $salt = (string)($p['salt'] ?? '');
+    if (!preg_match('/^[0-9a-f]{64}$/', $salt)) {
+        throw new RaError(422, 'bad_salt', 'the salt must be 64 hex characters (a runner older than this agent: update it)');
     }
-    $state['secret'] = $secret;
+    $state['secret'] = hash_hmac('sha256', "arsika-rollout-manager pair\n" . $salt, RA_PAIRING_KEY);
     $state['pairing_hash'] = hash('sha256', RA_PAIRING_KEY);
     $state['paired_at'] = gmdate('c');
     $state['nonces'] = [];
@@ -1587,15 +1579,14 @@ function ra_page(): void
             $body = '<p class="ok">Terhubung. Situs ini di-update oleh Arsika Rollout Manager.<br><small>Connected: this website is updated by Arsika Rollout Manager.</small></p>';
         } else {
             $https = strncmp(ra_url(), 'https://', 8) === 0;
-            $lan = !$https && ra_local_host((string)parse_url(ra_url(), PHP_URL_HOST));
             $checks = [                                                // [what, ok | warn | bad, note]
                 ['PHP ' . PHP_VERSION, version_compare(PHP_VERSION, '7.4', '>=') ? 'ok' : 'bad', 'PHP 7.4+'],
                 ['ZipArchive', class_exists('ZipArchive') ? 'ok' : 'bad', 'ekstensi zip / zip extension'],
                 ['zlib', function_exists('gzopen') ? 'ok' : 'bad', 'backup database'],
                 ['PDO: ' . (class_exists('PDO') ? implode(', ', PDO::getAvailableDrivers()) : '–'), class_exists('PDO') ? 'ok' : 'bad', 'database'],
                 ['Folder bisa ditulis / writable', $info !== null && $info['writable'] ? 'ok' : 'bad', ''],
-                ['HTTPS', $https ? 'ok' : ($lan ? 'warn' : 'bad'), $https ? '' : ($lan ? 'http di jaringan lokal: boleh / plain http on a local network: allowed'
-                    : 'buka lewat https:// / open it over https://')],
+                ['HTTPS', $https ? 'ok' : 'warn', $https ? '' : 'http juga boleh (mis. IP lokal), tetapi data dikirim tanpa enkripsi / '
+                    . 'plain http works too (e.g. a local IP), but data travels unencrypted'],
             ];
             $ready = $checks[0][1] === 'ok' && $checks[1][1] === 'ok' && $checks[4][1] === 'ok';
             $rows = '';
