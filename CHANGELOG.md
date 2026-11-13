@@ -3,6 +3,22 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.6.1] — 2026-11-14
+
+### Fixed
+- **A hosting whose clock is off** (e.g. a virtual machine whose clock runs in local time, without NTP) could not be
+  connected: every request ended with "request expired or clock mismatch". A signature still counts for 5 minutes
+  around the receiver's clock, but a request that is signed with the right key and only carries another time is now
+  answered with the receiver's time, proven with that key. The runner then signs with the hosting's time, and an agent
+  that calls the dashboard signs with the dashboard's. The site page warns that the hosting's clock is off (the
+  application there still runs on it), and so does the page of the agent file. Agent 1.6.1; an agent file before
+  1.6.1 on a hosting whose clock is off must be downloaded again.
+- The page of the agent file answered an empty HTTP 500 when PHP cannot write the website folder (e.g. `/var/www/html`
+  of Apache on Debian or Ubuntu, which belongs to root). It now shows **Folder writable ✗** with the reason, and on a
+  server of one's own the command that fixes it (`chown -R www-data:www-data …`).
+- An agent that calls the dashboard and is refused (another key, a call seen before) is told so with HTTP 403. The
+  dashboard turned the runner's 401 into "the runner refused the dashboard" (503), so the agent kept calling.
+
 ## [1.6.0] — 2026-11-10
 
 ### Added

@@ -29,7 +29,9 @@ php artisan migrate inside PHP, the plan of migrations, artisan jobs, rollback, 
 when vendor/ is missing, the PHP version check, the agent replacing itself, adopting a Laravel website, the hidden data
 folder."""
 import base64
+import getpass
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -60,7 +62,8 @@ from arsika_rollout_manager.config import Config  # noqa: E402
 from arsika_rollout_manager.deploy import Deployer, DeployError, merge_user_ini  # noqa: E402
 from arsika_rollout_manager import hosting as hosting_module  # noqa: E402
 from arsika_rollout_manager.hosting import AgentClient, AgentError, artisan_command, pair_secret, valid_agent_url  # noqa: E402
-from arsika_rollout_manager.relay import Relay, RelayError  # noqa: E402
+from arsika_rollout_manager import relay as relay_module  # noqa: E402
+from arsika_rollout_manager.relay import Relay, RelayError, clock_proof  # noqa: E402
 from arsika_rollout_manager.server import Api, ThreadingServer, serve  # noqa: E402
 from arsika_rollout_manager import system  # noqa: E402
 from arsika_rollout_manager.store import Store  # noqa: E402
@@ -1249,6 +1252,29 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(out["error"].code, "lost")
         self.assertLess(time.time() - started, 5)                                              # not after its 60 seconds
 
+    def test_another_clock_is_told_with_a_proof(self):
+        relay, secret, nonce = Relay(wait=5, offline=60), "s" * 64, "e" * 32
+
+        def signed(ts):
+            message = relay_module.poll_message("office", ts, nonce, "1.6.1", "http://10.0.0.5/a.php", "", 0, "", b"")
+            return ts, nonce, hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest(), message
+
+        late = int(time.time()) - 7 * 3600                                                    # the hosting's clock
+        with self.assertRaises(RelayError) as caught:
+            relay.check("office", secret, "", *signed(late))
+        error = caught.exception
+        self.assertEqual((error.status, error.code), (401, "clock"))
+        self.assertIn("7 hours", str(error))
+        self.assertAlmostEqual(error.fields["time"], time.time(), delta=5)
+        self.assertEqual(error.fields["proof"], clock_proof(secret, error.fields["time"], nonce))
+        self.assertEqual(relay.failures["office"], [])                                         # not an invalid question
+        ts, nonce_, signature, message = signed(late)
+        with self.assertRaises(RelayError) as caught:                                           # another key is one
+            relay.check("office", "x" * 64, "", ts, nonce_, signature, message)
+        self.assertEqual((caught.exception.code, str(caught.exception), len(relay.failures["office"])),
+                         ("bad_signature", "invalid signature", 1))
+        self.assertEqual(relay.check("office", secret, "", *signed(late + 7 * 3600)), "secret")   # with the dashboard's time
+
     def test_an_agent_that_does_not_call_is_offline(self):
         relay = Relay(wait=5, offline=1)
         thread, out = self.send_later(relay, "d" * 32)
@@ -1287,7 +1313,7 @@ class FakeDashboard(object):
 
             def do_GET(self):
                 if self.path == "/api/v1/agent/ping":
-                    return self.answer(200, {"data": {"app": "Arsika Rollout Manager"}})
+                    return self.answer(200, {"data": {"app": "Arsika Rollout Manager", "time": int(relay_module.time.time())}})
                 self.answer(404, {"error": {"code": "route_not_found", "message": "not found"}})
 
             def do_POST(self):
@@ -1297,6 +1323,8 @@ class FakeDashboard(object):
                     return self.answer(404, {"error": {"code": "route_not_found", "message": "not found"}})
                 query = {key: self.headers.get(header) or "" for key, header in FakeDashboard.FIELDS}
                 status, doc = runner.request("POST", "/v1/sites/%s/agent/poll?%s" % (match.group(1), urllib.parse.urlencode(query)), raw=body)
+                if status == 401:                                  # as RunnerClient::answer() of the dashboard
+                    status, doc = 503, {"error": {"code": "runner_rejected", "message": "the runner refused the dashboard"}}
                 dashboard.calls.append((match.group(1), query, body, doc))
                 self.answer(status, doc)
 
@@ -1494,14 +1522,15 @@ class PullHostingTest(unittest.TestCase):
     def test_04_refused_calls(self):
         headers = {"X-Rollout-Timestamp": str(int(time.time())), "X-Rollout-Nonce": "a" * 32, "X-Rollout-Signature": "0" * 64,
                    "X-Rollout-Agent": "1.6.0", "X-Rollout-Wait": "0"}
-        for site, code in (("office", 401), ("nowhere", 404)):
+        # a refused agent hears 403: to the dashboard a 401 of the runner means that the runner refused the dashboard itself
+        for site, code, name in (("office", 403, "bad_signature"), ("nowhere", 404, "site_not_found")):
             request = urllib.request.Request(self.dashboard.url + "/api/v1/agent/%s/poll" % site, data=b"", headers=headers, method="POST")
             with self.assertRaises(urllib.error.HTTPError) as error:
                 urllib.request.urlopen(request, timeout=30)
-            self.assertEqual(error.exception.code, code)
+            self.assertEqual((error.exception.code, json.loads(error.exception.read().decode("utf-8"))["error"]["code"]), (code, name))
         _, query, body, _ = [c for c in self.dashboard.calls if c[0] == "office" and "data" in c[3]][-1]
         status, doc = self.client.request("POST", "/v1/sites/office/agent/poll?" + urllib.parse.urlencode(query), raw=body)
-        self.assertEqual((status, doc["error"]["code"]), (401, "replayed"))                      # a call seen before
+        self.assertEqual((status, doc["error"]["code"]), (403, "replayed"))                      # a call seen before
 
     def test_04b_an_agent_that_neither_answers_nor_calls(self):
         self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": "silent", "repo": "o/office", "asset_pattern": "demo_v*.zip"})
@@ -1549,6 +1578,244 @@ def make_tar(files, top=""):
             info.size, info.mode = len(data), 0o644
             t.addfile(info, io.BytesIO(data))
     return buffer.getvalue()
+
+
+class SkewedTime(object):
+    """The time module of a server whose clock is ``skew`` seconds off (only time() differs)."""
+
+    def __init__(self, skew):
+        self.skew = skew
+
+    def time(self):
+        return time.time() + self.skew
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def read_only(folder):
+    """Take away the right to create anything in a folder (POSIX: mode 555, Windows: a deny entry). -> it worked"""
+    if os.name == "nt":
+        subprocess.run(["icacls", folder, "/deny", "%s:(W)" % getpass.getuser()], check=True, stdout=subprocess.DEVNULL)
+    else:
+        os.chmod(folder, 0o555)
+    try:
+        os.mkdir(os.path.join(folder, "probe"))
+    except OSError:
+        return True
+    os.rmdir(os.path.join(folder, "probe"))                                                    # root may write anyway
+    return False
+
+
+def writable_again(folder):
+    if os.name == "nt":
+        subprocess.run(["icacls", folder, "/remove:d", getpass.getuser()], stdout=subprocess.DEVNULL)
+    else:
+        os.chmod(folder, 0o755)
+
+
+class FakeAgent(object):
+    """An agent file that refuses every request with the error ``answer(headers)`` returns."""
+
+    def __init__(self, answer):
+        self.requests = []
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                fake.requests.append(dict(self.headers))
+                payload = json.dumps({"ok": False, "error": answer(self.headers)}).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d/rollout-agent-x.php" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+class AgentClockTest(unittest.TestCase):
+    """The runner signs with the clock of a hosting only when its agent proves that time with the key."""
+
+    def agent(self, answer):
+        agent = FakeAgent(answer)
+        self.addCleanup(stop, agent.server)
+        return agent
+
+    def test_an_agent_file_before_1_6_1(self):
+        agent = self.agent(lambda headers: {"code": "bad_signature", "message": "request expired or clock mismatch"})
+        with self.assertRaises(AgentError) as caught:
+            AgentClient(agent.url, "k" * 64).call("status")
+        self.assertIn("timedatectl set-ntp true", str(caught.exception))
+        self.assertEqual(len(agent.requests), 1)
+
+    def test_a_time_without_its_proof_changes_nothing(self):
+        later = int(time.time()) + 3600
+        agent = self.agent(lambda headers: {"code": "clock", "message": "differ", "fields": {"time": later, "proof": "0" * 64}})
+        clocks = {}
+        with self.assertRaises(AgentError) as caught:
+            AgentClient(agent.url, "k" * 64, site="vm", clocks=clocks).call("status")
+        self.assertEqual((caught.exception.code, clocks, len(agent.requests)), ("clock", {}, 1))
+
+    def test_a_proven_time_is_tried_once(self):
+        def answer(headers):
+            later = int(time.time()) + 3600
+            return {"code": "clock", "message": "differ", "fields": {"time": later, "proof": clock_proof("k" * 64, later, headers["X-Rollout-Nonce"])}}
+
+        agent = self.agent(answer)
+        clocks = {}
+        with self.assertRaises(AgentError):
+            AgentClient(agent.url, "k" * 64, site="vm", clocks=clocks).call("status")
+        self.assertEqual(len(agent.requests), 2)                                                  # once more, then it gives up
+        self.assertAlmostEqual(clocks["vm"], 3600, delta=2)
+        first, second = (int(r["X-Rollout-Timestamp"]) for r in agent.requests)
+        self.assertAlmostEqual(second - first, 3600, delta=2)
+
+
+@unittest.skipUnless(PHP, "PHP is needed to run the hosting agent")
+class ClockTest(unittest.TestCase):
+    """A hosting whose clock is 7 hours ahead (a virtual machine whose clock runs in local time, no NTP). The window of a
+    signature stays 5 minutes: cicd signs with the hosting's time once its agent proved it, and an agent that calls the
+    dashboard signs with the dashboard's time."""
+
+    SKEW = -7 * 3600                                         # the clock of this runner, seen from the hosting
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="rollout-clock-")
+        cls.docroot = os.path.join(cls.tmp, "vm", "html")
+        cls.office = os.path.join(cls.tmp, "office", "html")
+        os.makedirs(cls.docroot)
+        os.makedirs(cls.office)
+        cls.github = FakeGitHub()
+        for version in ("1.0.0", "1.1.0"):
+            cls.github.publish(version, {"index.html": "<h1>%s</h1>" % version, "version.txt": "version " + version}, repo="o/vm")
+        cls.php, cls.port = php_server(cls.docroot)
+        cls.agent_port = free_port()
+        cls.agent_php = php_server(cls.office, ["-d", "max_execution_time=15"], cls.agent_port)[0]
+        cls.web, cls.web_port = php_server(cls.office)
+        config_path = os.path.join(cls.tmp, "etc", "runner.json")
+        os.makedirs(os.path.dirname(config_path))
+        cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
+                                   github_api="http://127.0.0.1:%d" % cls.github.port, site_roots=[cls.tmp], shell=SHELL, port=0,
+                                   health_attempts=3, health_delay=0.3, agent_poll_wait=2, agent_offline_seconds=6)
+        cls.config.prepare_dirs()
+        store = Store(cls.config.state_path("runner.db"))
+        cls.deployer = Deployer(cls.config, store, Backups(cls.config, store))
+        cls.worker = Worker(cls.config, store, cls.deployer)
+        cls.worker.start()
+        cls.server = serve(Api(cls.config, store, cls.deployer, cls.worker))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.client = Client("http://127.0.0.1:%d" % cls.server.server_address[1], cls.config["secret"])
+        cls.dashboard = FakeDashboard(cls.client)
+        cls.pollers = []
+
+    @classmethod
+    def tearDownClass(cls):
+        for poller in cls.pollers:
+            poller.stop()
+        stop(cls.server, cls.github.server, cls.dashboard.server)
+        cls.worker.stopping = True
+        cls.worker.wake.set()
+        for proc in (cls.php, cls.agent_php, cls.web):
+            proc.terminate()
+            proc.wait(10)
+        time.sleep(0.3)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    call = RunnerTest.call
+    wait_job = RunnerTest.wait_job
+    job = HostingTest.job
+    live = HostingTest.live
+    wait_for = PullHostingTest.wait_for
+
+    def skewed(self):
+        """This runner's clock is 7 hours behind the hosting's (signatures, the relay and the dashboard's ping)."""
+        clock = SkewedTime(self.SKEW)
+        for module in (hosting_module, relay_module):
+            patcher = mock.patch.object(module, "time", clock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def add_site(self, site, health_port, dashboard="https://dash.example.com"):
+        self.call("POST", "/v1/sites", {"preset": "hosting-static", "id": site, "repo": "o/vm", "asset_pattern": "demo_v*.zip",
+                                        "health_url": "http://127.0.0.1:%d/version.txt" % health_port, "health_contains": "version {version}"})
+        return self.call("POST", "/v1/sites/%s/agent-file" % site, {"dashboard": dashboard})
+
+    # ---------- tests (run in order) ----------
+    def test_00_the_page_when_php_cannot_write_the_website_folder(self):
+        folder = os.path.join(self.tmp, "locked", "html")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "rollout-agent-x.php"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(hosting_module.Hosting.agent_code({"id": "locked"}, "https://dash.example.com", "ab" * 32))
+        try:
+            if not (read_only(folder) and read_only(os.path.dirname(folder))):
+                self.skipTest("this user may write into any folder")
+            proc, port = php_server(folder)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/rollout-agent-x.php" % port, timeout=30) as response:
+                    status, page = response.status, response.read().decode("utf-8")
+            finally:
+                proc.terminate()
+                proc.wait(10)
+        finally:
+            writable_again(folder)
+            writable_again(os.path.dirname(folder))
+        self.assertEqual(status, 200)                                                             # not an empty error 500
+        self.assertIn('<td>Folder bisa ditulis / writable</td><td class="bad">', page)
+        self.assertIn("cannot create a data folder in", page)
+        self.assertIn("belum bisa menulis di folder ini", page)
+        self.assertNotIn('id="ra-connect"', page)
+
+    def test_01_connect_and_deploy_while_the_clocks_differ(self):
+        self.skewed()
+        agent = self.add_site("vm", self.port)
+        with open(os.path.join(self.docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        details = self.call("POST", "/v1/sites/vm/agent/connect", {"url": "http://127.0.0.1:%d/%s" % (self.port, agent["filename"])})
+        hosting = details["hosting"]
+        self.assertEqual((hosting["connected"], hosting["mode"], hosting["error"]), (True, "direct", ""))
+        self.assertAlmostEqual(hosting["clock"], -self.SKEW, delta=5)                           # shown in the dashboard
+        self.job("deploy", "1.0.0", site="vm")
+        self.assertEqual(self.live("version.txt"), "version 1.0.0")
+        with open(os.path.join(self.tmp, "vm", ".rollout-agent-vm", "state.php"), encoding="utf-8") as f:
+            state = json.loads(f.read().split("\n", 1)[1])
+        self.assertEqual(state.get("failures"), [])                                              # never an invalid request
+
+    def test_02_the_clock_of_the_hosting_is_set_right(self):
+        # NTP corrected the hosting (here: this runner's clock is right again): one request is refused, then cicd follows
+        self.job("deploy", "1.1.0", site="vm")
+        self.assertEqual(self.live("version.txt"), "version 1.1.0")
+        self.assertLess(abs(self.worker.hosting.clocks.get("vm", 0)), 5)
+        self.assertLess(abs(self.call("GET", "/v1/sites/vm")["hosting"].get("clock", 0)), 5)
+
+    def test_03_an_agent_that_calls_the_dashboard(self):
+        self.skewed()
+        agent = self.add_site("office", self.web_port, dashboard=self.dashboard.url)
+        with open(os.path.join(self.office, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        url = "http://127.0.0.1:%d/%s" % (self.agent_port, agent["filename"])
+        with urllib.request.urlopen(url, timeout=30) as response:
+            page = response.read().decode("utf-8")
+        self.assertIn('<td>Jam / Clock</td><td class="warn">', page)                              # the page tells it too
+        self.assertIn("jam server ini lebih cepat 7 jam dari dasbor", page)
+        self.pollers.append(Poller(url))
+        self.wait_for(lambda: self.worker.hosting.relay.online("office", key="pairing"), "the agent calls with the dashboard's time")
+        details = self.call("POST", "/v1/sites/office/agent/connect", {"url": "http://127.0.0.1:1/" + agent["filename"]})
+        hosting = details["hosting"]
+        self.assertEqual((hosting["connected"], hosting["mode"], hosting["error"]), (True, "pull", ""))
+        self.assertAlmostEqual(hosting["clock"], -self.SKEW, delta=5)
+        self.job("deploy", "1.0.0", site="office")
+        with open(os.path.join(self.office, "version.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "version 1.0.0")
+        with open(os.path.join(self.tmp, "office", ".rollout-agent-office", "clock"), encoding="utf-8") as f:
+            self.assertAlmostEqual(int(f.read()), self.SKEW, delta=5)                           # what the agent learned
 
 
 class LogLines(object):

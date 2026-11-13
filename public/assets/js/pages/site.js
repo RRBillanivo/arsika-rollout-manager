@@ -14,6 +14,15 @@ const uploaded = (site) => (site.settings ? site.settings.source : site.source) 
 const envName = (file) => String(file || '.env').replace(/^@shared\//, '');        // Laravel: kept in the agent's data folder
 const laravel = (site) => site.deploy_mode === 'hosting' && site.settings && site.settings.hosting_app === 'laravel';
 
+/** The hosting's clock is off (its agent proved it): cicd signs with that time, the application there runs on it. */
+function clockBox(site) {
+  const seconds = site.hosting && Number(site.hosting.clock);
+  if (!seconds || Math.abs(seconds) < 60) return '';
+  const minutes = Math.round(Math.abs(seconds) / 60);
+  const span = minutes >= 90 ? t('sites.hosting.clock_hours', { n: Math.round(minutes / 6) / 10 }) : t('sites.hosting.clock_minutes', { n: minutes });
+  return `<div class="box box--yellow">${icon('clock')}<div>${t(seconds > 0 ? 'sites.hosting.clock_ahead' : 'sites.hosting.clock_behind', { span })}</div></div>`;
+}
+
 function header(site) {
   const d = (key, params) => t('sites.detail.' + key, params);
   const busy = !!site.active_job;
@@ -47,6 +56,7 @@ function header(site) {
       ? `<br><code class="mono small">${esc(site.hosting.poll_url)}</code>` : ''}
     ${site.state === 'unreachable' && site.hosting && site.hosting.error ? `<br><small>${esc(site.hosting.error)}</small>` : ''}</div></div>` : ''}
   ${site.deploy_mode === 'hosting' && site.state === 'unpaired' ? connectCard(site) : ''}
+  ${clockBox(site)}
   ${busy ? `<div class="box box--blue">${icon('activity')}<div>${t('jobs.in_progress')} ${jobStatusBadge(site.active_job.status)}
     <a href="#/sites/${esc(site.id)}/jobs/${site.active_job.id}">${t('sites.overview.view_log')}</a></div></div>` : ''}`;
 }

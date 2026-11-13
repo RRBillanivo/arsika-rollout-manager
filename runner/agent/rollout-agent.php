@@ -19,10 +19,12 @@
  * Every request except the page shown in the browser must be signed with the site's secret (HMAC-SHA256 over method,
  * path, timestamp, a one-time nonce and the body). The key written into this file only works once, to connect; the
  * secret is derived from it on both sides and never travels, so plain http (e.g. a local IP address) is possible too.
+ * When the clock of this server is more than 5 minutes off, this file answers a request signed with the right key with
+ * its own time, proven with that key, and the runner signs with that time from then on (the same the other way round).
  * Delete this file to disconnect the site.
  */
 
-const RA_VERSION = '1.6.0';
+const RA_VERSION = '1.6.1';
 const RA_SITE = '__RA_SITE__';
 const RA_DASHBOARD = '__RA_DASHBOARD__';
 const RA_PAIRING_KEY = '__RA_PAIRING_KEY__';
@@ -46,12 +48,14 @@ final class RaError extends Exception
 {
     public $status;
     public $name;
+    public $fields;
 
-    public function __construct(int $status, string $name, string $message)
+    public function __construct(int $status, string $name, string $message, array $fields = [])
     {
         parent::__construct($message);
         $this->status = $status;
         $this->name = $name;
+        $this->fields = $fields;
     }
 }
 
@@ -312,20 +316,27 @@ function ra_auth(array &$state, string $action, string $body, array $request): s
     $signature = (string)($request['signature'] ?? '');
     $message = "POST\n" . (string)($request['uri'] ?? '') . "\n" . $ts . "\n" . $nonce . "\n" . hash('sha256', $body);
     $used = null;
+    $key = '';
     $secret = (string)($state['secret'] ?? '');
-    if (abs($now - $ts) <= RA_WINDOW && preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
+    if (preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
         if ($secret !== '' && hash_equals(hash_hmac('sha256', $message, $secret), $signature)) {
-            $used = 'secret';
+            list($used, $key) = ['secret', $secret];
         } elseif (in_array($action, ['hello', 'pair'], true) && ra_pairing_open($state)
             && hash_equals(hash_hmac('sha256', $message, RA_PAIRING_KEY), $signature)) {
-            $used = 'pairing';
+            list($used, $key) = ['pairing', RA_PAIRING_KEY];
         }
     }
     if ($used === null) {
         $failures[] = $now;
         $state['failures'] = $failures;
         ra_save($state);
-        throw new RaError(401, 'bad_signature', abs($now - $ts) > RA_WINDOW ? 'request expired or clock mismatch' : 'invalid signature');
+        throw new RaError(401, 'bad_signature', 'invalid signature');
+    }
+    if (abs($now - $ts) > RA_WINDOW) {
+        // the right key, another clock (e.g. a virtual machine whose clock runs in local time): the runner signs again
+        // with the time of this server, which the proof shows to come from this file (not counted as an invalid request)
+        throw new RaError(401, 'clock', 'the clocks of this hosting and of the dashboard differ by ' . ra_span($now - $ts)[1],
+            ['time' => $now, 'proof' => ra_clock_proof($key, $now, $nonce)]);
     }
     $nonces = array_filter($state['nonces'] ?? [], function ($t) use ($now) { return $t > $now - 2 * RA_WINDOW; });
     if (isset($nonces[$nonce])) {
@@ -335,6 +346,56 @@ function ra_auth(array &$state, string $action, string $body, array $request): s
     $state['nonces'] = $nonces;
     $state['failures'] = $failures;
     return $used;
+}
+
+/** A proof of this server's time: HMAC with the key that signed the refused message, over the time and its nonce. */
+function ra_clock_proof(string $key, int $time, string $nonce): string
+{
+    return hash_hmac('sha256', "arsika-rollout-manager clock\n" . $time . "\n" . $nonce, $key);
+}
+
+/** How far apart two clocks are, for people. -> [Indonesian, English] */
+function ra_span(int $seconds): array
+{
+    $minutes = (int)round(abs($seconds) / 60);
+    if ($minutes < 90) {
+        return [$minutes . ' menit', $minutes . ' minutes'];
+    }
+    $hours = rtrim(rtrim(number_format($minutes / 60, 1, '.', ''), '0'), '.');
+    return [$hours . ' jam', $hours . ' hours'];
+}
+
+/** Seconds to add to this server's clock for the dashboard's time (learned from the dashboard; 0 on most hostings). */
+function ra_clock(): int
+{
+    if (!isset($GLOBALS['ra_clock'])) {
+        $GLOBALS['ra_clock'] = 0;
+        try {
+            $GLOBALS['ra_clock'] = (int)@file_get_contents(ra_data() . '/clock');
+        } catch (Throwable $ignored) {
+        }
+    }
+    return $GLOBALS['ra_clock'];
+}
+
+/**
+ * The dashboard refused a call signed with the right key because the clocks differ, and told its time, proven with that
+ * key and the call's nonce (an answer that is not proven changes nothing). From now on the calls carry its time.
+ */
+function ra_clock_learn(array $doc, string $key, string $nonce): bool
+{
+    $error = $doc['error'] ?? null;
+    $time = $error['fields']['time'] ?? null;
+    if (!is_array($error) || ($error['code'] ?? '') !== 'clock' || !is_int($time)
+        || !hash_equals(ra_clock_proof($key, $time, $nonce), (string)($error['fields']['proof'] ?? ''))) {
+        return false;
+    }
+    $GLOBALS['ra_clock'] = $time - time();
+    try {
+        ra_write_file(ra_data() . '/clock', (string)$GLOBALS['ra_clock'], 0600);
+    } catch (Throwable $ignored) {
+    }
+    return true;
 }
 
 /** The key in this file connects once; a new file (new key) may connect again (whoever uploads it controls the hosting). */
@@ -1650,19 +1711,22 @@ function ra_poll_problem(int $status, string $answer, string $error, string $loc
     return 'the dashboard answered HTTP ' . $status . ' (is ' . RA_DASHBOARD . ' the address of Arsika Rollout Manager?)';
 }
 
-/** For the page: can this hosting call the dashboard? Needed when the dashboard's server cannot open this address. -> [ok|warn, note] */
+/**
+ * For the page: can this hosting call the dashboard? Needed when the dashboard's server cannot open this address.
+ * -> [ok|warn, note, the dashboard's time (null: not known)]
+ */
 function ra_dashboard_check(): array
 {
     if (!ra_calls_out()) {
-        return ['warn', 'PHP tidak bisa membuat request keluar (aktifkan curl) / PHP cannot make requests (enable curl)'];
+        return ['warn', 'PHP tidak bisa membuat request keluar (aktifkan curl) / PHP cannot make requests (enable curl)', null];
     }
     list($status, $answer, $error, $location) = ra_http('GET', ra_dashboard('/api/v1/agent/ping'),
         ['User-Agent: arsika-rollout-agent/' . RA_VERSION, 'Accept: application/json'], '', 6);
     $doc = json_decode($answer, true);
     if ($status === 200 && is_array($doc) && isset($doc['data']['app'])) {
-        return ['ok', 'dasbor menjawab / the dashboard answers'];
+        return ['ok', 'dasbor menjawab / the dashboard answers', is_int($doc['data']['time'] ?? null) ? $doc['data']['time'] : null];
     }
-    return ['warn', ra_poll_problem($status, $answer, $error, $location)];
+    return ['warn', ra_poll_problem($status, $answer, $error, $location), null];
 }
 
 /** Remember how the calls go (under the lock of the requests). -> the state */
@@ -1706,11 +1770,10 @@ function ra_poll_key(array $state): string
     return $secret !== '' ? $secret : (ra_pairing_open($state) ? RA_PAIRING_KEY : '');
 }
 
-/** The signed headers of one call. */
-function ra_poll_headers(string $key, string $url, ?array $answer, int $wait): array
+/** The signed headers of one call (with the dashboard's time). */
+function ra_poll_headers(string $key, string $url, ?array $answer, int $wait, string $nonce): array
 {
-    $ts = (string)time();
-    $nonce = bin2hex(random_bytes(16));
+    $ts = (string)(time() + ra_clock());
     $fields = [RA_VERSION, $url, (string)($answer['nonce'] ?? ''), (string)(int)($answer['status'] ?? 0), (string)($answer['type'] ?? '')];
     $message = implode("\n", array_merge(['POLL', RA_SITE, $ts, $nonce], $fields, [hash('sha256', (string)($answer['body'] ?? ''))]));
     return ['Content-Type: application/octet-stream', 'User-Agent: arsika-rollout-agent/' . RA_VERSION, 'X-Rollout-Timestamp: ' . $ts,
@@ -1725,13 +1788,19 @@ function ra_poll_headers(string $key, string $url, ?array $answer, int $wait): a
  */
 function ra_poll_call(string $key, string $url, ?array $answer, int $wait): array
 {
-    list($status, $body, $error, $location) = ra_http('POST', ra_dashboard('/api/v1/agent/' . rawurlencode(RA_SITE) . '/poll'),
-        ra_poll_headers($key, $url, $answer, $wait), (string)($answer['body'] ?? ''), $wait + 25);
-    $doc = json_decode($body, true);
-    if ($status === 200 && is_array($doc) && isset($doc['data']) && is_array($doc['data'])) {
-        return [$status, $doc['data'], ''];
+    for ($try = 1; ; $try++) {
+        $nonce = bin2hex(random_bytes(16));
+        list($status, $body, $error, $location) = ra_http('POST', ra_dashboard('/api/v1/agent/' . rawurlencode(RA_SITE) . '/poll'),
+            ra_poll_headers($key, $url, $answer, $wait, $nonce), (string)($answer['body'] ?? ''), $wait + 25);
+        $doc = json_decode($body, true);
+        if ($status === 200 && is_array($doc) && isset($doc['data']) && is_array($doc['data'])) {
+            return [$status, $doc['data'], ''];
+        }
+        if ($try === 1 && $status >= 400 && is_array($doc) && ra_clock_learn($doc, $key, $nonce)) {
+            continue;                                                // the clocks differ: once more, with the dashboard's time
+        }
+        return [$status, is_array($doc) ? $doc : [], ra_poll_problem($status, $body, $error, $location)];
     }
-    return [$status, is_array($doc) ? $doc : [], ra_poll_problem($status, $body, $error, $location)];
 }
 
 /** Run a request of the runner taken from the dashboard (signed by the runner, checked like a request to this file). */
@@ -1991,7 +2060,8 @@ function ra_handle(array $request, string $body, array $query): array
         return [200, $json, ra_json(['ok' => true, 'data' => $result])];
     } catch (RaError $error) {
         $GLOBALS['ra_artisan_done'] = true;                          // answered here: the artisan guard stays quiet
-        return [$error->status, $json, ra_json(['ok' => false, 'error' => ['code' => $error->name, 'message' => $error->getMessage()]])];
+        $detail = ['code' => $error->name, 'message' => $error->getMessage()] + ($error->fields ? ['fields' => $error->fields] : []);
+        return [$error->status, $json, ra_json(['ok' => false, 'error' => $detail])];
     } catch (Throwable $error) {
         $GLOBALS['ra_artisan_done'] = true;
         return [500, $json, ra_json(['ok' => false, 'error' => ['code' => 'agent_error', 'message' => $error->getMessage()]])];
@@ -2004,6 +2074,24 @@ function ra_handle(array $request, string $body, array $query): array
 }
 
 // ------------------------------------------------------------------ the page in the browser
+
+/** For the page: how to let PHP write into the website folder (on one's own server, one command as root). */
+function ra_writable_hint(callable $e): string
+{
+    $user = $group = '';
+    if (!ra_disabled('posix_geteuid') && !ra_disabled('posix_getpwuid') && !ra_disabled('posix_getegid') && !ra_disabled('posix_getgrgid')) {
+        $user = (string)(@posix_getpwuid(posix_geteuid())['name'] ?? '');
+        $group = (string)(@posix_getgrgid(posix_getegid())['name'] ?? '');
+    }
+    $who = $user !== '' ? ' (user ' . $e($user) . ')' : '';
+    $text = '<p>PHP' . $who . ' belum bisa menulis di folder ini. Di server sendiri (VM/VPS), jalankan perintah ini sebagai root lalu muat ulang '
+        . 'halaman ini; di hosting, atur izin folder lewat file manager-nya.<br><small>PHP' . $who . ' cannot write to this folder. On your own '
+        . 'server (VM/VPS) run this as root and reload this page; on a hosting, set the permissions of the folder in its file manager.</small></p>';
+    if ($user !== '' && $user !== 'root') {
+        $text .= '<p><code>chown -R ' . $e($user . ($group !== '' ? ':' . $group : '')) . ' ' . $e(__DIR__) . '</code></p>';
+    }
+    return $text;
+}
 
 function ra_page(): void
 {
@@ -2031,12 +2119,14 @@ function ra_page(): void
     if (ra_is_template()) {
         $body = '<p class="bad">Ini file contoh. Unduh file agen dari dasbor (Situs → Hosting → Unduh file agen).<br><small>This is the template: download the agent file from the dashboard.</small></p>';
     } else {
+        $problem = '';
         try {
             $state = ra_load();
             $info = ra_info($state);
         } catch (Throwable $error) {
             $state = [];
             $info = null;
+            $problem = $error->getMessage();                         // e.g. PHP cannot write into the website folder
         }
         if ($info !== null && $info['paired'] && $info['mode'] === 'pull') {
             $cron = ra_url() . '?poll=run';
@@ -2049,22 +2139,35 @@ function ra_page(): void
         } elseif ($info !== null && $info['paired']) {
             $body = '<p class="ok">Terhubung. Situs ini di-update oleh Arsika Rollout Manager.<br><small>Connected: this website is updated by Arsika Rollout Manager.</small></p>';
         } else {
-            if (ra_pairing_open($state)) {
-                ra_poll_note(['until' => time() + 900]);             // the page is open: this file may call the dashboard
+            if ($info !== null && ra_pairing_open($state)) {
+                try {
+                    ra_poll_note(['until' => time() + 900]);         // the page is open: this file may call the dashboard
+                } catch (Throwable $error) {
+                    $problem = $error->getMessage();
+                }
             }
             $https = strncmp(ra_url(), 'https://', 8) === 0;
             $dash = ra_dashboard_check();
+            $writable = $info !== null && $info['writable'] && $problem === '';
             $checks = [                                                // [what, ok | warn | bad, note]
                 ['PHP ' . PHP_VERSION, version_compare(PHP_VERSION, '7.4', '>=') ? 'ok' : 'bad', 'PHP 7.4+'],
                 ['ZipArchive', class_exists('ZipArchive') ? 'ok' : 'bad', 'ekstensi zip / zip extension'],
                 ['zlib', function_exists('gzopen') ? 'ok' : 'bad', 'backup database'],
                 ['PDO: ' . (class_exists('PDO') ? implode(', ', PDO::getAvailableDrivers()) : '–'), class_exists('PDO') ? 'ok' : 'bad', 'database'],
-                ['Folder bisa ditulis / writable', $info !== null && $info['writable'] ? 'ok' : 'bad', ''],
+                ['Folder bisa ditulis / writable', $writable ? 'ok' : 'bad', $problem],
                 ['HTTPS', $https ? 'ok' : 'warn', $https ? '' : 'http juga boleh (mis. IP lokal), tetapi data dikirim tanpa enkripsi / '
                     . 'plain http works too (e.g. a local IP), but data travels unencrypted'],
                 ['Menghubungi dasbor / Calls the dashboard', $dash[0], $dash[1] . ($dash[0] === 'ok' ? '' : ' (perlu kalau server cicd tidak bisa '
                     . 'membuka alamat ini, mis. jaringan lain / needed when the cicd server cannot open this address, e.g. another network)')],
             ];
+            if ($dash[2] !== null && abs(time() - $dash[2]) >= 60) {                // the application here runs on this clock
+                list($id, $en) = ra_span(time() - $dash[2]);
+                $ahead = time() > $dash[2];
+                $checks[] = ['Jam / Clock', 'warn', 'jam server ini ' . ($ahead ? 'lebih cepat ' : 'lebih lambat ') . $id . ' dari dasbor; '
+                    . 'cicd menyesuaikan sendiri, tetapi aplikasi di sini memakai jam ini: setel jamnya (NTP, mis. timedatectl set-ntp true) / '
+                    . "this server's clock is " . $en . ($ahead ? ' ahead of' : ' behind') . " the dashboard's; cicd adapts to it, but the "
+                    . 'application here runs on this clock: set it (NTP, e.g. timedatectl set-ntp true)'];
+            }
             $ready = $checks[0][1] === 'ok' && $checks[1][1] === 'ok' && $checks[4][1] === 'ok';
             $rows = '';
             foreach ($checks as $check) {
@@ -2089,7 +2192,8 @@ function ra_page(): void
                 . $poller(true);
             $body = '<p>File agen untuk situs <b>' . $e(RA_SITE) . '</b>. Periksa alamat dasbor, klik Hubungkan, lalu konfirmasi di dasbor.<br><small>Agent file of the site '
                 . $e(RA_SITE) . ': check the address of the dashboard, click Connect, then confirm in the dashboard.</small></p><table>' . $rows . '</table>'
-                . ($ready ? $form : '<p class="bad">Tempat ini belum memenuhi syarat di atas. / This place does not meet the requirements above.</p>');
+                . ($ready ? $form : '<p class="bad">Tempat ini belum memenuhi syarat di atas. / This place does not meet the requirements above.</p>'
+                    . ($writable ? '' : ra_writable_hint($e)));
         }
     }
     echo '<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'

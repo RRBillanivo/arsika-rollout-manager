@@ -30,7 +30,8 @@ that runs all the time …) need a full server (VPS / VM with the runner) for th
 | PHP | 7.4 or newer, run by the web server (the agent is a normal PHP page); Laravel 11/12 needs PHP 8.2+ |
 | Extensions | `zip` (ZipArchive, required); `zlib` for database backups; `pdo_mysql` (or `pdo_sqlite`) for database changes and backups |
 | Disabled functions | fine: the agent needs no `exec`, `putenv`, `symlink` … (aaPanel's default `disable_functions` works; without `symlink` there is no public storage link) |
-| Folder | the website folder (e.g. `public_html`) must be writable by PHP, as it is on most hostings |
+| Folder | the website folder (e.g. `public_html`) must be writable by PHP, as it is on most hostings. On a server of your own with Apache or nginx from the distribution, `/var/www/html` belongs to root: `chown -R www-data:www-data /var/www/html` (the agent page shows the command) |
+| Clock | any: when the hosting's clock is more than 5 minutes off, cicd signs with the hosting's time (the agent proves it) and the site page warns about it, because the application on the hosting runs on that clock |
 | Address | HTTPS, or plain `http://` (e.g. a local IP address without a certificate), marked **No HTTPS**: the release, the `.env` and backups then travel unencrypted, the connection secret never does |
 | Reachable | the **dashboard's server** opens the address of the agent file; when it cannot (a hosting in another network without a public address, e.g. an office server), the hosting must be able to open the **dashboard's address** instead: then the agent calls the dashboard ([below](#a-hosting-in-another-network)) |
 
@@ -223,9 +224,11 @@ backups for them); big databases take longer.
 ## Security
 
 - The agent answers only requests signed with the site's secret: HMAC-SHA256 over method, address, timestamp
-  (±5 minutes) and body, with a one-time nonce. After 30 invalid requests in 10 minutes it stops answering for 10
-  minutes. The one-time key in the file works once, only to connect; a file the runner writes when it updates the
-  agent has a key that is marked as used.
+  (±5 minutes around the hosting's clock) and body, with a one-time nonce. After 30 invalid requests in 10 minutes it
+  stops answering for 10 minutes. A request with the right signature but another time is answered with the hosting's
+  time, proven with the key; the runner signs with that time from then on (an agent that calls the dashboard does the
+  same with the dashboard's time). A time without its proof changes nothing. The one-time key in the file works once,
+  only to connect; a file the runner writes when it updates the agent has a key that is marked as used.
 - The page in the browser shows the checks and the connect form only before the site is connected; afterwards it says
   only that the site is connected.
 - The agent only works inside its website folder and its data folder: paths with `..`, absolute paths and unsafe
@@ -259,6 +262,9 @@ backups for them); big databases take longer.
 | Calls the dashboard: the dashboard answered HTTP 302 … Cloudflare Access | A sign-in in front of the dashboard: add a *Bypass* rule for the path `/api/v1/agent/` |
 | Calls the dashboard: SSL certificate problem | PHP on the hosting cannot check the dashboard's certificate: set `curl.cainfo` in its `php.ini` (Windows: download `cacert.pem` from curl.se) |
 | the PHP extension zip is not enabled | Enable `zip` in the panel (PHP settings / extensions) |
+| The page of the agent file: HTTP ERROR 500 (agent before 1.6.1), or **Folder writable ✗** | PHP cannot write the website folder, e.g. `/var/www/html` of Apache on Debian/Ubuntu belongs to root: run `chown -R www-data:www-data /var/www/html` as root (aaPanel: user `www`), then reload the page |
+| request expired or clock mismatch (agent before 1.6.1) | The hosting's clock is more than 5 minutes off: set it (`timedatectl set-ntp true`), or download the agent file again; from 1.6.1 on cicd adapts to the hosting's clock |
+| The clock of the hosting is … ahead of / behind the cicd server | cicd adapts, but the application on the hosting runs on that clock: enable NTP (`timedatectl set-ntp true`). A Proxmox VM whose clock is a few hours off: VM → Options → *Use local time for RTC* = No |
 | the file .env with the database settings is not on the hosting | The site has database changes or backups but its environment file is missing: upload it, or fill it in with **Edit .env** |
 | the .env of the site is not set yet | Laravel: **Edit .env** on the site page, then deploy again |
 | the release needs PHP … and the hosting runs PHP … | Choose a newer PHP version in the hosting's panel |

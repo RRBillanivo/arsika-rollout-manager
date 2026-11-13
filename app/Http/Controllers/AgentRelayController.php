@@ -27,10 +27,10 @@ final class AgentRelayController extends Controller
         $this->servers = $servers;
     }
 
-    /** GET /api/v1/agent/ping — the agent's page checks that the hosting can reach the dashboard. */
+    /** GET /api/v1/agent/ping — the agent's page checks that the hosting can reach the dashboard (and compares the clocks). */
     public function ping(Request $request): Response
     {
-        return Response::json(['app' => 'Arsika Rollout Manager']);
+        return Response::json(['app' => 'Arsika Rollout Manager', 'time' => time()]);
     }
 
     /**

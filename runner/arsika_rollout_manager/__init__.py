@@ -4,4 +4,4 @@ restores their data. Runs as root and accepts requests signed by the dashboard (
 dashboard on the same server, on HTTPS with a pinned certificate for a dashboard on another server. Standard library
 only, Python 3.6+."""
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"

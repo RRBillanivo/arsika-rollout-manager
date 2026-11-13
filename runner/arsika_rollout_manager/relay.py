@@ -10,6 +10,14 @@ agent is signed as well, with the site's secret (or with the one-time key of its
 
 A request is identified by its nonce, which its signature covers, so an answer cannot be given to another request.
 Everything waits in memory: when the runner restarts, a request in progress fails and the agent asks again.
+
+Clocks: a signed message counts for WINDOW seconds around the receiver's time. When the clocks of the two sides differ by
+more (a virtual machine whose clock runs in local time, a hosting without NTP), the receiver refuses a message that is
+signed with the right key with the error "clock" and its own time, proven with the same key and the message's nonce:
+
+    hex HMAC-SHA256(key, "arsika-rollout-manager clock" \\n TIME \\n NONCE)
+
+The sender then signs with the receiver's time (its own clock plus the difference). The window stays as it was.
 """
 import collections
 import hashlib
@@ -26,9 +34,14 @@ NONCE = re.compile(r"^[0-9a-f]{16,64}$")
 
 
 class RelayError(Exception):
-    def __init__(self, status, code, message):
+    def __init__(self, status, code, message, fields=None):
         Exception.__init__(self, message)
-        self.status, self.code = status, code
+        self.status, self.code, self.fields = status, code, fields or {}
+
+
+def clock_proof(key, when, nonce):
+    """The receiver's time, proven with the key that signed the refused message and with that message's nonce."""
+    return hmac.new(key.encode(), ("arsika-rollout-manager clock\n%d\n%s" % (when, nonce)).encode(), hashlib.sha256).hexdigest()
 
 
 def poll_message(site, ts, nonce, agent, url, result, status, kind, body):
@@ -68,15 +81,20 @@ class Relay(object):
             self.failures[site] = failures
             if len(failures) >= LOCKOUT[0]:
                 raise RelayError(429, "locked", "too many invalid requests: try again in 10 minutes")
-            used = None
-            if abs(now - ts) <= WINDOW and NONCE.match(nonce):
+            used = signer = None
+            if NONCE.match(nonce):
                 for name, value in (("secret", secret), ("pairing", key)):
                     if value and hmac.compare_digest(hmac.new(value.encode(), message.encode(), hashlib.sha256).hexdigest(), signature):
-                        used = name
+                        used, signer = name, value
                         break
             if used is None:
                 failures.append(now)
-                raise RelayError(401, "bad_signature", "request expired or clock mismatch" if abs(now - ts) > WINDOW else "invalid signature")
+                raise RelayError(401, "bad_signature", "invalid signature")
+            if abs(now - ts) > WINDOW:
+                # the right key, another clock: the agent signs again with this time (not counted as an invalid question)
+                when = int(now)
+                raise RelayError(401, "clock", "the clocks of the hosting and of the dashboard differ by %s" % ago(abs(now - ts)),
+                                 {"time": when, "proof": clock_proof(signer, when, nonce)})
             nonces = {n: t for n, t in self.nonces.get(site, {}).items() if t > now - 2 * WINDOW}
             if nonce in nonces:
                 raise RelayError(401, "replayed", "request already used")

@@ -46,7 +46,8 @@ not in a public issue.
 - Docker Compose: a bind mount into the release that does not exist stops a deployment (Docker would silently create an
   empty folder in its place).
 - Hosting agents: a generated PHP file per site answers only requests signed with that site's secret (timestamp ±5
-  minutes, one-time nonce, lockout after repeated invalid requests); the key written into the file works once, to
+  minutes, one-time nonce, lockout after repeated invalid requests; a hosting whose clock is further off proves its time
+  with the key and the runner signs with it, the window stays the same); the key written into the file works once, to
   connect; the agent works only inside its website and data folders, refuses unsafe archives, never runs shell
   commands, and keeps its secret outside the web root when the hosting allows it (inside it: a random folder name and
   an `.htaccess` that denies access). Backups are moved off the hosting. Laravel applications live outside the website

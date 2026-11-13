@@ -57,8 +57,8 @@ A sign-in in front of the dashboard (e.g. Cloudflare Access) must let `/api/v1/a
 
 | Method | Path | |
 |---|---|---|
-| GET | `/agent/ping` | `{"data": {"app": …}}`: the agent's page checks that the hosting can reach the dashboard |
-| POST | `/agent/{site}/poll` | raw body: the agent's answer to the runner's last request; headers `X-Rollout-Timestamp`, `X-Rollout-Nonce`, `X-Rollout-Signature`, `X-Rollout-Agent`, `X-Rollout-Agent-Url`, `X-Rollout-Result`, `X-Rollout-Result-Status`, `X-Rollout-Result-Type`, `X-Rollout-Wait`. Passed on to the runner of the site → `{"command": request or null}` or `{"stop": "direct"}` |
+| GET | `/agent/ping` | `{"data": {"app": …, "time": unix seconds}}`: the agent's page checks that the hosting can reach the dashboard and compares the clocks |
+| POST | `/agent/{site}/poll` | raw body: the agent's answer to the runner's last request; headers `X-Rollout-Timestamp`, `X-Rollout-Nonce`, `X-Rollout-Signature`, `X-Rollout-Agent`, `X-Rollout-Agent-Url`, `X-Rollout-Result`, `X-Rollout-Result-Status`, `X-Rollout-Result-Type`, `X-Rollout-Wait`. Passed on to the runner of the site → `{"command": request or null}` or `{"stop": "direct"}`. A refused call gets 403 (`bad_signature`, `replayed`; `locked`: 429). A call with the right signature that is more than 300 s off the runner's clock gets 403 `clock` with `fields: {time, proof}`, proof = hex HMAC-SHA256(key, `arsika-rollout-manager clock` \n time \n nonce of the call): the agent signs again with that time |
 
 ## Runner API (`/v1`, used by the dashboard and `python3 -m arsika_rollout_manager`)
 
@@ -93,7 +93,9 @@ X-Rollout-Signature: hex HMAC-SHA256(secret, METHOD "\n" PATH_WITH_QUERY "\n" TI
 
 `POST ?action=<name>[&…]`, signed like the runner API (`X-Rollout-Timestamp` ±300 s, `X-Rollout-Nonce`,
 `X-Rollout-Signature` over `POST`, the path with the query, timestamp, nonce and the body's SHA-256) with the site's
-secret; `hello` and `pair` also with the file's one-time key until it is used. Actions: `hello`, `pair`, `status`,
+secret; `hello` and `pair` also with the file's one-time key until it is used. A request with the right signature that
+is more than 300 s off the hosting's clock gets 401 `clock` with `fields: {time, proof}` (the proof as above, with the
+key of the request): the runner signs with the hosting's time from then on. Actions: `hello`, `pair`, `status`,
 `upload` (raw body, `name`, `offset`), `finish-upload`, `extract` (in steps), `migrate`, `activate`, `delete-release`,
 `backup` (in steps), `download`, `clear`, `restore-files`, `restore-db`, `forget`; from 1.5.0 `self-update` (`code`:
 the agent of the runner's version), `env-read` / `env-write` (`file`, `content`), `laravel-prepare`, `laravel-finish`,

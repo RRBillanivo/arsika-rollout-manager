@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 
 from . import __version__
 from .deploy import RUNNER_DIR, DeployError
-from .relay import Relay, RelayError, poll_message
+from .relay import Relay, RelayError, clock_proof, poll_message
 from .sites import release_pattern, site_url
 from .uploads import UploadError, long_path, pack, php_satisfies, prepare_tree, project_root, unpack
 from .util import VERSION, ensure_dir, exists, human_size, now, remove, sha256_file, stamp, version_key, write_private
@@ -157,13 +157,16 @@ def artisan_command(command):
 class AgentClient(object):
     """Signed requests to the agent of a site: over HTTP to its address, or (``relay``) through the dashboard when the
     agent calls the dashboard itself (a hosting in another network). ``auth`` names the key: the site's "secret" or the
-    one-time key of the agent file ("pairing") while it connects."""
+    one-time key of the agent file ("pairing") while it connects. ``clocks`` (site -> seconds) keeps how far the clock of
+    each hosting is from this server's, as its agent proved it: requests are signed with the hosting's time."""
 
-    def __init__(self, url, secret, timeout=120, relay=None, site="", auth="secret"):
+    def __init__(self, url, secret, timeout=120, relay=None, site="", auth="secret", clocks=None):
         self.url = url
         self.secret = secret
         self.timeout = timeout
         self.relay, self.site, self.auth = relay, site, auth
+        self.clocks = clocks if clocks is not None else {}
+        self.clock_key = site or url
         self.chunk = PULL_CHUNK if relay is not None else CHUNK          # pieces of uploads and downloads
         self.opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
@@ -173,22 +176,32 @@ class AgentClient(object):
         url = self.url + "?" + urlencode(sorted(params.items()))
         body = raw if raw is not None else json.dumps(data or {}).encode("utf-8")
         parts = urlsplit(url)
-        ts, nonce = int(time.time()), secrets.token_hex(16)
         target = "%s?%s" % (parts.path, parts.query)
-        message = "POST\n%s\n%d\n%s\n%s" % (target, ts, nonce, hashlib.sha256(body).hexdigest())
-        headers = {"X-Rollout-Timestamp": str(ts), "X-Rollout-Nonce": nonce, "User-Agent": "arsika-rollout-manager/" + __version__,
-                   "X-Rollout-Signature": hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest(),
-                   "Content-Type": "application/octet-stream" if raw is not None else "application/json"}
-        status, kind, content, location = self.send(url, target, body, headers)
-        if status in (301, 302, 303, 307, 308):
-            raise AgentError("the agent address redirects to %s: use that address" % location, "redirect", status)
-        if status >= 400:
+        for attempt in (1, 2):
+            # the hosting's time: the clock of this server plus the difference its agent proved (none on most hostings)
+            ts, nonce = int(time.time()) + self.clocks.get(self.clock_key, 0), secrets.token_hex(16)
+            message = "POST\n%s\n%d\n%s\n%s" % (target, ts, nonce, hashlib.sha256(body).hexdigest())
+            headers = {"X-Rollout-Timestamp": str(ts), "X-Rollout-Nonce": nonce, "User-Agent": "arsika-rollout-manager/" + __version__,
+                       "X-Rollout-Signature": hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest(),
+                       "Content-Type": "application/octet-stream" if raw is not None else "application/json"}
+            status, kind, content, location = self.send(url, target, body, headers)
+            if status in (301, 302, 303, 307, 308):
+                raise AgentError("the agent address redirects to %s: use that address" % location, "redirect", status)
+            if status < 400:
+                break
             try:
                 error = json.loads(content.decode("utf-8")).get("error") or {}
-            except ValueError:
+            except (ValueError, AttributeError):
                 raise AgentError("the hosting answered HTTP %d instead of the agent (is the file there? a firewall of the hosting?)"
                                  % status, "http", status)
-            raise AgentError(str(error.get("message") or "agent error"), str(error.get("code") or ""), status, error)
+            if attempt == 1 and self.learn_clock(error, nonce):
+                continue                                             # the clocks differ: once more, with the hosting's time
+            message = str(error.get("message") or "agent error")
+            if error.get("code") == "bad_signature" and "clock mismatch" in message:          # an agent file before 1.6.1
+                message = ("the clocks of the hosting and of this server differ by more than 5 minutes: set the clock of the "
+                           "hosting (NTP, e.g. timedatectl set-ntp true) or download the agent file again (from 1.6.1 on it "
+                           "adapts to the clock)")
+            raise AgentError(message, str(error.get("code") or ""), status, error)
         if binary:
             return content
         if "json" not in kind:
@@ -198,6 +211,17 @@ class AgentClient(object):
             error = doc.get("error") or {}
             raise AgentError(str(error.get("message") or "agent error"), str(error.get("code") or ""))
         return doc.get("data")
+
+    def learn_clock(self, error, nonce):
+        """The agent refused a request signed with the right key because the clocks differ, and told its time, proven with
+        that key and the request's nonce (an answer that is not proven changes nothing). -> sign again"""
+        fields = error.get("fields") if isinstance(error, dict) else None
+        if error.get("code") != "clock" or not isinstance(fields, dict) or type(fields.get("time")) is not int:
+            return False
+        if not hmac.compare_digest(clock_proof(self.secret, fields["time"], nonce), str(fields.get("proof") or "")):
+            return False
+        self.clocks[self.clock_key] = fields["time"] - int(time.time())
+        return True
 
     def send(self, url, target, body, headers):
         """-> (status, content type, bytes, redirect address)"""
@@ -243,6 +267,7 @@ class Hosting(object):
         self.backups = deployer.backups
         self.uploads = deployer.uploads
         self.cache = {}
+        self.clocks = {}                                              # site -> seconds its hosting's clock is ahead (proven)
         self.relay = Relay(wait=int(config.get("agent_poll_wait", 20)), offline=int(config.get("agent_offline_seconds", 120)))
 
     @staticmethod
@@ -270,8 +295,8 @@ class Hosting(object):
             raise DeployError("the hosting of this site is not connected yet: download the agent file in the dashboard, upload it "
                               "with the file manager of the hosting, open it and click Connect")
         if self.pulls(site):
-            return AgentClient(site["agent_url"], secret, timeout, relay=self.relay, site=site["id"])
-        return AgentClient(site["agent_url"], secret, timeout)
+            return AgentClient(site["agent_url"], secret, timeout, relay=self.relay, site=site["id"], clocks=self.clocks)
+        return AgentClient(site["agent_url"], secret, timeout, site=site["id"], clocks=self.clocks)
 
     @staticmethod
     def pulls(site):
@@ -366,12 +391,14 @@ class Hosting(object):
                     self_update=not agent_outdated(status.get("agent"), LARAVEL_AGENT), **mode)
 
     def mode_info(self, site):
-        """direct: this runner opens the address of the agent; pull: the agent calls the dashboard (another network)."""
+        """direct: this runner opens the address of the agent; pull: the agent calls the dashboard (another network).
+        clock: seconds the hosting's clock is ahead of this server's, when its agent had to prove it (more than 5 minutes)."""
+        clock = {"clock": self.clocks[site["id"]]} if self.clocks.get(site["id"]) else {}
         if not self.pulls(site):
-            return {"mode": "direct"}
+            return dict({"mode": "direct"}, **clock)
         since = self.relay.last_seen(site["id"])
-        return {"mode": "pull", "last_seen": None if since is None else int(since), "online": self.relay.online(site["id"]),
-                "poll_url": str(site.get("agent_url") or "") + "?poll=run"}
+        return dict({"mode": "pull", "last_seen": None if since is None else int(since), "online": self.relay.online(site["id"]),
+                     "poll_url": str(site.get("agent_url") or "") + "?poll=run"}, **clock)
 
     # ------------------------------------------------------------------ the agent file itself
     def require_agent(self, site, client, info, log=None, wanted=LARAVEL_AGENT):
@@ -434,7 +461,7 @@ class Hosting(object):
         # an agent whose page is open calls the dashboard: when this runner cannot open the address of the hosting
         # (another network, no public address), the agent keeps calling instead and takes its requests that way
         calling = self.relay.online(site["id"], key="pairing")
-        client, mode = AgentClient(url, key, timeout=PROBE_SECONDS if calling else 30), ""
+        client, mode = AgentClient(url, key, timeout=PROBE_SECONDS if calling else 30, site=site["id"], clocks=self.clocks), ""
         try:
             info = client.call("hello")
         except AgentError as e:
@@ -444,7 +471,8 @@ class Hosting(object):
                 raise DeployError("%s; the agent file has not called the dashboard either: open it in a browser on the network of "
                                   "the hosting and keep its page open until it is connected (its row \"Calls the dashboard\" "
                                   "must be OK)" % e)
-            client, mode = AgentClient(url, key, timeout=30, relay=self.relay, site=site["id"], auth="pairing"), "pull"
+            client, mode = AgentClient(url, key, timeout=30, relay=self.relay, site=site["id"], auth="pairing",
+                                       clocks=self.clocks), "pull"
             info = client.call("hello")
         if info.get("site") != site["id"]:
             raise DeployError("this agent file belongs to the site %s, not %s" % (info.get("site"), site["id"]))
@@ -503,6 +531,7 @@ class Hosting(object):
         self.config.set_secret_of("agent_secrets", site["id"], "")
         self.config.set_secret_of("agent_keys", site["id"], "")
         self.forget_cache(site)
+        self.clocks.pop(site["id"], None)
         self.relay.forget(site["id"])
         if exists(self.pending_env_path(site)):
             os.unlink(self.pending_env_path(site))

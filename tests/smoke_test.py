@@ -19,9 +19,12 @@ connecting (password), connecting, the plan of migrations, a deployment with php
 (password), the activity log."""
 import argparse
 import base64
+import hashlib
+import hmac
 import http.cookiejar
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -375,6 +378,20 @@ def remote_tests(admin, password, tmp, github, args, logs, run_job):
             agent.terminate()
 
 
+def poll_call(relay, site, key, ts, nonce, url):
+    """One call of an agent to the public route of the dashboard, signed with ``key`` (None: a wrong signature)."""
+    message = "\n".join(["POLL", site, str(ts), nonce, "1.6.1", url, "", "0", "", hashlib.sha256(b"").hexdigest()])
+    headers = {"X-Rollout-Timestamp": str(ts), "X-Rollout-Nonce": nonce, "X-Rollout-Agent": "1.6.1", "X-Rollout-Agent-Url": url,
+               "X-Rollout-Result": "", "X-Rollout-Result-Status": "0", "X-Rollout-Result-Type": "", "X-Rollout-Wait": "0",
+               "X-Rollout-Signature": hmac.new(key.encode(), message.encode(), hashlib.sha256).hexdigest() if key else "0" * 64}
+    request = urllib.request.Request(relay + "/api/v1/agent/%s/poll" % site, data=b"", headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8") or "{}")
+
+
 def pull_tests(admin, password, tmp, github, agent_php, php, env, logs, base, run_job):
     """A hosting in another network (no address the dashboard's server can open): its agent calls the dashboard (the
     public route /api/v1/agent/<site>/poll, passed on to the runner) and takes the runner's requests that way."""
@@ -395,6 +412,10 @@ def pull_tests(admin, password, tmp, github, agent_php, php, env, logs, base, ru
         relay = "http://127.0.0.1:%d" % relay_port
         status, doc = None, None
         check("public route for agents: /api/v1/agent/ping", wait_for(relay + "/api/v1/agent/ping"))
+        with urllib.request.urlopen(relay + "/api/v1/agent/ping", timeout=30) as response:
+            ping = json.loads(response.read().decode("utf-8"))["data"]
+        check("the ping tells the dashboard's time (the agent page compares the clocks)", abs(ping.get("time", 0) - time.time()) < 10,
+              json.dumps(ping))
         site = {"preset": "hosting-static", "id": "office", "name": "Office", "repo": "o/office", "source": "source",
                 "deploy_mode": "hosting", "health_url": "http://127.0.0.1:%d/version.txt" % web_port, "health_contains": "version {version}",
                 "password": password}
@@ -409,6 +430,18 @@ def pull_tests(admin, password, tmp, github, agent_php, php, env, logs, base, ru
         with urllib.request.urlopen(url, timeout=30) as response:
             page = response.read().decode("utf-8")
         check("the agent page: the dashboard answers its call", '<td>Menghubungi dasbor / Calls the dashboard</td><td class="ok">' in page)
+        # an agent whose clock is 7 hours off: the right key, another time -> the runner's time with a proof of that key
+        key = re.search(r"const RA_PAIRING_KEY = '([0-9a-f]{64})';", content).group(1)
+        status, answer = poll_call(relay, "office", key, int(time.time()) - 7 * 3600, "f" * 32, url)
+        fields = (answer.get("error") or {}).get("fields") or {}
+        proof = hmac.new(key.encode(), ("arsika-rollout-manager clock\n%s\n%s" % (fields.get("time"), "f" * 32)).encode(),
+                         hashlib.sha256).hexdigest()
+        check("another clock: the dashboard answers 403 clock with its time and the proof", status == 403
+              and answer["error"]["code"] == "clock" and abs(fields.get("time", 0) - time.time()) < 10 and fields.get("proof") == proof,
+              "%s %s" % (status, json.dumps(answer)[:300]))
+        status, answer = poll_call(relay, "office", None, int(time.time()), "e" * 32, url)
+        check("a refused agent hears 403 bad_signature (not 503 'the runner refused the dashboard')",
+              status == 403 and answer["error"]["code"] == "bad_signature", "%s %s" % (status, json.dumps(answer)[:300]))
 
         def keep_open():                                             # the agent's page stays open in a browser
             while not halt.is_set():

@@ -511,7 +511,8 @@ class Api(object):
         try:
             return self.hosting.poll(record, query, raw)
         except RelayError as e:
-            raise ApiError(e.status, e.code, str(e))
+            # to the dashboard, 401 means that the runner refused the dashboard: a refused agent is told with 403
+            raise ApiError(403 if e.status == 401 else e.status, e.code, str(e), e.fields)
 
     def plan(self, site, query, data):
         return self.hosting.plan(self.hosting_site(site), str(query.get("version") or ""))
