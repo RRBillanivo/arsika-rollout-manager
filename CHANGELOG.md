@@ -3,6 +3,15 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.6.2] — 2026-11-19
+
+### Fixed
+- **A hosting site set to Laravel after a first deployment** failed with "release … has no vendor/ folder": the runner
+  reused the release it had downloaded from GitHub while the site was still plain files, and the hosting reused the
+  copy it had unpacked then. A Laravel release is now kept under its own name on the runner (downloaded again and
+  completed with composer), and a copy on the hosting without vendor/ is uploaded again once. The agent is unchanged
+  (1.6.1).
+
 ## [1.6.1] — 2026-11-14
 
 ### Fixed

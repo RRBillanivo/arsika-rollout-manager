@@ -1846,9 +1846,9 @@ class UploadMixin(object):
         cls = type(self)
         config_path = os.path.join(cls.tmp, "etc", "runner.json")
         os.makedirs(os.path.dirname(config_path))
+        options.setdefault("github_api", "http://127.0.0.1:9")
         cls.config = Config.create(config_path, state_dir=os.path.join(cls.tmp, "state"), backup_dir=os.path.join(cls.tmp, "backup"),
-                                   github_api="http://127.0.0.1:9", shell=SHELL, port=0, health_attempts=2, health_delay=0.3,
-                                   **options)
+                                   shell=SHELL, port=0, health_attempts=2, health_delay=0.3, **options)
         cls.config.prepare_dirs()
         store = Store(cls.config.state_path("runner.db"))
         cls.deployer = Deployer(cls.config, store, Backups(cls.config, store))
@@ -2118,11 +2118,13 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         os.environ["FAKE_COMPOSER_AUTOLOAD"] = autoload
         cls.php, cls.port = php_server(cls.docroot, AAPANEL_PHP)                       # as strict as aaPanel
         cls.extra_php = []
-        UploadMixin.runner(cls(), "laravel", site_roots=[cls.tmp], composer_command=[sys.executable, FAKE_COMPOSER])
+        cls.github = FakeGitHub()
+        UploadMixin.runner(cls(), "laravel", site_roots=[cls.tmp], composer_command=[sys.executable, FAKE_COMPOSER],
+                           github_api="http://127.0.0.1:%d" % cls.github.port)
 
     @classmethod
     def tearDownClass(cls):
-        stop(cls.server)
+        stop(cls.server, cls.github.server)
         cls.worker.stopping = True
         cls.worker.wake.set()
         for proc in [cls.php] + cls.extra_php:
@@ -2345,6 +2347,34 @@ class LaravelHostingTest(UploadMixin, unittest.TestCase):
         self.assertEqual(job["message"], "deployed 1.0.0 again")
         self.assertEqual(self.page(port), "app 1.0.0 env=Three key=set public=web storage=ok")
         self.assertIn("Arsika Rollout Manager", self.live("index.php", docroot))
+
+    def test_12_a_site_set_to_laravel_later_gets_vendor_from_composer(self):
+        self.github.publish_source("o/lara", "1.0.0", laravel_files("1.0.0", vendor=False, junk=False))
+        home = os.path.join(self.tmp, "home5")
+        docroot = os.path.join(home, "public_html")
+        os.makedirs(docroot)
+        proc, port = php_server(docroot, AAPANEL_PHP)
+        self.extra_php.append(proc)
+        self.call("POST", "/v1/sites", {"preset": "hosting-laravel", "id": "gh", "repo": "o/lara", "source": "source",
+                                        "health_contains": "app {version}"})
+        self.call("PUT", "/v1/sites/gh/env", {"content": "APP_NAME=Gh\nAPP_KEY=\nDB_CONNECTION=sqlite\nDB_DATABASE=%s\n"
+                                                         % os.path.join(self.tmp, "gh.sqlite").replace("\\", "/")})
+        agent = self.call("POST", "/v1/sites/gh/agent-file", {"dashboard": "https://dash.example.com"})
+        with open(os.path.join(docroot, agent["filename"]), "w", encoding="utf-8", newline="\n") as f:
+            f.write(agent["content"])
+        self.call("POST", "/v1/sites/gh/agent/connect", {"url": "http://127.0.0.1:%d/%s" % (port, agent["filename"])})
+        plain = laravel_files("1.0.0", vendor=False, junk=False)            # left from when the site was plain files
+        with open(self.config.state_path("downloads", "hosting-gh-1.0.0.zip"), "wb") as f:
+            f.write(make_zip(plain))
+        for name, text in plain.items():
+            path = os.path.join(home, ".rollout-agent-gh", "releases", "1.0.0", name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        job = self.job("deploy", "1.0.0", site="gh")
+        self.assertIn("has no vendor/ folder; uploading the release again", job["log"]["text"])
+        self.assertIn("Install the PHP dependencies with composer", job["log"]["text"])
+        self.assertEqual(self.page(port), "app 1.0.0 env=Gh key=set public=web storage=ok")
 
     def test_09_an_old_data_folder_in_the_website_folder_gets_a_hidden_name(self):
         docroot = os.path.join(self.tmp, "home3", "public_html")

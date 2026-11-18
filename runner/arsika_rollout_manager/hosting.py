@@ -638,7 +638,9 @@ class Hosting(object):
 
     # ------------------------------------------------------------------ releases
     def archive_path(self, site, version):
-        return self.config.state_path("downloads", "hosting-%s-%s.zip" % (site["id"], re.sub(r"[^A-Za-z0-9._-]", "-", version)))
+        # a completed Laravel archive (vendor/ added) never reuses a download kept from before the site was set to Laravel
+        kind = "-laravel" if self.is_laravel(site) else ""
+        return self.config.state_path("downloads", "hosting-%s-%s%s.zip" % (site["id"], re.sub(r"[^A-Za-z0-9._-]", "-", version), kind))
 
     def fetch_release(self, site, version, log):
         """The release zip on this server: an uploaded version, or the GitHub release downloaded once for the plan and
@@ -922,7 +924,15 @@ class Hosting(object):
         # an adopted website already runs this version, so its database has these changes: mark them as done unless asked
         mode = str(job["params"].get("migrations") or ("manual" if adopt else "auto"))
         if laravel:
-            self.laravel_prepare(site, client, version, adopt, log)
+            try:
+                self.laravel_prepare(site, client, version, adopt, log)
+            except AgentError as e:
+                if e.code != "no_vendor" or not on_hosting or again:
+                    raise
+                # unpacked while the site was not set to Laravel yet: replace it with the release completed by composer
+                log.line("the copy of %s on the hosting has no vendor/ folder; uploading the release again" % version)
+                self.upload_release(site, client, version, log, info)
+                self.laravel_prepare(site, client, version, adopt, log)
             self.laravel_migrate(site, client, version, mode, log)
         else:
             self.migrate(site, client, version, mode, log)
