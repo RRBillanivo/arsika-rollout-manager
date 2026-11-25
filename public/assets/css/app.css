@@ -989,6 +989,9 @@ code { font-family: var(--mono); font-size: .88em; background: var(--bg-2); padd
 /* releases */
 .release-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
 .pager { display: flex; width: fit-content; max-width: 100%; margin: 14px auto 0; }
+.card--table .pager { margin-bottom: 14px; }
+.pager__gap { align-self: center; padding: 0 4px; color: var(--muted); }
+.nowrap { white-space: nowrap; }
 .check-list { list-style: none; padding: 0; margin: 0 0 12px; display: grid; gap: 6px; }
 .check-list li { display: flex; align-items: center; gap: 8px; }
 .upload-card progress { width: 100%; height: 10px; accent-color: var(--primary, #4f46e5); }

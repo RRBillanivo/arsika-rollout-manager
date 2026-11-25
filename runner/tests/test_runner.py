@@ -55,7 +55,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from arsika_rollout_manager import __main__ as cli  # noqa: E402
-from arsika_rollout_manager.backup import Backups, settings_from_env  # noqa: E402
+from arsika_rollout_manager.backup import BackupError, Backups, settings_from_env  # noqa: E402
 from arsika_rollout_manager.client import Client, PinError  # noqa: E402
 from arsika_rollout_manager.compose import ComposeError  # noqa: E402
 from arsika_rollout_manager.config import Config  # noqa: E402
@@ -521,6 +521,34 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(settings_from_env({"MYSQL_DATABASE": "shop", "MYSQL_USER": "shop"})["engine"], "mysql")
         self.assertIsNone(settings_from_env({"DB_CONNECTION": "sqlite", "DB_DATABASE": "/data/app.sqlite"})["engine"])
         self.assertIsNone(settings_from_env({"APP_KEY": "x"}))
+
+    def test_16b_mariadb_client_and_a_server_without_tls(self):
+        # MariaDB 11.4+ clients stop when the server has no TLS: the dump and the restore connect once more without it
+        backups, log = Backups(self.config, None), mock.Mock()
+        db = {"engine": "mysql", "where": "host", "host": "127.0.0.1", "port": "3306", "name": "app", "user": "u", "password": "p"}
+        calls = []
+
+        def client(argv, *rest):
+            calls.append(argv)
+            if "--skip-ssl" not in argv:
+                raise BackupError('database dump failed: mysqldump: Got error: 2026: "TLS/SSL error: SSL is required, but the '
+                                  'server does not support it" when trying to connect')
+            open(rest[0], "ab").close()                                  # the dump file (written, or read by the restore)
+
+        target = os.path.join(self.tmp, "no-tls.sql.gz")
+        with mock.patch("arsika_rollout_manager.backup._find", return_value="/usr/bin/mariadb-dump"), \
+                mock.patch.object(backups, "_stream_out", side_effect=client), \
+                mock.patch.object(backups, "_stream_in", side_effect=client), \
+                mock.patch.object(backups, "database", return_value=db):
+            self.assertEqual(backups._dump({"id": "demo"}, db, target, log)["engine"], "mysql")
+            self.assertEqual([len(calls), calls[1][2], calls[1][:2] + calls[1][3:]], [2, "--skip-ssl", calls[0]])
+            self.assertFalse(os.path.exists(calls[0][1].split("=", 1)[1]))            # the password file is removed
+            backups._restore_database({"id": "demo"}, target, {"engine": "mysql"}, log)
+            self.assertEqual([len(calls), calls[3][2]], [4, "--skip-ssl"])
+            calls.clear()
+            with mock.patch.object(backups, "_stream_out", side_effect=BackupError("database dump failed: Access denied")):
+                with self.assertRaisesRegex(BackupError, "Access denied"):         # other errors are not tried again
+                    backups._dump({"id": "demo"}, db, target, log)
 
     def test_17_init_options(self):
         folder = os.path.join(self.tmp, "init")

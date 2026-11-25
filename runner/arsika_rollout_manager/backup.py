@@ -33,6 +33,8 @@ ENGINES = {"mysql": "MySQL/MariaDB", "postgres": "PostgreSQL"}
 PORTS = {"mysql": "3306", "postgres": "5432"}
 SCHEMES = {"mysql": "mysql", "mysql2": "mysql", "mariadb": "mysql", "postgres": "postgres", "postgresql": "postgres",
            "pgsql": "postgres"}
+# MariaDB 11.4+ clients ask for TLS by default and stop (error 2026) when the server has none, e.g. MariaDB 10.x of aaPanel
+NO_TLS = "SSL is required, but the server does not support it"
 
 # ---------- scripts run inside a database container (POSIX sh; credentials from the container's environment) ----------
 _SECRET = r'''set -e
@@ -285,7 +287,10 @@ class Backups(object):
                     "--no-tablespaces", "--default-character-set=utf8mb4", db["name"]]
             log.line("dumping database %s with %s" % (db["name"], mysqldump))
         try:
-            self._stream_out(argv, target, env, db)
+            if cleanup:                                              # mysqldump on this server
+                self._without_tls(lambda a: self._stream_out(a, target, env, db), argv, log)
+            else:
+                self._stream_out(argv, target, env, db)
         finally:
             if cleanup:
                 os.unlink(cleanup)
@@ -307,6 +312,18 @@ class Backups(object):
         errors.seek(0)
         if code != 0:
             raise BackupError("database dump failed: " + self._hint(_last_line(errors.read(), code), db))
+
+    @staticmethod
+    def _without_tls(run, argv, log):
+        """Run a mysql/mariadb client; when it asked for TLS the server does not have, run it once more without TLS (as
+        older clients and the site itself connect). The client stops before it reads or writes any data."""
+        try:
+            run(argv)
+        except BackupError as e:
+            if NO_TLS not in str(e):
+                raise
+            log.line("the database server does not support TLS: connecting again without it (--skip-ssl)")
+            run(argv[:2] + ["--skip-ssl"] + argv[2:])             # --defaults-extra-file must stay the first option
 
     @staticmethod
     def _hint(message, db):
@@ -472,7 +489,10 @@ class Backups(object):
                 cleanup = self._defaults_file(db)
                 argv = [mysql, "--defaults-extra-file=" + cleanup, "--default-character-set=utf8mb4", db["name"]]
         try:
-            self._stream_in(argv, dump, env)
+            if cleanup:                                              # the mysql client on this server
+                self._without_tls(lambda a: self._stream_in(a, dump, env), argv, log)
+            else:
+                self._stream_in(argv, dump, env)
         finally:
             if cleanup:
                 os.unlink(cleanup)

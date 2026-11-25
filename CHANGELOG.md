@@ -3,6 +3,20 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.6.4] — 2026-11-26
+
+### Fixed
+- **Backups of a MySQL/MariaDB database on the server failed with "TLS/SSL error: SSL is required, but the server does
+  not support it"**: MariaDB 11.4 and newer clients (`mysqldump`, `mysql`) ask for an encrypted connection by default
+  and stop when the database server has none, like the MariaDB of aaPanel. The dump, and the restore of a backup, now
+  connect once more without TLS when the server answers this, as older clients and the site itself do. Other errors
+  are reported as before.
+
+### Changed
+- **The history and the backups of a site are shown 5 per page too**, like its versions. With more than 7 pages only
+  the first, the last and the pages next to the current one have a button (1 … 9 10 11 … 20). A job number no longer
+  breaks over two lines. The agent is unchanged (1.6.1).
+
 ## [1.6.3] — 2026-11-25
 
 ### Changed

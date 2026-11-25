@@ -152,14 +152,28 @@ function releaseItem(site, release) {
 
 const PER_PAGE = 5;
 
-/** One page of the versions (newest first) and, when there are more than 5, the page buttons below them. */
-function releasePage(site, releases, page) {
-  const pages = Math.ceil(releases.length / PER_PAGE);
-  const buttons = Array.from({ length: pages }, (_, i) => i + 1).map((n) => (n === page
-    ? `<button type="button" class="tabs__item tabs__item--active" aria-current="page" data-page="${n}">${n}</button>`
-    : `<button type="button" class="tabs__item" data-page="${n}">${n}</button>`)).join('');
-  return `<ul class="release-list">${releases.slice((page - 1) * PER_PAGE, page * PER_PAGE).map((r) => releaseItem(site, r)).join('')}</ul>
-    ${pages > 1 ? `<nav class="tabs pager" aria-label="${t('sites.versions.pages')}">${buttons}</nav>` : ''}`;
+/** Page buttons for ``count`` items (none for 5 or fewer): all of up to 7 pages, else the first, the last and the
+ * pages next to the current one, e.g. 1 … 9 10 11 … 20. */
+function pager(count, page) {
+  const pages = Math.ceil(count / PER_PAGE);
+  if (pages < 2) return '';
+  const shown = Array.from({ length: pages }, (_, i) => i + 1)
+    .filter((n) => pages <= 7 || n === 1 || n === pages || Math.abs(n - page) <= 1);
+  const buttons = shown.map((n, i) => (n - (shown[i - 1] || 0) > 1 ? '<span class="pager__gap" aria-hidden="true">…</span>' : '')
+    + (n === page
+      ? `<button type="button" class="tabs__item tabs__item--active" aria-current="page" data-page="${n}">${n}</button>`
+      : `<button type="button" class="tabs__item" data-page="${n}">${n}</button>`));
+  return `<nav class="tabs pager" aria-label="${t('common.pages')}">${buttons.join('')}</nav>`;
+}
+
+/** ``items`` (newest first) 5 at a time in ``box``: html(the items of one page), then the page buttons. */
+function paginate(box, items, html) {
+  const show = (page) => { box.innerHTML = html(items.slice((page - 1) * PER_PAGE, page * PER_PAGE)) + pager(items.length, page); };
+  show(1);
+  box.addEventListener('click', (e) => {
+    const button = e.target.closest('[data-page]');
+    if (button) show(Number(button.dataset.page));
+  });
 }
 
 /** Upload a zip, rar, 7z or tar archive as a new version (sent in pieces; the runner unpacks and checks it). */
@@ -222,16 +236,11 @@ async function versionsTab(container, site, isCurrent, refresh = false) {
     <div class="card__header"><h2 class="card__title">${icon(fromUploads ? 'package' : 'github')}${v(fromUploads ? 'title_upload' : 'title')}</h2>
       <button type="button" class="btn btn--ghost btn--small" data-refresh-releases>${icon('refresh')}${v(fromUploads ? 'refresh_upload' : 'refresh')}</button></div>
     ${data.error ? `<div class="box box--red">${icon('alert')}<div>${v('github_error', { message: data.error })}</div></div>` : ''}
-    ${releases.length ? `<div data-release-page>${releasePage(site, releases, 1)}</div>` : `<p class="muted">${v(fromUploads ? 'none_upload' : 'none')}</p>`}
+    ${releases.length ? '<div data-page-box></div>' : `<p class="muted">${v(fromUploads ? 'none_upload' : 'none')}</p>`}
   </section>
   ${laravel(site) && site.state === 'ready' ? artisanCard(site) : ''}`;
-  const pageBox = container.querySelector('[data-release-page]');
-  if (pageBox) {
-    pageBox.addEventListener('click', (e) => {
-      const button = e.target.closest('[data-page]');
-      if (button) pageBox.innerHTML = releasePage(site, releases, Number(button.dataset.page));
-    });
-  }
+  const box = container.querySelector('[data-page-box]');
+  if (box) paginate(box, releases, (page) => `<ul class="release-list">${page.map((r) => releaseItem(site, r)).join('')}</ul>`);
 }
 
 // ---------- History ----------
@@ -240,18 +249,19 @@ async function historyTab(container, site, isCurrent) {
   container.innerHTML = '<div class="skeleton skeleton--table"></div>';
   const { data: jobs } = await get(`jobs?site=${site.id}&limit=100`);
   if (!isCurrent()) return;
-  container.innerHTML = `<section class="card card--table">${jobs.length ? `<div class="table-scroll"><table class="table">
+  container.innerHTML = `<section class="card card--table">${jobs.length ? '<div data-page-box></div>'
+    : `<div class="empty">${icon('clock', 'icon--large')}<p>${t('sites.history.empty')}</p></div>`}</section>`;
+  if (jobs.length) paginate(container.querySelector('[data-page-box]'), jobs, (page) => `<div class="table-scroll"><table class="table">
     <thead><tr><th>${h('job')}</th><th>${h('type')}</th><th>${h('version')}</th><th>${h('status')}</th><th>${h('actor')}</th><th>${h('started')}</th><th class="right">${h('duration')}</th><th>${h('result')}</th></tr></thead>
-    <tbody>${jobs.map((j) => `<tr>
-      <td data-label="${h('job')}"><a href="#/sites/${esc(site.id)}/jobs/${j.id}" class="mono">#${j.id}</a></td>
+    <tbody>${page.map((j) => `<tr>
+      <td data-label="${h('job')}"><a href="#/sites/${esc(site.id)}/jobs/${j.id}" class="mono nowrap">#${j.id}</a></td>
       <td data-label="${h('type')}">${jobType(j.type)}</td>
       <td data-label="${h('version')}" class="mono">${j.from_version && j.to_version && j.from_version !== j.to_version ? `${esc(j.from_version)} → ${esc(j.to_version)}` : esc(j.to_version || j.version || '–')}</td>
       <td data-label="${h('status')}">${jobStatusBadge(j.status)}</td>
       <td data-label="${h('actor')}">${esc(j.actor || '–')}</td>
       <td data-label="${h('started')}" class="muted">${formatDateTime(j.started_at || j.created_at, true)}</td>
       <td data-label="${h('duration')}" class="right muted">${j.started_at ? duration(j.started_at, j.finished_at) : '–'}</td>
-      <td data-label="${h('result')}" class="small">${esc(j.message || '')}</td></tr>`).join('')}</tbody></table></div>`
-    : `<div class="empty">${icon('clock', 'icon--large')}<p>${t('sites.history.empty')}</p></div>`}</section>`;
+      <td data-label="${h('result')}" class="small">${esc(j.message || '')}</td></tr>`).join('')}</tbody></table></div>`);
 }
 
 // ---------- Backups ----------
@@ -269,9 +279,11 @@ async function backupsTab(container, site, isCurrent) {
       <p class="small muted">${b('lead', { keep: site.settings.backup_keep })}</p></div>
       ${site.state === 'ready' || site.state === 'classic' ? `<button type="button" class="btn btn--primary btn--small" data-backup ${site.active_job || !configured ? 'disabled' : ''}>${icon('archive')}${b('create')}</button>` : ''}</div>
     ${!configured ? `<div class="box box--yellow">${icon('info')}<div>${b('not_configured')}</div></div>` : ''}
-    ${backups.length ? `<div class="table-scroll"><table class="table">
+    ${backups.length ? '<div data-page-box></div>' : `<div class="empty">${icon('archive', 'icon--large')}<p>${b('empty')}</p></div>`}
+  </section>`;
+  if (backups.length) paginate(container.querySelector('[data-page-box]'), backups, (page) => `<div class="table-scroll"><table class="table">
       <thead><tr><th>${c('time')}</th><th>${c('version')}</th><th>${c('contents')}</th><th class="right">${c('size')}</th><th>${c('reason')}</th><th></th></tr></thead>
-      <tbody>${backups.map((x) => `<tr>
+      <tbody>${page.map((x) => `<tr>
         <td data-label="${c('time')}"><b>${formatDateTime(x.created_at, true)}</b><small class="block muted mono">${esc(x.id)}</small></td>
         <td data-label="${c('version')}">${versionPill(x.version)}</td>
         <td data-label="${c('contents')}">${x.has_database ? `<span class="badge badge--admin">${icon('database')}${b('database')}</span>` : ''}
@@ -281,8 +293,7 @@ async function backupsTab(container, site, isCurrent) {
         <td data-label="${c('reason')}" class="small muted">${esc(x.reason || '')}</td>
         <td class="right cell-actions">${site.state === 'ready' ? `<button type="button" class="btn btn--outline btn--small" data-restore="${esc(x.id)}" ${site.active_job ? 'disabled' : ''}>${icon('rollback')}${b('restore')}</button>` : ''}
           <button type="button" class="icon-btn icon-btn--danger" data-delete-backup="${esc(x.id)}" aria-label="${t('common.delete')}" title="${t('common.delete')}">${icon('trash')}</button></td>
-      </tr>`).join('')}</tbody></table></div>` : `<div class="empty">${icon('archive', 'icon--large')}<p>${b('empty')}</p></div>`}
-  </section>`;
+      </tr>`).join('')}</tbody></table></div>`);
 }
 
 // ---------- Settings ----------
