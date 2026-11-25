@@ -150,6 +150,18 @@ function releaseItem(site, release) {
     <div class="release__actions">${actions}${removeUpload}</div></li>`;
 }
 
+const PER_PAGE = 5;
+
+/** One page of the versions (newest first) and, when there are more than 5, the page buttons below them. */
+function releasePage(site, releases, page) {
+  const pages = Math.ceil(releases.length / PER_PAGE);
+  const buttons = Array.from({ length: pages }, (_, i) => i + 1).map((n) => (n === page
+    ? `<button type="button" class="tabs__item tabs__item--active" aria-current="page" data-page="${n}">${n}</button>`
+    : `<button type="button" class="tabs__item" data-page="${n}">${n}</button>`)).join('');
+  return `<ul class="release-list">${releases.slice((page - 1) * PER_PAGE, page * PER_PAGE).map((r) => releaseItem(site, r)).join('')}</ul>
+    ${pages > 1 ? `<nav class="tabs pager" aria-label="${t('sites.versions.pages')}">${buttons}</nav>` : ''}`;
+}
+
 /** Upload a zip, rar, 7z or tar archive as a new version (sent in pieces; the runner unpacks and checks it). */
 function uploadCard(site) {
   const u = (key, params) => t('sites.upload.' + key, params);
@@ -210,9 +222,16 @@ async function versionsTab(container, site, isCurrent, refresh = false) {
     <div class="card__header"><h2 class="card__title">${icon(fromUploads ? 'package' : 'github')}${v(fromUploads ? 'title_upload' : 'title')}</h2>
       <button type="button" class="btn btn--ghost btn--small" data-refresh-releases>${icon('refresh')}${v(fromUploads ? 'refresh_upload' : 'refresh')}</button></div>
     ${data.error ? `<div class="box box--red">${icon('alert')}<div>${v('github_error', { message: data.error })}</div></div>` : ''}
-    ${releases.length ? `<ul class="release-list">${releases.map((r) => releaseItem(site, r)).join('')}</ul>` : `<p class="muted">${v(fromUploads ? 'none_upload' : 'none')}</p>`}
+    ${releases.length ? `<div data-release-page>${releasePage(site, releases, 1)}</div>` : `<p class="muted">${v(fromUploads ? 'none_upload' : 'none')}</p>`}
   </section>
   ${laravel(site) && site.state === 'ready' ? artisanCard(site) : ''}`;
+  const pageBox = container.querySelector('[data-release-page]');
+  if (pageBox) {
+    pageBox.addEventListener('click', (e) => {
+      const button = e.target.closest('[data-page]');
+      if (button) pageBox.innerHTML = releasePage(site, releases, Number(button.dataset.page));
+    });
+  }
 }
 
 // ---------- History ----------

@@ -3,6 +3,13 @@
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org); every version
 has a git tag and a GitHub release with the upload archive (`arsika-rollout-manager-vX.Y.Z.zip`).
 
+## [1.6.3] — 2026-11-25
+
+### Changed
+- **The versions of a site are shown 5 per page.** The list of releases on GitHub, or of the versions uploaded through
+  the dashboard, showed every version on one long page; it now shows the newest 5, with page buttons (1, 2, 3 …) below
+  them when there are more. The agent is unchanged (1.6.1).
+
 ## [1.6.2] — 2026-11-19
 
 ### Fixed

@@ -38,7 +38,7 @@ export default {
     versions: {
       title: 'Rilis di GitHub', refresh: 'Muat ulang dari GitHub', github_error: 'GitHub: {message}',
       published: 'Dirilis {date}', current: 'Aktif', installed: 'Ada di server', local_only: 'hanya di server', no_asset: 'tanpa file {pattern}',
-      deploy: 'Deploy', activate: 'Aktifkan', delete: 'Hapus dari server', notes: 'Catatan rilis', none: 'Belum ada rilis di GitHub.',
+      deploy: 'Deploy', activate: 'Aktifkan', delete: 'Hapus dari server', notes: 'Catatan rilis', none: 'Belum ada rilis di GitHub.', pages: 'Halaman versi',
       deploy_title: 'Deploy versi {version}?',
       deploy_text: 'Versi {version} diunduh dari GitHub, disiapkan di folder terpisah, lalu diaktifkan. Kalau web tidak sehat setelahnya, versi sebelumnya dikembalikan otomatis.',
       deploy_backup: 'Backup database & file dulu (disarankan)',
@@ -304,7 +304,7 @@ export default {
     versions: {
       title: 'Releases on GitHub', refresh: 'Reload from GitHub', github_error: 'GitHub: {message}',
       published: 'Published {date}', current: 'Current', installed: 'On the server', local_only: 'on the server only', no_asset: 'no {pattern} file',
-      deploy: 'Deploy', activate: 'Activate', delete: 'Delete from server', notes: 'Release notes', none: 'No releases on GitHub yet.',
+      deploy: 'Deploy', activate: 'Activate', delete: 'Delete from server', notes: 'Release notes', none: 'No releases on GitHub yet.', pages: 'Version pages',
       deploy_title: 'Deploy version {version}?',
       deploy_text: 'Version {version} is downloaded from GitHub, prepared in its own folder and then activated. If the site is not healthy afterwards, the previous version is switched back automatically.',
       deploy_backup: 'Back up the database & files first (recommended)',
